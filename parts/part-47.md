@@ -2100,6 +2100,1097 @@ print(string.format("Avg response: %.1fms", report.avg_ms))
 
 ---
 
+## ตัวอย่างที่ 22: FTP Client
+
+```lua
+local ftp  = require("socket.ftp")
+local ltn12 = require("ltn12")
+
+-- FTP Download
+local function ftp_download(url_str, local_path)
+    local f = io.open(local_path, "wb")
+    if not f then
+        return nil, "Cannot create file: " .. local_path
+    end
+
+    local ok, err = ftp.get{
+        url  = url_str,
+        sink = ltn12.sink.file(f),
+    }
+
+    f:close()
+
+    if ok then
+        return true, nil
+    else
+        os.remove(local_path)
+        return nil, "FTP download failed: " .. tostring(err)
+    end
+end
+
+-- FTP Upload
+local function ftp_upload(url_str, local_path)
+    local f = io.open(local_path, "rb")
+    if not f then
+        return nil, "Cannot open file: " .. local_path
+    end
+
+    local ok, err = ftp.put{
+        url    = url_str,
+        source = ltn12.source.file(f),
+    }
+
+    f:close()
+    return ok and true or nil, err
+end
+
+-- FTP List directory
+local function ftp_list(url_str)
+    local listing = {}
+    local ok, err = ftp.get{
+        url  = url_str .. "/",
+        sink = ltn12.sink.table(listing),
+        type = "a",  -- ASCII mode
+    }
+
+    if ok then
+        return table.concat(listing), nil
+    else
+        return nil, err
+    end
+end
+
+print("=== FTP Client ===")
+print("FTP functions defined:")
+print("  ftp_download(url, local_path)")
+print("  ftp_upload(url, local_path)")
+print("  ftp_list(url)")
+print("\nFTP URL format: ftp://user:pass@host:21/path/file.txt")
+
+-- Example usage (ต้องมี FTP server จริงๆ)
+local ftp_examples = {
+    "ftp://anonymous:user@ftp.gnu.org/README",
+    "ftp://user:pass@myserver.com/data/file.txt",
+    "ftp://admin:secret@192.168.1.1:21/uploads/",
+}
+
+for _, u in ipairs(ftp_examples) do
+    print("  " .. u)
+end
+```
+
+---
+
+## ตัวอย่างที่ 23: Socket Buffering
+
+```lua
+local socket = require("socket")
+
+-- Buffered Socket Wrapper
+local BufferedSocket = {}
+BufferedSocket.__index = BufferedSocket
+
+function BufferedSocket.new(sock, buffer_size)
+    return setmetatable({
+        sock        = sock,
+        buffer_size = buffer_size or 8192,
+        read_buf    = "",
+        write_buf   = "",
+        bytes_read  = 0,
+        bytes_sent  = 0,
+    }, BufferedSocket)
+end
+
+function BufferedSocket:read_until(delimiter)
+    delimiter = delimiter or "\n"
+
+    while true do
+        -- ตรวจ buffer ก่อน
+        local pos = self.read_buf:find(delimiter, 1, true)
+        if pos then
+            local line = self.read_buf:sub(1, pos - 1)
+            self.read_buf = self.read_buf:sub(pos + #delimiter)
+            return line
+        end
+
+        -- อ่านเพิ่ม
+        local chunk, err = self.sock:receive(self.buffer_size)
+        if chunk then
+            self.bytes_read = self.bytes_read + #chunk
+            self.read_buf = self.read_buf .. chunk
+        else
+            if err == "timeout" then
+                -- return ข้อมูลที่มี ถ้า partial
+                if #self.read_buf > 0 then
+                    local data = self.read_buf
+                    self.read_buf = ""
+                    return data, "partial"
+                end
+            end
+            return nil, err
+        end
+    end
+end
+
+function BufferedSocket:read_bytes(n)
+    while #self.read_buf < n do
+        local chunk, err = self.sock:receive(self.buffer_size)
+        if chunk then
+            self.bytes_read = self.bytes_read + #chunk
+            self.read_buf = self.read_buf .. chunk
+        else
+            return nil, err
+        end
+    end
+
+    local data = self.read_buf:sub(1, n)
+    self.read_buf = self.read_buf:sub(n + 1)
+    return data
+end
+
+function BufferedSocket:write(data)
+    self.write_buf = self.write_buf .. data
+    if #self.write_buf >= self.buffer_size then
+        return self:flush()
+    end
+    return true
+end
+
+function BufferedSocket:flush()
+    if #self.write_buf == 0 then return true end
+
+    local sent, err = self.sock:send(self.write_buf)
+    if sent then
+        self.bytes_sent = self.bytes_sent + #self.write_buf
+        self.write_buf = ""
+        return true
+    end
+    return nil, err
+end
+
+function BufferedSocket:stats()
+    return {
+        bytes_read = self.bytes_read,
+        bytes_sent = self.bytes_sent,
+        read_buf_size  = #self.read_buf,
+        write_buf_size = #self.write_buf,
+    }
+end
+
+function BufferedSocket:close()
+    self:flush()
+    self.sock:close()
+end
+
+-- ทดสอบ buffered socket
+print("=== Socket Buffering ===")
+
+-- Create server/client pair
+local server = socket.tcp()
+server:setoption("reuseaddr", true)
+server:bind("127.0.0.1", 19940)
+server:listen(1)
+server:settimeout(2)
+
+local client_sock = socket.tcp()
+client_sock:settimeout(2)
+client_sock:connect("127.0.0.1", 19940)
+
+local conn_sock = server:accept()
+
+if conn_sock and client_sock then
+    local client = BufferedSocket.new(client_sock)
+    local conn   = BufferedSocket.new(conn_sock)
+
+    -- Write buffered
+    client:write("Hello ")
+    client:write("Buffered ")
+    client:write("World!\n")
+    client:flush()
+
+    -- Read line
+    local line, err = conn:read_until("\n")
+    if line then
+        print("Received:", line)
+    end
+
+    -- Stats
+    local stats = client:stats()
+    print(string.format("Client sent: %d bytes", stats.bytes_sent))
+
+    client:close()
+    conn:close()
+end
+
+server:close()
+print("Buffered socket demo complete")
+```
+
+---
+
+## ตัวอย่างที่ 24: Network Protocol - Custom Binary Protocol
+
+```lua
+local socket = require("socket")
+
+-- Custom Binary Protocol
+-- Packet format:
+--   [2 bytes] magic (0xCAFE)
+--   [1 byte]  version
+--   [1 byte]  type (1=request, 2=response, 3=error)
+--   [4 bytes] length (big-endian)
+--   [n bytes] payload
+
+local Protocol = {
+    MAGIC    = 0xCAFE,
+    VERSION  = 1,
+    TYPE_REQ = 1,
+    TYPE_RES = 2,
+    TYPE_ERR = 3,
+}
+
+function Protocol.encode(msg_type, payload)
+    payload = payload or ""
+    local header = string.pack(">I2I1I1I4",
+        Protocol.MAGIC,
+        Protocol.VERSION,
+        msg_type,
+        #payload)
+    return header .. payload
+end
+
+function Protocol.decode_header(bytes)
+    if #bytes < 8 then return nil, "Incomplete header" end
+    local magic, version, msg_type, length =
+        string.unpack(">I2I1I1I4", bytes)
+
+    if magic ~= Protocol.MAGIC then
+        return nil, string.format("Invalid magic: 0x%04X", magic)
+    end
+    if version ~= Protocol.VERSION then
+        return nil, string.format("Version mismatch: %d", version)
+    end
+
+    return {
+        magic    = magic,
+        version  = version,
+        msg_type = msg_type,
+        length   = length,
+    }
+end
+
+function Protocol.recv_packet(sock)
+    -- รับ header
+    local header_bytes, err = sock:receive(8)
+    if not header_bytes then return nil, err end
+
+    local header, err2 = Protocol.decode_header(header_bytes)
+    if not header then return nil, err2 end
+
+    -- รับ payload
+    local payload = ""
+    if header.length > 0 then
+        payload, err = sock:receive(header.length)
+        if not payload then return nil, err end
+    end
+
+    return {
+        type    = header.msg_type,
+        payload = payload,
+    }
+end
+
+-- ทดสอบ protocol
+print("=== Custom Binary Protocol ===")
+
+-- Test encode/decode
+local req_packet = Protocol.encode(Protocol.TYPE_REQ, "GET /api/users")
+print(string.format("Request packet: %d bytes", #req_packet))
+print("Magic:", string.format("0x%04X", req_packet:byte(1) * 256 + req_packet:byte(2)))
+
+local header = Protocol.decode_header(req_packet:sub(1, 8))
+if header then
+    local types = {[1]="REQUEST", [2]="RESPONSE", [3]="ERROR"}
+    print("Type:", types[header.msg_type])
+    print("Length:", header.length)
+end
+
+local resp_packet = Protocol.encode(Protocol.TYPE_RES,
+    '{"users": [{"id": 1, "name": "Alice"}]}')
+print(string.format("\nResponse packet: %d bytes", #resp_packet))
+
+-- Loopback test
+local server = socket.tcp()
+server:setoption("reuseaddr", true)
+server:bind("127.0.0.1", 19930)
+server:listen(1)
+server:settimeout(2)
+
+local co = coroutine.create(function()
+    local conn = server:accept()
+    if conn then
+        conn:settimeout(2)
+        local pkt = Protocol.recv_packet(conn)
+        if pkt then
+            print("Server got payload:", pkt.payload)
+            -- Send response
+            conn:send(Protocol.encode(Protocol.TYPE_RES, "OK: " .. pkt.payload))
+        end
+        conn:close()
+    end
+    server:close()
+end)
+
+coroutine.resume(co)
+
+local c = socket.tcp()
+c:settimeout(2)
+if c:connect("127.0.0.1", 19930) then
+    c:send(Protocol.encode(Protocol.TYPE_REQ, "PING"))
+    local resp = Protocol.recv_packet(c)
+    if resp then
+        print("Client got response:", resp.payload)
+    end
+    c:close()
+end
+
+coroutine.resume(co)
+print("Binary protocol test complete")
+```
+
+---
+
+## ตัวอย่างที่ 25: Concurrent Downloads
+
+```lua
+local socket = require("socket")
+local http   = require("socket.http")
+local ltn12  = require("ltn12")
+
+-- Simulated concurrent downloads ด้วย coroutines
+-- (LuaSocket ไม่มี threading จริงๆ แต่ใช้ coroutines + select)
+
+local Downloader = {}
+Downloader.__index = Downloader
+
+function Downloader.new()
+    local dl = setmetatable({}, Downloader)
+    dl.tasks     = {}
+    dl.results   = {}
+    dl.completed = 0
+    dl.failed    = 0
+    return dl
+end
+
+function Downloader:add_url(url_str, save_as)
+    table.insert(self.tasks, {
+        url     = url_str,
+        save_as = save_as,
+        status  = "pending",
+    })
+end
+
+function Downloader:download_one(task)
+    local start = socket.gettime()
+    local chunks = {}
+
+    local ok, status, headers = http.request{
+        url     = task.url,
+        sink    = ltn12.sink.table(chunks),
+        headers = {["User-Agent"] = "LuaDownloader/1.0"},
+    }
+
+    local elapsed = socket.gettime() - start
+    local body = table.concat(chunks)
+
+    if ok and status == 200 then
+        -- บันทึกไฟล์ถ้ากำหนด
+        if task.save_as then
+            local f = io.open(task.save_as, "wb")
+            if f then
+                f:write(body)
+                f:close()
+            end
+        end
+
+        return {
+            url     = task.url,
+            status  = status,
+            bytes   = #body,
+            elapsed = elapsed,
+            ok      = true,
+        }
+    else
+        return {
+            url     = task.url,
+            status  = status or 0,
+            elapsed = elapsed,
+            ok      = false,
+            error   = not ok and tostring(status) or nil,
+        }
+    end
+end
+
+function Downloader:run()
+    local start = socket.gettime()
+
+    for _, task in ipairs(self.tasks) do
+        io.write(string.format("Downloading %s...", task.url:sub(-30)))
+        io.flush()
+
+        local result = self:download_one(task)
+        table.insert(self.results, result)
+
+        if result.ok then
+            self.completed = self.completed + 1
+            print(string.format(" OK (%d bytes, %.2fs)",
+                result.bytes, result.elapsed))
+        else
+            self.failed = self.failed + 1
+            print(string.format(" FAILED (%s)", result.error or tostring(result.status)))
+        end
+    end
+
+    local total_time = socket.gettime() - start
+    return {
+        total     = #self.tasks,
+        completed = self.completed,
+        failed    = self.failed,
+        time      = total_time,
+    }
+end
+
+-- ทดสอบ
+print("=== Concurrent Downloads ===")
+
+local dl = Downloader.new()
+dl:add_url("http://httpbin.org/bytes/1024",   "/tmp/file1.bin")
+dl:add_url("http://httpbin.org/bytes/2048",   "/tmp/file2.bin")
+dl:add_url("http://httpbin.org/json",          "/tmp/data.json")
+dl:add_url("http://httpbin.org/status/404",    nil)
+dl:add_url("http://httpbin.org/uuid",          nil)
+
+local stats = dl:run()
+
+print(string.format("\nDownload summary: %d/%d ok, %d failed, %.2fs total",
+    stats.completed, stats.total, stats.failed, stats.time))
+```
+
+---
+
+## ตัวอย่างที่ 26: WebSocket Handshake (HTTP Upgrade)
+
+```lua
+local socket = require("socket")
+local mime   = require("mime")
+
+-- WebSocket Handshake ด้วย LuaSocket
+-- (WebSocket frame parsing ไม่ครอบคลุมใน LuaSocket ต้องทำเอง)
+
+local function create_websocket_key()
+    -- สร้าง random 16-byte key แล้ว base64 encode
+    local bytes = {}
+    for i = 1, 16 do
+        bytes[i] = string.char(math.random(0, 255))
+    end
+    return mime.b64(table.concat(bytes))
+end
+
+local function compute_websocket_accept(key)
+    -- WebSocket accept key = base64(SHA1(key + GUID))
+    -- ใน LuaSocket ต้องใช้ library เพิ่ม สำหรับ SHA1
+    -- นี่เป็น conceptual example
+    local magic_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    return "computed_" .. key:sub(1, 8) .. "..."  -- simplified
+end
+
+local function ws_handshake_client(host, port, path)
+    local sock = socket.tcp()
+    sock:settimeout(5)
+
+    local ok, err = sock:connect(host, port)
+    if not ok then return nil, err end
+
+    local key = create_websocket_key()
+
+    -- ส่ง HTTP Upgrade request
+    local request = table.concat({
+        "GET " .. path .. " HTTP/1.1",
+        "Host: " .. host,
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        "Sec-WebSocket-Key: " .. key,
+        "Sec-WebSocket-Version: 13",
+        "Origin: http://" .. host,
+        "",
+        "",
+    }, "\r\n")
+
+    sock:send(request)
+
+    -- รับ response
+    local lines = {}
+    while true do
+        local line = sock:receive("*l")
+        if not line or line == "" then break end
+        table.insert(lines, line)
+    end
+
+    -- ตรวจสอบ 101 Switching Protocols
+    if lines[1] and lines[1]:find("101") then
+        return sock, nil, key
+    else
+        sock:close()
+        return nil, "WebSocket handshake failed: " .. (lines[1] or "no response")
+    end
+end
+
+-- WebSocket Frame Encoder (basic)
+local function ws_encode_frame(data, opcode)
+    opcode = opcode or 0x1  -- text frame
+    local payload = data
+    local len = #payload
+
+    local header = {}
+
+    -- FIN + opcode
+    table.insert(header, string.char(0x80 | opcode))
+
+    -- Mask bit + payload length
+    if len <= 125 then
+        table.insert(header, string.char(0x80 | len))
+    elseif len <= 65535 then
+        table.insert(header, string.char(0x80 | 126))
+        table.insert(header, string.pack(">I2", len))
+    else
+        table.insert(header, string.char(0x80 | 127))
+        table.insert(header, string.pack(">I8", len))
+    end
+
+    -- Masking key (4 random bytes)
+    local mask = {
+        math.random(0, 255), math.random(0, 255),
+        math.random(0, 255), math.random(0, 255),
+    }
+    for _, b in ipairs(mask) do
+        table.insert(header, string.char(b))
+    end
+
+    -- Mask payload
+    local masked = {}
+    for i = 1, #payload do
+        masked[i] = string.char(
+            payload:byte(i) ~ mask[((i-1) % 4) + 1]
+        )
+    end
+
+    return table.concat(header) .. table.concat(masked)
+end
+
+print("=== WebSocket Handshake ===")
+print("WebSocket key:", create_websocket_key())
+print("Frame encoding:")
+local frame = ws_encode_frame("Hello, WebSocket!")
+print(string.format("  Encoded %d bytes -> %d bytes",
+    #"Hello, WebSocket!", #frame))
+print("  (Full WS support needs SHA1 library)")
+print("\nFor production use: lua-resty-websocket (OpenResty)")
+print("or: websocket-lua library")
+```
+
+---
+
+## ตัวอย่างที่ 27: Network Statistics และ Monitoring
+
+```lua
+local socket = require("socket")
+local http   = require("socket.http")
+local ltn12  = require("ltn12")
+
+-- Network Statistics Collector
+local NetStats = {}
+NetStats.__index = NetStats
+
+function NetStats.new()
+    return setmetatable({
+        measurements = {},
+        start_time   = socket.gettime(),
+    }, NetStats)
+end
+
+function NetStats:measure(name, func)
+    local start  = socket.gettime()
+    local ok, result = pcall(func)
+    local elapsed = socket.gettime() - start
+
+    table.insert(self.measurements, {
+        name    = name,
+        elapsed = elapsed,
+        ok      = ok,
+        result  = ok and result or tostring(result),
+        time    = start,
+    })
+
+    return ok and result or nil, not ok and tostring(result) or nil
+end
+
+function NetStats:report()
+    print("\nNetwork Statistics Report")
+    print(string.rep("=", 60))
+    print(string.format("%-30s %10s  %s",
+        "Measurement", "Time (ms)", "Status"))
+    print(string.rep("-", 60))
+
+    local total_time = 0
+    local success_count = 0
+
+    for _, m in ipairs(self.measurements) do
+        local ms = m.elapsed * 1000
+        total_time = total_time + ms
+
+        if m.ok then success_count = success_count + 1 end
+
+        print(string.format("%-30s %10.2f  %s",
+            m.name:sub(1, 30), ms,
+            m.ok and "OK" or "FAIL"))
+    end
+
+    print(string.rep("-", 60))
+    print(string.format("Total: %d measurements, %d/%d succeeded",
+        #self.measurements, success_count, #self.measurements))
+    print(string.format("Total time: %.2f ms", total_time))
+    if #self.measurements > 0 then
+        print(string.format("Average: %.2f ms",
+            total_time / #self.measurements))
+    end
+end
+
+-- ทดสอบ
+print("=== Network Statistics ===")
+
+local stats = NetStats.new()
+
+-- DNS lookup
+stats:measure("DNS: google.com", function()
+    return socket.dns.toip("google.com")
+end)
+
+stats:measure("DNS: localhost", function()
+    return socket.dns.toip("localhost")
+end)
+
+stats:measure("DNS: invalid.xyz", function()
+    return socket.dns.toip("invalid.xyz.no.exist")
+end)
+
+-- TCP connect
+stats:measure("TCP: httpbin.org:80", function()
+    local s = socket.tcp()
+    s:settimeout(5)
+    local ok = s:connect("httpbin.org", 80)
+    s:close()
+    return ok ~= nil
+end)
+
+-- HTTP request timing
+stats:measure("HTTP GET /get", function()
+    local chunks = {}
+    local ok, status = http.request{
+        url  = "http://httpbin.org/get",
+        sink = ltn12.sink.table(chunks),
+    }
+    return ok and status or nil
+end)
+
+stats:measure("HTTP GET /delay/1 (slow)", function()
+    local chunks = {}
+    local ok, status = http.request{
+        url  = "http://httpbin.org/delay/1",
+        sink = ltn12.sink.table(chunks),
+    }
+    return ok and status or nil
+end)
+
+stats:report()
+```
+
+---
+
+## ตัวอย่างที่ 28: Simple HTTP Router
+
+```lua
+local socket = require("socket")
+
+-- Simple HTTP Server ที่มี routing
+local Router = {}
+Router.__index = Router
+
+function Router.new()
+    local r = setmetatable({}, Router)
+    r.routes = {}
+    r.middleware = {}
+    return r
+end
+
+function Router:add_route(method, path_pattern, handler)
+    table.insert(self.routes, {
+        method  = method:upper(),
+        pattern = path_pattern,
+        handler = handler,
+    })
+end
+
+function Router:get(path, handler) self:add_route("GET", path, handler) end
+function Router:post(path, handler) self:add_route("POST", path, handler) end
+function Router:put(path, handler) self:add_route("PUT", path, handler) end
+function Router:delete(path, handler) self:add_route("DELETE", path, handler) end
+
+function Router:use(middleware_func)
+    table.insert(self.middleware, middleware_func)
+end
+
+function Router:match(method, path)
+    for _, route in ipairs(self.routes) do
+        if route.method == method then
+            -- Simple pattern matching
+            local params = {}
+            local pattern = route.pattern
+                :gsub(":(%w+)", function(name)
+                    params[#params + 1] = name
+                    return "([^/]+)"
+                end)
+                :gsub("%*", "(.+)")
+
+            local matches = {path:match("^" .. pattern .. "$")}
+            if #matches > 0 then
+                local named_params = {}
+                for i, name in ipairs(params) do
+                    named_params[name] = matches[i]
+                end
+                return route.handler, named_params
+            end
+        end
+    end
+    return nil, {}
+end
+
+-- HTTP Response helpers
+local function make_response(status, body, content_type)
+    content_type = content_type or "text/plain"
+    return {
+        status       = status,
+        body         = body or "",
+        content_type = content_type,
+    }
+end
+
+local function json_response(data)
+    local body = type(data) == "string" and data or
+        string.format('{"result": "%s"}', tostring(data))
+    return make_response(200, body, "application/json")
+end
+
+local function text_response(text, status)
+    return make_response(status or 200, text, "text/plain")
+end
+
+-- สร้าง simple router
+local app = Router.new()
+
+-- Routes
+app:get("/", function(req)
+    return text_response("Welcome to Lua HTTP Server!")
+end)
+
+app:get("/hello/:name", function(req, params)
+    return text_response("Hello, " .. (params.name or "World") .. "!")
+end)
+
+app:get("/api/users", function(req)
+    return json_response('{"users": [{"id": 1, "name": "Alice"}]}')
+end)
+
+app:get("/api/users/:id", function(req, params)
+    return json_response(string.format(
+        '{"user": {"id": %s, "name": "User %s"}}',
+        params.id, params.id))
+end)
+
+app:post("/api/echo", function(req)
+    return json_response(string.format(
+        '{"echo": "%s"}', req.body or ""))
+end)
+
+-- ทดสอบ routing
+print("=== HTTP Router ===")
+
+local test_requests = {
+    {method = "GET",  path = "/"},
+    {method = "GET",  path = "/hello/Alice"},
+    {method = "GET",  path = "/hello/สมชาย"},
+    {method = "GET",  path = "/api/users"},
+    {method = "GET",  path = "/api/users/42"},
+    {method = "POST", path = "/api/echo", body = "test data"},
+    {method = "GET",  path = "/notfound"},
+    {method = "DELETE", path = "/api/users/1"},
+}
+
+for _, req in ipairs(test_requests) do
+    local handler, params = app:match(req.method, req.path)
+    if handler then
+        local resp = handler(req, params)
+        print(string.format("  %s %-25s -> %d: %s",
+            req.method, req.path, resp.status,
+            resp.body:sub(1, 50)))
+    else
+        print(string.format("  %s %-25s -> 404: Not Found",
+            req.method, req.path))
+    end
+end
+```
+
+---
+
+## ตัวอย่างที่ 29: Keep-Alive Connections
+
+```lua
+local socket = require("socket")
+local http   = require("socket.http")
+local ltn12  = require("ltn12")
+
+-- HTTP Keep-Alive Connection Pool
+-- (LuaSocket ปิด connection หลัง request โดย default)
+-- นี่เป็น pattern สำหรับ reusing connections
+
+local KeepAlivePool = {}
+KeepAlivePool.__index = KeepAlivePool
+
+function KeepAlivePool.new(max_connections_per_host)
+    return setmetatable({
+        pools     = {},  -- {host:port -> [connections]}
+        max_conns = max_connections_per_host or 5,
+        stats     = {reused = 0, new = 0, closed = 0},
+    }, KeepAlivePool)
+end
+
+function KeepAlivePool:_pool_key(host, port)
+    return host .. ":" .. port
+end
+
+function KeepAlivePool:get_connection(host, port)
+    local key = self:_pool_key(host, port)
+    local pool = self.pools[key]
+
+    if pool and #pool > 0 then
+        -- ดึง connection จาก pool
+        local conn = table.remove(pool)
+        -- ตรวจสอบว่ายังใช้งานได้
+        conn:settimeout(0)
+        local _, err = conn:receive(1)
+        conn:settimeout(5)
+
+        if err ~= "closed" then
+            self.stats.reused = self.stats.reused + 1
+            return conn, true  -- true = reused
+        else
+            conn:close()
+            self.stats.closed = self.stats.closed + 1
+        end
+    end
+
+    -- สร้าง connection ใหม่
+    local conn = socket.tcp()
+    conn:settimeout(5)
+    local ok, err = conn:connect(host, port)
+    if not ok then
+        return nil, false, err
+    end
+
+    self.stats.new = self.stats.new + 1
+    return conn, false
+end
+
+function KeepAlivePool:return_connection(host, port, conn)
+    local key = self:_pool_key(host, port)
+    self.pools[key] = self.pools[key] or {}
+
+    if #self.pools[key] < self.max_conns then
+        table.insert(self.pools[key], conn)
+    else
+        conn:close()
+        self.stats.closed = self.stats.closed + 1
+    end
+end
+
+function KeepAlivePool:get_stats()
+    return self.stats
+end
+
+-- ทดสอบ
+print("=== Keep-Alive Connection Pool ===")
+
+local pool = KeepAlivePool.new(3)
+
+-- Simulate connection reuse
+print("Connection pool stats:")
+print("  max connections per host:", 3)
+
+-- สร้างและ return connections (simulated)
+local host, port = "httpbin.org", 80
+local conns = {}
+
+for i = 1, 3 do
+    local conn, reused, err = pool:get_connection(host, port)
+    if conn then
+        table.insert(conns, conn)
+        print(string.format("  Got connection %d: %s",
+            i, reused and "REUSED" or "NEW"))
+    else
+        print(string.format("  Failed to get connection %d: %s", i, tostring(err)))
+    end
+end
+
+-- Return connections to pool
+for i, conn in ipairs(conns) do
+    pool:return_connection(host, port, conn)
+    print(string.format("  Returned connection %d to pool", i))
+end
+
+local stats = pool:get_stats()
+print(string.format("\nPool stats: new=%d reused=%d closed=%d",
+    stats.new, stats.reused, stats.closed))
+```
+
+---
+
+## ตัวอย่างที่ 30: Network Testing Utilities
+
+```lua
+local socket = require("socket")
+local http   = require("socket.http")
+local ltn12  = require("ltn12")
+
+-- Network Testing Toolkit
+
+-- ตรวจสอบ internet connectivity
+local function check_internet(timeout)
+    timeout = timeout or 3
+    local hosts = {
+        {"8.8.8.8",         53},
+        {"1.1.1.1",         53},
+        {"google.com",      80},
+        {"cloudflare.com",  80},
+    }
+
+    for _, h in ipairs(hosts) do
+        local s = socket.tcp()
+        s:settimeout(timeout)
+        local ok = s:connect(h[1], h[2])
+        s:close()
+        if ok then return true, h[1] end
+    end
+
+    return false, nil
+end
+
+-- Bandwidth estimation (rough)
+local function estimate_bandwidth(url, size_bytes)
+    size_bytes = size_bytes or 102400  -- 100KB default
+    local chunks = {}
+    local start = socket.gettime()
+
+    local ok, status = http.request{
+        url  = string.format("http://httpbin.org/bytes/%d", size_bytes),
+        sink = ltn12.sink.table(chunks),
+        headers = {["User-Agent"] = "LuaBandwidthTest/1.0"},
+    }
+
+    local elapsed = socket.gettime() - start
+
+    if ok and status == 200 then
+        local received = 0
+        for _, chunk in ipairs(chunks) do
+            received = received + #chunk
+        end
+
+        local kbps = (received / 1024) / elapsed
+        local mbps = kbps / 1024
+
+        return {
+            bytes    = received,
+            elapsed  = elapsed,
+            kbps     = kbps,
+            mbps     = mbps,
+        }
+    end
+
+    return nil
+end
+
+-- Traceroute-like (TCP based)
+local function tcp_traceroute(host, port, max_hops)
+    max_hops = max_hops or 10
+    print(string.format("TCP traceroute to %s:%d (max %d hops)",
+        host, port, max_hops))
+
+    for ttl = 1, max_hops do
+        local s = socket.tcp()
+        s:settimeout(1)
+
+        local start = socket.gettime()
+        local ok, err = s:connect(host, port)
+        local elapsed = (socket.gettime() - start) * 1000
+        s:close()
+
+        if ok then
+            print(string.format("  %2d  %s (reached in %.1fms)",
+                ttl, host, elapsed))
+            break
+        else
+            print(string.format("  %2d  * (%.1fms %s)",
+                ttl, elapsed, err or "?"))
+        end
+    end
+end
+
+-- ทดสอบ
+print("=== Network Testing Utilities ===\n")
+
+-- Check internet
+print("Internet connectivity check:")
+local connected, via = check_internet(3)
+if connected then
+    print("  Connected via:", via)
+else
+    print("  No internet connection detected")
+end
+
+-- Bandwidth test
+print("\nBandwidth estimation (100KB test):")
+local bw = estimate_bandwidth(nil, 102400)
+if bw then
+    print(string.format("  Downloaded: %d bytes in %.3fs",
+        bw.bytes, bw.elapsed))
+    print(string.format("  Speed: %.1f KB/s (%.2f Mbps)",
+        bw.kbps, bw.mbps))
+else
+    print("  Bandwidth test failed (no internet)")
+end
+
+-- TCP traceroute
+print("\nTCP traceroute:")
+tcp_traceroute("google.com", 80, 5)
+
+-- Network summary
+print("\n--- Network Summary ---")
+print(string.format("  Socket version: %s", socket._VERSION))
+print(string.format("  Local hostname: %s", socket.dns.tohostname("127.0.0.1") or "localhost"))
+local local_ip = socket.dns.toip("localhost")
+print(string.format("  Local IP: %s", local_ip or "127.0.0.1"))
+```
+
+---
+
 ## สรุป LuaSocket
 
 LuaSocket เป็น library ที่ครบครันสำหรับ network programming ใน Lua:
