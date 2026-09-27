@@ -1934,6 +1934,285 @@ tdb:close()
 
 ---
 
+## 59.16 ตัวอย่างเพิ่มเติม
+
+### ตัวอย่างที่ 27: Batch Operations
+
+```lua
+-- batch_operations.lua
+local sqlite3 = require("lsqlite3")
+local db = sqlite3.open(":memory:")
+
+db:exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, value REAL)")
+
+-- Batch insert ด้วย transaction (เร็วมาก)
+local function batch_insert(database, records)
+    local stmt = database:prepare(
+        "INSERT INTO items (name, value) VALUES (?, ?)")
+    database:exec("BEGIN")
+    local count = 0
+    for _, rec in ipairs(records) do
+        stmt:bind_values(rec.name, rec.value)
+        stmt:step()
+        stmt:reset()
+        count = count + 1
+    end
+    database:exec("COMMIT")
+    stmt:finalize()
+    return count
+end
+
+-- สร้างข้อมูล
+local records = {}
+for i = 1, 1000 do
+    table.insert(records, {name = "item_" .. i, value = i * 1.5})
+end
+
+local t = os.clock()
+local n = batch_insert(db, records)
+print(string.format("Batch insert %d records: %.4fs", n, os.clock() - t))
+
+-- Batch update
+local update_stmt = db:prepare("UPDATE items SET value = value * ? WHERE id = ?")
+db:exec("BEGIN")
+for i = 1, 100 do
+    update_stmt:bind_values(1.1, i)
+    update_stmt:step()
+    update_stmt:reset()
+end
+db:exec("COMMIT")
+update_stmt:finalize()
+print("Batch update done, changes:", db:changes())
+
+-- Batch delete
+db:exec("DELETE FROM items WHERE id > 500")
+for row in db:nrows("SELECT COUNT(*) as n FROM items") do
+    print("Remaining items:", row.n)
+end
+
+db:close()
+```
+
+### ตัวอย่างที่ 28: Database Triggers
+
+```lua
+-- triggers.lua
+local sqlite3 = require("lsqlite3")
+local db = sqlite3.open(":memory:")
+
+db:exec([[
+    CREATE TABLE products (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        name     TEXT NOT NULL,
+        price    REAL NOT NULL,
+        stock    INTEGER DEFAULT 0
+    );
+    
+    CREATE TABLE audit_log (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        table_name TEXT,
+        operation  TEXT,
+        record_id  INTEGER,
+        old_data   TEXT,
+        new_data   TEXT,
+        changed_at TEXT DEFAULT (datetime('now'))
+    );
+    
+    -- Trigger: บันทึก INSERT
+    CREATE TRIGGER products_after_insert
+    AFTER INSERT ON products
+    BEGIN
+        INSERT INTO audit_log (table_name, operation, record_id, new_data)
+        VALUES ('products', 'INSERT', NEW.id,
+            json_object('name', NEW.name, 'price', NEW.price, 'stock', NEW.stock));
+    END;
+    
+    -- Trigger: บันทึก UPDATE  
+    CREATE TRIGGER products_after_update
+    AFTER UPDATE ON products
+    BEGIN
+        INSERT INTO audit_log (table_name, operation, record_id, old_data, new_data)
+        VALUES ('products', 'UPDATE', NEW.id,
+            json_object('price', OLD.price, 'stock', OLD.stock),
+            json_object('price', NEW.price, 'stock', NEW.stock));
+    END;
+    
+    -- Trigger: ป้องกัน stock ติดลบ
+    CREATE TRIGGER check_stock
+    BEFORE UPDATE ON products
+    WHEN NEW.stock < 0
+    BEGIN
+        SELECT RAISE(ABORT, 'Stock cannot be negative');
+    END;
+]])
+
+-- ทดสอบ triggers
+db:exec("INSERT INTO products (name, price, stock) VALUES ('Widget', 9.99, 100)")
+db:exec("UPDATE products SET price = 12.99, stock = 95 WHERE id = 1")
+
+-- ลอง set stock ติดลบ
+local ok, err = pcall(function()
+    db:exec("UPDATE products SET stock = -5 WHERE id = 1")
+end)
+print("Negative stock prevented:", not ok)
+
+-- ดู audit log
+print("\nAudit Log:")
+for row in db:nrows("SELECT * FROM audit_log ORDER BY id") do
+    print(string.format("  [%s] %s on record %d",
+        row.operation, row.table_name, row.record_id))
+    if row.new_data then print("    New:", row.new_data) end
+end
+
+db:close()
+```
+
+### ตัวอย่างที่ 29: Window Functions
+
+```lua
+-- window_functions.lua
+-- SQLite 3.25+ รองรับ Window Functions
+local sqlite3 = require("lsqlite3")
+local db = sqlite3.open(":memory:")
+
+db:exec([[
+    CREATE TABLE sales (
+        id         INTEGER PRIMARY KEY,
+        rep        TEXT,
+        region     TEXT,
+        amount     REAL,
+        sale_date  TEXT
+    );
+    INSERT INTO sales (rep, region, amount, sale_date) VALUES
+        ('Alice', 'North', 1200, '2025-01-05'),
+        ('Bob',   'South', 800,  '2025-01-08'),
+        ('Alice', 'North', 1500, '2025-01-12'),
+        ('Carol', 'East',  950,  '2025-01-15'),
+        ('Bob',   'South', 1100, '2025-01-20'),
+        ('Alice', 'North', 900,  '2025-01-22'),
+        ('Carol', 'East',  1300, '2025-01-28');
+]])
+
+-- ROW_NUMBER, RANK
+print("=== Rankings ===")
+for row in db:nrows([[
+    SELECT 
+        rep,
+        amount,
+        ROW_NUMBER() OVER (ORDER BY amount DESC) as row_num,
+        RANK()       OVER (ORDER BY amount DESC) as rank,
+        DENSE_RANK() OVER (ORDER BY amount DESC) as dense_rank
+    FROM sales
+    ORDER BY amount DESC
+]]) do
+    print(string.format("  %-6s $%-8.2f Row:%d Rank:%d Dense:%d",
+        row.rep, row.amount, row.row_num, row.rank, row.dense_rank))
+end
+
+-- Running total (Cumulative SUM)
+print("\n=== Running Total ===")
+for row in db:nrows([[
+    SELECT
+        sale_date,
+        rep,
+        amount,
+        SUM(amount) OVER (ORDER BY sale_date) as running_total
+    FROM sales
+    ORDER BY sale_date
+]]) do
+    print(string.format("  %s %-6s $%-8.2f Total: $%.2f",
+        row.sale_date, row.rep, row.amount, row.running_total))
+end
+
+-- Rank within partition (by region)
+print("\n=== Rank per Region ===")
+for row in db:nrows([[
+    SELECT
+        region,
+        rep,
+        amount,
+        RANK() OVER (PARTITION BY region ORDER BY amount DESC) as region_rank
+    FROM sales
+    ORDER BY region, region_rank
+]]) do
+    print(string.format("  %-6s %-6s $%-8.2f Rank in region: %d",
+        row.region, row.rep, row.amount, row.region_rank))
+end
+
+db:close()
+```
+
+### ตัวอย่างที่ 30: JSON Operations
+
+```lua
+-- sqlite_json.lua
+-- SQLite 3.38+ มี built-in JSON functions
+local sqlite3 = require("lsqlite3")
+local db = sqlite3.open(":memory:")
+
+db:exec([[
+    CREATE TABLE configs (
+        id      INTEGER PRIMARY KEY,
+        app     TEXT NOT NULL,
+        settings TEXT NOT NULL  -- JSON column
+    );
+    INSERT INTO configs VALUES
+        (1, 'web', '{"theme":"dark","lang":"en","features":["auth","api","logs"]}'),
+        (2, 'mobile', '{"theme":"light","lang":"th","features":["auth","push"]}'),
+        (3, 'admin', '{"theme":"system","lang":"en","debug":true,"features":["all"]}');
+]])
+
+-- json_extract: ดึงค่าจาก JSON
+print("=== Extract JSON values ===")
+for row in db:nrows([[
+    SELECT 
+        app,
+        json_extract(settings, '$.theme') as theme,
+        json_extract(settings, '$.lang')  as lang,
+        json_extract(settings, '$.debug') as debug
+    FROM configs
+]]) do
+    print(string.format("  %-8s theme=%-8s lang=%s debug=%s",
+        row.app, row.theme, row.lang, tostring(row.debug)))
+end
+
+-- json_array_length
+print("\n=== Feature count ===")
+for row in db:nrows([[
+    SELECT app,
+           json_array_length(settings, '$.features') as feature_count
+    FROM configs
+]]) do
+    print(string.format("  %-8s features: %d", row.app, row.feature_count))
+end
+
+-- json_each: แตก JSON array เป็น rows
+print("\n=== All features (json_each) ===")
+for row in db:nrows([[
+    SELECT c.app, f.value as feature
+    FROM configs c,
+         json_each(c.settings, '$.features') f
+    ORDER BY c.app, f.value
+]]) do
+    print(string.format("  %-8s %s", row.app, row.feature))
+end
+
+-- json_patch: อัปเดต JSON
+db:exec([[
+    UPDATE configs
+    SET settings = json_patch(settings, '{"theme":"auto"}')
+    WHERE app = 'admin'
+]])
+
+for row in db:nrows("SELECT settings FROM configs WHERE app='admin'") do
+    print("\nUpdated admin settings:", row.settings)
+end
+
+db:close()
+```
+
+---
+
 ## แบบฝึกหัด
 
 **ข้อ 1**: สร้าง database schema สำหรับระบบจัดการห้องสมุด มีตาราง `books`, `members`, `loans` พร้อม foreign keys และ indexes ที่เหมาะสม เขียนฟังก์ชัน `borrow_book` และ `return_book` พร้อม transaction

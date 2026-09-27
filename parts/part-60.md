@@ -1,2081 +1,2914 @@
-# บทที่ 60: SQLite และ NoSQL Patterns ใน Lua
+# บทที่ 60: Message Queue กับ Redis
 
 ## บทนำ
 
-SQLite เป็น embedded database ที่ไม่ต้องการ server แยกต่างหาก ใช้งานได้ทันทีจาก application เพียงแค่ link library เข้าไป เหมาะสำหรับ desktop applications, mobile apps, หรือ applications ขนาดเล็กถึงกลางที่ไม่ต้องการ scalability ระดับสูง
+Redis เป็น in-memory data structure store ที่นอกจากจะทำหน้าที่เป็น cache แล้ว ยังเป็น message broker ชั้นเยี่ยมอีกด้วย ใน Lua เราใช้ library เช่น `lua-resty-redis` (สำหรับ OpenResty) หรือ `redis-lua` (สำหรับ standalone Lua) เพื่อเชื่อมต่อกับ Redis
+
+Message Queue ด้วย Redis ช่วยให้แอปพลิเคชันสื่อสารแบบ asynchronous ได้ ทำให้ decouple services, handle load spikes และรองรับ background job processing
+
+> **บทก่อนหน้า**: [บทที่ 59: SQLite กับ Lua](part-59.md)
 
 ---
 
-## 60.1 SQLite พื้นฐานด้วย LuaSQLite3
+## 60.1 การเชื่อมต่อ Redis
 
-### ตัวอย่างที่ 1: การเปิดและปิด Database
+### ตัวอย่างที่ 1: Setup และ Connection
 
-```lua
--- sqlite_basics.lua
--- ต้องติดตั้ง: luarocks install lsqlite3
+```bash
+# ติดตั้ง redis-lua
+luarocks install redis-lua
 
-local sqlite3 = require("lsqlite3")
+# หรือสำหรับ OpenResty ใช้ lua-resty-redis (built-in)
+# ตรวจสอบการติดตั้ง
+lua -e "require('redis'); print('redis-lua OK')"
 
--- เปิด database (สร้างใหม่ถ้าไม่มี)
-local db = sqlite3.open("myapp.db")
-
-print("SQLite version:", sqlite3.version())
-print("Database opened successfully")
-
--- ปิด database
-db:close()
-print("Database closed")
-
--- เปิด in-memory database
-local memdb = sqlite3.open(":memory:")
-print("In-memory database opened")
-memdb:close()
+# ติดตั้ง Redis server
+sudo apt-get install redis-server
+# หรือด้วย Docker
+docker run -d -p 6379:6379 redis:7-alpine
 ```
 
-### ตัวอย่างที่ 2: สร้างตารางและ Insert ข้อมูล
-
 ```lua
--- create_table.lua
-local sqlite3 = require("lsqlite3")
+-- redis_connect.lua
+-- ตัวอย่างใช้ redis-lua library
 
-local db = sqlite3.open(":memory:")
+local redis = require("redis")
 
--- สร้างตาราง
-db:exec([[
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        age INTEGER,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-]])
+-- เชื่อมต่อ Redis
+local client = redis.connect("127.0.0.1", 6379)
 
--- Insert ข้อมูล
-local stmt = db:prepare("INSERT INTO users (name, email, age) VALUES (?, ?, ?)")
+-- ทดสอบ connection
+local pong = client:ping()
+print("PING:", pong)  -- PONG
 
-local users_data = {
-    {"สมชาย ใจดี", "somchai@example.com", 30},
-    {"สมหญิง รักษ์ดี", "somying@example.com", 25},
-    {"มานะ ขยันดี", "mana@example.com", 35},
-    {"วิชัย เก่งมาก", "wichai@example.com", 28},
-}
-
-for _, user in ipairs(users_data) do
-    stmt:bind_values(user[1], user[2], user[3])
-    stmt:step()
-    stmt:reset()
-end
-
-stmt:finalize()
-
-print("Inserted", db:changes(), "rows")
-print("Last row ID:", db:last_insert_rowid())
-
-db:close()
-```
-
-### ตัวอย่างที่ 3: Query ข้อมูล
-
-```lua
--- query_data.lua
-local sqlite3 = require("lsqlite3")
-
-local db = sqlite3.open(":memory:")
-
--- สร้างและ populate ตาราง
-db:exec([[
-    CREATE TABLE products (
-        id INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        price REAL NOT NULL,
-        category TEXT,
-        stock INTEGER DEFAULT 0
-    )
-]])
-
-local insert = db:prepare(
-    "INSERT INTO products (name, price, category, stock) VALUES (?, ?, ?, ?)"
-)
-
-local products = {
-    {"Apple MacBook Pro", 59900, "Electronics", 15},
-    {"iPhone 15", 35900, "Electronics", 50},
-    {"โต๊ะไม้", 4500, "Furniture", 30},
-    {"เก้าอี้สำนักงาน", 3200, "Furniture", 45},
-    {"หนังสือ Lua Programming", 350, "Books", 100},
-    {"หนังสือ Clean Code", 420, "Books", 80},
-}
-
-for _, p in ipairs(products) do
-    insert:bind_values(p[1], p[2], p[3], p[4])
-    insert:step()
-    insert:reset()
-end
-insert:finalize()
-
--- Query ทั้งหมด
-print("=== All Products ===")
-for row in db:nrows("SELECT * FROM products ORDER BY price DESC") do
-    print(string.format("  [%d] %s - %.2f บาท (คลัง: %d)",
-        row.id, row.name, row.price, row.stock))
-end
-
--- Query ด้วย WHERE
-print("\n=== Electronics ===")
-local stmt = db:prepare("SELECT * FROM products WHERE category = ? AND price < ?")
-stmt:bind_values("Electronics", 40000)
-for row in stmt:nrows() do
-    print(string.format("  %s - %.2f บาท", row.name, row.price))
-end
-stmt:finalize()
-
--- Aggregate
-print("\n=== Summary by Category ===")
-for row in db:nrows([[
-    SELECT category, 
-           COUNT(*) as count,
-           AVG(price) as avg_price,
-           SUM(stock) as total_stock
-    FROM products 
-    GROUP BY category
-    ORDER BY category
-]]) do
-    print(string.format("  %s: %d สินค้า, ราคาเฉลี่ย %.2f, คลัง %d",
-        row.category, row.count, row.avg_price, row.total_stock))
-end
-
-db:close()
-```
-
----
-
-## 60.2 Prepared Statements และ Transactions
-
-### ตัวอย่างที่ 4: Transaction Management
-
-```lua
--- transactions.lua
-local sqlite3 = require("lsqlite3")
-
-local db = sqlite3.open(":memory:")
-
-db:exec([[
-    CREATE TABLE accounts (
-        id INTEGER PRIMARY KEY,
-        owner TEXT NOT NULL,
-        balance REAL NOT NULL DEFAULT 0
-    )
-]])
-
--- เพิ่มข้อมูลเริ่มต้น
-db:exec([[
-    INSERT INTO accounts (owner, balance) VALUES
-    ('ลูกค้า A', 10000),
-    ('ลูกค้า B', 5000)
-]])
-
--- ฟังก์ชัน transfer เงิน
-local function transfer(db, from_id, to_id, amount)
-    -- ตรวจสอบยอดเงิน
-    local stmt = db:prepare("SELECT balance FROM accounts WHERE id = ?")
-    stmt:bind_values(from_id)
-    local row = stmt:first_row()
-    stmt:finalize()
-
-    if not row then
-        return false, "ไม่พบบัญชีต้นทาง"
+-- ข้อมูล server
+local info = client:info("server")
+-- แสดงเฉพาะ version
+for line in info:gmatch("[^\r\n]+") do
+    if line:match("^redis_version") then
+        print("Redis:", line)
     end
+end
 
-    if row[1] < amount then
-        return false, string.format("ยอดเงินไม่พอ (มี %.2f, ต้องการ %.2f)", row[1], amount)
+-- Authentication (ถ้ามี password)
+-- client:auth("your_password")
+
+-- เลือก database (0-15)
+client:select(0)  -- default database
+
+-- ทดสอบ basic operations
+client:set("hello", "world")
+print("GET hello:", client:get("hello"))
+
+-- ลบ key
+client:del("hello")
+print("After DEL:", client:get("hello"))  -- nil
+
+-- Disconnect
+client:quit()
+print("Disconnected")
+```
+
+### ตัวอย่างที่ 2: Connection Pool
+
+```lua
+-- redis_pool.lua
+-- Connection pool สำหรับ Redis
+
+local redis = require("redis")
+
+local RedisPool = {}
+RedisPool.__index = RedisPool
+
+function RedisPool.new(host, port, pool_size)
+    local self = setmetatable({}, RedisPool)
+    self.host = host or "127.0.0.1"
+    self.port = port or 6379
+    self.pool_size = pool_size or 10
+    self.pool = {}
+    self.available = {}
+    
+    for i = 1, pool_size do
+        local client = redis.connect(self.host, self.port)
+        self.pool[i] = client
+        table.insert(self.available, i)
     end
+    
+    print(string.format("Redis pool: %d connections to %s:%d",
+        pool_size, self.host, self.port))
+    return self
+end
 
-    -- เริ่ม transaction
-    db:exec("BEGIN TRANSACTION")
+function RedisPool:acquire()
+    if #self.available == 0 then
+        error("Redis pool exhausted!")
+    end
+    local idx = table.remove(self.available)
+    return self.pool[idx], idx
+end
 
-    local ok, err = pcall(function()
-        local deduct = db:prepare("UPDATE accounts SET balance = balance - ? WHERE id = ?")
-        deduct:bind_values(amount, from_id)
-        deduct:step()
-        deduct:finalize()
+function RedisPool:release(idx)
+    table.insert(self.available, idx)
+end
 
-        local credit = db:prepare("UPDATE accounts SET balance = balance + ? WHERE id = ?")
-        credit:bind_values(amount, to_id)
-        credit:step()
-        credit:finalize()
+function RedisPool:execute(cmd, ...)
+    local client, idx = self:acquire()
+    local ok, result = pcall(function()
+        return client[cmd](client, ...)
     end)
-
-    if ok then
-        db:exec("COMMIT")
-        return true, "โอนเงินสำเร็จ"
-    else
-        db:exec("ROLLBACK")
-        return false, "เกิดข้อผิดพลาด: " .. tostring(err)
-    end
-end
-
--- ทดสอบ transfer
-local function show_balances()
-    for row in db:nrows("SELECT owner, balance FROM accounts ORDER BY id") do
-        print(string.format("  %s: %.2f บาท", row.owner, row.balance))
-    end
-end
-
-print("=== ก่อน Transfer ===")
-show_balances()
-
-local ok, msg = transfer(db, 1, 2, 3000)
-print("\nTransfer 3000 บาท:", msg)
-print("=== หลัง Transfer ===")
-show_balances()
-
--- ทดสอบ transfer ที่ล้มเหลว
-ok, msg = transfer(db, 2, 1, 99999)
-print("\nTransfer 99999 บาท:", msg)
-print("=== ยอดไม่เปลี่ยน ===")
-show_balances()
-
-db:close()
-```
-
-### ตัวอย่างที่ 5: Batch Insert ด้วย Transaction
-
-```lua
--- batch_insert.lua
-local sqlite3 = require("lsqlite3")
-local os = require("os")
-
-local db = sqlite3.open(":memory:")
-
-db:exec([[
-    CREATE TABLE logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        level TEXT NOT NULL,
-        message TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-    )
-]])
-
--- วัดประสิทธิภาพ: insert ทีละรายการ vs batch
-local function time_insert(label, count, use_transaction)
-    local start = os.clock()
-
-    if use_transaction then
-        db:exec("BEGIN TRANSACTION")
-    end
-
-    local stmt = db:prepare(
-        "INSERT INTO logs (level, message, created_at) VALUES (?, ?, ?)"
-    )
-
-    local levels = {"INFO", "WARN", "ERROR", "DEBUG"}
-    for i = 1, count do
-        local level = levels[(i % 4) + 1]
-        stmt:bind_values(level, "Log message #" .. i, os.time())
-        stmt:step()
-        stmt:reset()
-    end
-
-    stmt:finalize()
-
-    if use_transaction then
-        db:exec("COMMIT")
-    end
-
-    local elapsed = os.clock() - start
-    print(string.format("  %s: %d rows ใน %.3f วินาที",
-        label, count, elapsed))
-
-    -- ล้างข้อมูล
-    db:exec("DELETE FROM logs")
-end
-
-print("=== Benchmark Insert ===")
-time_insert("ไม่มี Transaction", 100, false)
-time_insert("มี Transaction", 100, true)
-time_insert("Transaction 1000 rows", 1000, true)
-
-db:close()
-```
-
----
-
-## 60.3 Advanced Queries และ Indexes
-
-### ตัวอย่างที่ 6: Indexes และ Query Optimization
-
-```lua
--- indexes.lua
-local sqlite3 = require("lsqlite3")
-
-local db = sqlite3.open(":memory:")
-
--- สร้างตารางและ indexes
-db:exec([[
-    CREATE TABLE orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customer_id INTEGER NOT NULL,
-        product_id INTEGER NOT NULL,
-        quantity INTEGER NOT NULL,
-        total_price REAL NOT NULL,
-        status TEXT DEFAULT 'pending',
-        order_date TEXT NOT NULL,
-        shipped_date TEXT
-    );
-    
-    -- สร้าง indexes เพื่อเพิ่มประสิทธิภาพ
-    CREATE INDEX idx_orders_customer ON orders(customer_id);
-    CREATE INDEX idx_orders_status ON orders(status);
-    CREATE INDEX idx_orders_date ON orders(order_date);
-    
-    -- Composite index
-    CREATE INDEX idx_orders_customer_date ON orders(customer_id, order_date);
-]])
-
--- Populate ข้อมูลทดสอบ
-db:exec("BEGIN")
-local insert = db:prepare([[
-    INSERT INTO orders (customer_id, product_id, quantity, total_price, status, order_date)
-    VALUES (?, ?, ?, ?, ?, ?)
-]])
-
-local statuses = {"pending", "processing", "shipped", "delivered", "cancelled"}
-math.randomseed(42)
-
-for i = 1, 500 do
-    local customer_id = math.random(1, 50)
-    local product_id = math.random(1, 100)
-    local qty = math.random(1, 10)
-    local price = qty * (math.random(100, 5000) / 10)
-    local status = statuses[math.random(#statuses)]
-    local days_ago = math.random(0, 365)
-    local date = string.format("2024-%02d-%02d",
-        math.random(1, 12), math.random(1, 28))
-
-    insert:bind_values(customer_id, product_id, qty, price, status, date)
-    insert:step()
-    insert:reset()
-end
-insert:finalize()
-db:exec("COMMIT")
-
--- Query ที่ใช้ประโยชน์จาก index
-print("=== Orders by Customer ===")
-local stmt = db:prepare([[
-    SELECT COUNT(*) as cnt, SUM(total_price) as total
-    FROM orders 
-    WHERE customer_id = ? AND status = 'delivered'
-]])
-stmt:bind_values(1)
-for row in stmt:nrows() do
-    print(string.format("  Customer 1 delivered: %d orders, total %.2f", 
-        row.cnt, row.total or 0))
-end
-stmt:finalize()
-
--- Complex JOIN-like query (SQLite ไม่มี JOIN กับ in-memory tables แต่ทำได้)
-print("\n=== Top 5 Customers by Revenue ===")
-for row in db:nrows([[
-    SELECT 
-        customer_id,
-        COUNT(*) as order_count,
-        SUM(total_price) as total_revenue,
-        AVG(total_price) as avg_order
-    FROM orders
-    WHERE status IN ('shipped', 'delivered')
-    GROUP BY customer_id
-    ORDER BY total_revenue DESC
-    LIMIT 5
-]]) do
-    print(string.format("  Customer %d: %d orders, %.2f รวม",
-        row.customer_id, row.order_count, row.total_revenue))
-end
-
-db:close()
-```
-
-### ตัวอย่างที่ 7: Full-Text Search ด้วย FTS5
-
-```lua
--- fts_search.lua
-local sqlite3 = require("lsqlite3")
-
-local db = sqlite3.open(":memory:")
-
--- สร้าง FTS virtual table
-db:exec([[
-    CREATE VIRTUAL TABLE articles USING fts5(
-        title,
-        content,
-        author,
-        tokenize = "unicode61 remove_diacritics 1"
-    )
-]])
-
--- เพิ่มบทความ
-local articles = {
-    {
-        title = "Introduction to Lua Programming",
-        content = "Lua is a powerful scripting language designed for embedded systems. It has a simple syntax and is easy to learn.",
-        author = "John Doe"
-    },
-    {
-        title = "Advanced Lua Techniques",
-        content = "Learn advanced concepts like metatables, coroutines, and closures in Lua programming language.",
-        author = "Jane Smith"
-    },
-    {
-        title = "Lua for Game Development",
-        content = "Many game engines use Lua for scripting. LÖVE2D and Defold are popular choices for indie game developers.",
-        author = "Game Dev"
-    },
-    {
-        title = "SQLite with Lua",
-        content = "SQLite is an embedded database perfect for Lua applications. Learn how to use lsqlite3 library.",
-        author = "DB Expert"
-    },
-    {
-        title = "Web Development with OpenResty",
-        content = "OpenResty combines Nginx with Lua to create high-performance web applications and APIs.",
-        author = "Web Dev"
-    },
-}
-
-local insert = db:prepare("INSERT INTO articles VALUES (?, ?, ?)")
-for _, article in ipairs(articles) do
-    insert:bind_values(article.title, article.content, article.author)
-    insert:step()
-    insert:reset()
-end
-insert:finalize()
-
--- ค้นหา
-local function search(query)
-    print(string.format("\n=== Search: '%s' ===", query))
-    local stmt = db:prepare([[
-        SELECT title, author, 
-               snippet(articles, 1, '<mark>', '</mark>', '...', 15) as excerpt
-        FROM articles 
-        WHERE articles MATCH ?
-        ORDER BY rank
-    ]])
-    stmt:bind_values(query)
-
-    local found = 0
-    for row in stmt:nrows() do
-        found = found + 1
-        print(string.format("  [%d] %s (โดย %s)", found, row.title, row.author))
-        print(string.format("      %s", row.excerpt))
-    end
-
-    if found == 0 then
-        print("  ไม่พบผลลัพธ์")
-    end
-    stmt:finalize()
-end
-
-search("Lua")
-search("game development")
-search("embedded database")
-search("Python")  -- ไม่มีใน database
-
-db:close()
-```
-
----
-
-## 60.4 ORM Pattern สำหรับ SQLite
-
-### ตัวอย่างที่ 8: Simple ORM
-
-```lua
--- simple_orm.lua
-local sqlite3 = require("lsqlite3")
-
--- Base Model class
-local Model = {}
-Model.__index = Model
-
-function Model.new(db, table_name, schema)
-    local instance = setmetatable({}, Model)
-    instance._db = db
-    instance._table = table_name
-    instance._schema = schema
-    instance:_create_table()
-    return instance
-end
-
-function Model:_create_table()
-    local columns = {"id INTEGER PRIMARY KEY AUTOINCREMENT"}
-    for _, col in ipairs(self._schema) do
-        table.insert(columns, col.name .. " " .. col.type ..
-            (col.not_null and " NOT NULL" or "") ..
-            (col.default ~= nil and " DEFAULT " .. tostring(col.default) or ""))
-    end
-    table.insert(columns, "created_at INTEGER DEFAULT (strftime('%s', 'now'))")
-    table.insert(columns, "updated_at INTEGER DEFAULT (strftime('%s', 'now'))")
-
-    local sql = string.format("CREATE TABLE IF NOT EXISTS %s (%s)",
-        self._table, table.concat(columns, ", "))
-    self._db:exec(sql)
-end
-
-function Model:create(data)
-    local cols = {}
-    local placeholders = {}
-    local values = {}
-
-    for _, col in ipairs(self._schema) do
-        if data[col.name] ~= nil then
-            table.insert(cols, col.name)
-            table.insert(placeholders, "?")
-            table.insert(values, data[col.name])
-        end
-    end
-
-    local sql = string.format(
-        "INSERT INTO %s (%s) VALUES (%s)",
-        self._table,
-        table.concat(cols, ", "),
-        table.concat(placeholders, ", ")
-    )
-
-    local stmt = self._db:prepare(sql)
-    stmt:bind_values(table.unpack(values))
-    stmt:step()
-    stmt:finalize()
-
-    return self:find(self._db:last_insert_rowid())
-end
-
-function Model:find(id)
-    local stmt = self._db:prepare(
-        "SELECT * FROM " .. self._table .. " WHERE id = ?"
-    )
-    stmt:bind_values(id)
-    local row = stmt:first_row()
-    stmt:finalize()
-
-    if not row then return nil end
-
-    -- แปลง numeric row เป็น named table
-    local result = {id = row[1]}
-    for i, col in ipairs(self._schema) do
-        result[col.name] = row[i + 1]
-    end
-    result.created_at = row[#self._schema + 2]
-    result.updated_at = row[#self._schema + 3]
+    self:release(idx)
+    if not ok then error(result) end
     return result
 end
 
-function Model:where(conditions, limit, order)
-    local wheres = {}
-    local values = {}
-
-    for col, val in pairs(conditions) do
-        if type(val) == "table" then
-            -- Support {op, value}
-            table.insert(wheres, col .. " " .. val[1] .. " ?")
-            table.insert(values, val[2])
-        else
-            table.insert(wheres, col .. " = ?")
-            table.insert(values, val)
-        end
-    end
-
-    local sql = "SELECT * FROM " .. self._table
-    if #wheres > 0 then
-        sql = sql .. " WHERE " .. table.concat(wheres, " AND ")
-    end
-    if order then sql = sql .. " ORDER BY " .. order end
-    if limit then sql = sql .. " LIMIT " .. limit end
-
-    local stmt = self._db:prepare(sql)
-    if #values > 0 then
-        stmt:bind_values(table.unpack(values))
-    end
-
+function RedisPool:pipeline(commands)
+    local client, idx = self:acquire()
     local results = {}
-    for numeric_row in stmt:urows() do
-        local row = {id = numeric_row[1]}
-        for i, col in ipairs(self._schema) do
-            row[col.name] = numeric_row[i + 1]
-        end
-        table.insert(results, row)
-    end
-    stmt:finalize()
-
+    
+    local ok, err = pcall(function()
+        client:pipeline(function(pipe)
+            for _, cmd in ipairs(commands) do
+                pipe[cmd[1]](pipe, table.unpack(cmd, 2))
+            end
+        end)
+    end)
+    
+    self:release(idx)
+    if not ok then error(err) end
     return results
 end
 
-function Model:update(id, data)
-    local sets = {}
-    local values = {}
-
-    for _, col in ipairs(self._schema) do
-        if data[col.name] ~= nil then
-            table.insert(sets, col.name .. " = ?")
-            table.insert(values, data[col.name])
-        end
+function RedisPool:close()
+    for _, client in ipairs(self.pool) do
+        pcall(function() client:quit() end)
     end
-
-    table.insert(sets, "updated_at = strftime('%s', 'now')")
-    table.insert(values, id)
-
-    local sql = string.format(
-        "UPDATE %s SET %s WHERE id = ?",
-        self._table, table.concat(sets, ", ")
-    )
-
-    local stmt = self._db:prepare(sql)
-    stmt:bind_values(table.unpack(values))
-    stmt:step()
-    stmt:finalize()
-
-    return self:find(id)
+    print("Redis pool closed")
 end
 
-function Model:delete(id)
-    local stmt = self._db:prepare(
-        "DELETE FROM " .. self._table .. " WHERE id = ?"
-    )
-    stmt:bind_values(id)
-    stmt:step()
-    local affected = self._db:changes()
-    stmt:finalize()
-    return affected > 0
-end
+-- ใช้งาน
+local pool = RedisPool.new("127.0.0.1", 6379, 5)
 
-function Model:count(conditions)
-    local wheres = {}
-    local values = {}
+-- Execute commands
+pool:execute("set", "test_key", "test_value")
+print("GET:", pool:execute("get", "test_key"))
+pool:execute("del", "test_key")
 
-    if conditions then
-        for col, val in pairs(conditions) do
-            table.insert(wheres, col .. " = ?")
-            table.insert(values, val)
-        end
-    end
-
-    local sql = "SELECT COUNT(*) FROM " .. self._table
-    if #wheres > 0 then
-        sql = sql .. " WHERE " .. table.concat(wheres, " AND ")
-    end
-
-    local stmt = self._db:prepare(sql)
-    if #values > 0 then
-        stmt:bind_values(table.unpack(values))
-    end
-    local row = stmt:first_row()
-    stmt:finalize()
-
-    return row and row[1] or 0
-end
-
--- ทดสอบ ORM
-local db = sqlite3.open(":memory:")
-
--- สร้าง User model
-local User = Model.new(db, "users", {
-    {name = "name", type = "TEXT", not_null = true},
-    {name = "email", type = "TEXT", not_null = true},
-    {name = "age", type = "INTEGER"},
-    {name = "active", type = "INTEGER", default = 1},
-})
-
--- Create
-print("=== Creating Users ===")
-local u1 = User:create({name = "สมชาย", email = "somchai@test.com", age = 30})
-local u2 = User:create({name = "สมหญิง", email = "somying@test.com", age = 25})
-local u3 = User:create({name = "มานะ", email = "mana@test.com", age = 35, active = 0})
-
-print("Created user:", u1.id, u1.name, u1.email)
-
--- Find
-print("\n=== Finding User ===")
-local found = User:find(2)
-print("Found:", found.name, "age:", found.age)
-
--- Where
-print("\n=== Active Users ===")
-local actives = User:where({active = 1}, nil, "name ASC")
-for _, u in ipairs(actives) do
-    print("  -", u.name, "(อายุ", u.age, ")")
-end
-
--- Update
-print("\n=== Update User ===")
-local updated = User:update(1, {age = 31, active = 1})
-print("Updated:", updated.name, "age:", updated.age)
-
--- Count
-print("\n=== Count ===")
-print("Total users:", User:count())
-print("Active users:", User:count({active = 1}))
-
--- Delete
-print("\n=== Delete User ===")
-local deleted = User:delete(3)
-print("Deleted:", deleted)
-print("Remaining:", User:count())
-
-db:close()
+print("Available connections:", #pool.available)
+pool:close()
 ```
 
 ---
 
-## 60.5 NoSQL Patterns ใน Lua
+## 60.2 LPUSH/RPOP Queue
 
-### ตัวอย่างที่ 9: Document Store ด้วย SQLite JSON
+### ตัวอย่างที่ 3: Simple Queue ด้วย LPUSH/RPOP
 
 ```lua
--- document_store.lua
--- SQLite 3.38+ รองรับ JSON functions
+-- simple_queue.lua
+local redis = require("redis")
+local json = require("dkjson")  -- หรือ cjson
 
-local sqlite3 = require("lsqlite3")
+local client = redis.connect("127.0.0.1", 6379)
 
-local db = sqlite3.open(":memory:")
+-- Simple Queue: LPUSH เพิ่มหัว, RPOP ดึงท้าย (FIFO)
+local QUEUE_KEY = "jobs:email"
 
--- สร้าง document store table
-db:exec([[
-    CREATE TABLE documents (
-        id TEXT PRIMARY KEY,
-        collection TEXT NOT NULL,
-        data TEXT NOT NULL,  -- JSON
-        created_at INTEGER DEFAULT (strftime('%s', 'now')),
-        updated_at INTEGER DEFAULT (strftime('%s', 'now'))
-    );
+-- Producer: เพิ่ม jobs เข้า queue
+local function enqueue(job)
+    local payload = json.encode(job)
+    local len = client:lpush(QUEUE_KEY, payload)
+    print(string.format("Enqueued job '%s' (queue length: %d)", 
+        job.type, len))
+    return len
+end
+
+-- Consumer: ดึง job จาก queue
+local function dequeue()
+    local payload = client:rpop(QUEUE_KEY)
+    if not payload then return nil end
+    return json.decode(payload)
+end
+
+-- Peek (ดูโดยไม่ลบ)
+local function peek()
+    local payload = client:lindex(QUEUE_KEY, -1)
+    if not payload then return nil end
+    return json.decode(payload)
+end
+
+-- Queue size
+local function queue_size()
+    return client:llen(QUEUE_KEY)
+end
+
+-- ล้าง queue
+client:del(QUEUE_KEY)
+
+-- Enqueue jobs
+enqueue({type = "welcome_email", user_id = 101, email = "alice@example.com"})
+enqueue({type = "password_reset", user_id = 102, email = "bob@example.com"})
+enqueue({type = "order_confirm",  user_id = 103, email = "carol@example.com"})
+enqueue({type = "newsletter",     user_id = 104, email = "dave@example.com"})
+
+print("Queue size:", queue_size())
+print("Next job:", peek() and peek().type or "empty")
+
+-- Dequeue และ process
+print("\nProcessing jobs:")
+while true do
+    local job = dequeue()
+    if not job then break end
+    print(string.format("  Processing: %s for user %d (%s)",
+        job.type, job.user_id, job.email))
+    -- ทำงานจริงที่นี่ เช่น send_email(job)
+end
+
+print("Queue empty:", queue_size() == 0)
+client:quit()
+```
+
+### ตัวอย่างที่ 4: BRPOP - Blocking Queue
+
+```lua
+-- blocking_queue.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+-- BRPOP = Blocking RPOP: รอจนมี item ใน queue
+
+-- Worker process
+local function run_worker(worker_id, queues, timeout)
+    local client = redis.connect("127.0.0.1", 6379)
+    print(string.format("Worker %d started, watching: %s",
+        worker_id, table.concat(queues, ", ")))
     
-    CREATE INDEX idx_doc_collection ON documents(collection);
-]])
-
--- JSON encoding/decoding แบบง่าย
-local function json_encode(t)
-    if type(t) == "number" then return tostring(t) end
-    if type(t) == "boolean" then return t and "true" or "false" end
-    if type(t) == "string" then
-        return '"' .. t:gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
-    end
-    if type(t) == "table" then
-        -- ตรวจว่าเป็น array หรือ object
-        local is_array = #t > 0
-        if is_array then
-            local parts = {}
-            for _, v in ipairs(t) do
-                table.insert(parts, json_encode(v))
+    local running = true
+    local processed = 0
+    
+    while running do
+        -- BRPOP รอสูงสุด timeout วินาที
+        -- คืนค่า: {queue_name, value} หรือ nil ถ้า timeout
+        local result = client:brpop(table.unpack(queues), timeout or 5)
+        
+        if result then
+            local queue_name = result[1]
+            local payload    = result[2]
+            
+            local ok, job = pcall(json.decode, payload)
+            if ok and job then
+                print(string.format("Worker %d: Processing from [%s]: %s",
+                    worker_id, queue_name, job.type or "unknown"))
+                
+                -- simulate work
+                -- process_job(job)
+                processed = processed + 1
+                
+                -- หยุด worker เมื่อได้รับ stop signal
+                if job.type == "STOP" then
+                    running = false
+                end
+            else
+                print(string.format("Worker %d: Invalid payload: %s", 
+                    worker_id, payload))
             end
-            return "[" .. table.concat(parts, ",") .. "]"
         else
-            local parts = {}
-            for k, v in pairs(t) do
-                table.insert(parts, '"' .. k .. '":' .. json_encode(v))
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
+            -- Timeout - ตรวจสอบสถานะ
+            print(string.format("Worker %d: No jobs (timeout), processed=%d",
+                worker_id, processed))
+            -- สามารถ break ได้ถ้าต้องการ
+            break  -- ออกจาก loop สำหรับตัวอย่างนี้
         end
     end
-    return "null"
+    
+    print(string.format("Worker %d: Shutdown, processed %d jobs",
+        worker_id, processed))
+    client:quit()
 end
 
--- UUID generator แบบง่าย
-local function uuid()
-    math.randomseed(os.time() + math.random(1000000))
-    return string.format("%08x-%04x-%04x-%04x-%012x",
-        math.random(0xFFFFFFFF),
-        math.random(0xFFFF),
-        math.random(0xFFFF),
-        math.random(0xFFFF),
-        math.random(0xFFFFFFFFFFFF)
-    )
-end
-
--- DocumentStore class
-local DocumentStore = {}
-DocumentStore.__index = DocumentStore
-
-function DocumentStore.new(db)
-    return setmetatable({_db = db}, DocumentStore)
-end
-
-function DocumentStore:insert(collection, doc)
-    local id = doc._id or uuid()
-    doc._id = id
-
-    local stmt = self._db:prepare([[
-        INSERT OR REPLACE INTO documents (id, collection, data)
-        VALUES (?, ?, ?)
-    ]])
-    stmt:bind_values(id, collection, json_encode(doc))
-    stmt:step()
-    stmt:finalize()
-
-    return id
-end
-
-function DocumentStore:findById(collection, id)
-    local stmt = self._db:prepare([[
-        SELECT data FROM documents WHERE id = ? AND collection = ?
-    ]])
-    stmt:bind_values(id, collection)
-    local row = stmt:first_row()
-    stmt:finalize()
-
-    if row then
-        -- ใน production ควรใช้ JSON library ที่ดีกว่า
-        return {_raw = row[1], _id = id}
+-- Producer
+local function produce_jobs()
+    local client = redis.connect("127.0.0.1", 6379)
+    
+    local jobs = {
+        {type = "email",  data = "Send welcome email"},
+        {type = "report", data = "Generate monthly report"},
+        {type = "image",  data = "Resize uploaded image"},
+        {type = "STOP",   data = ""},
+    }
+    
+    for _, job in ipairs(jobs) do
+        client:lpush("jobs:default", json.encode(job))
+        print("Produced:", job.type)
     end
-    return nil
+    
+    client:quit()
 end
 
-function DocumentStore:count(collection)
-    local stmt = self._db:prepare(
-        "SELECT COUNT(*) FROM documents WHERE collection = ?"
-    )
-    stmt:bind_values(collection)
-    local row = stmt:first_row()
-    stmt:finalize()
-    return row and row[1] or 0
-end
+-- ในตัวอย่างนี้ run แบบ sequential (ใน production ใช้ separate processes)
+produce_jobs()
+run_worker(1, {"jobs:default"}, 2)
+```
 
-function DocumentStore:listAll(collection, limit)
-    local sql = "SELECT id, data FROM documents WHERE collection = ? ORDER BY created_at DESC"
-    if limit then sql = sql .. " LIMIT " .. limit end
+---
 
-    local stmt = self._db:prepare(sql)
-    stmt:bind_values(collection)
+## 60.3 Pub/Sub Patterns
 
-    local results = {}
-    for row in stmt:urows() do
-        table.insert(results, {_id = row[1], _raw = row[2]})
+### ตัวอย่างที่ 5: Publisher
+
+```lua
+-- publisher.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+local client = redis.connect("127.0.0.1", 6379)
+
+-- Publish messages ไปยัง channel
+local function publish(channel, message)
+    local payload
+    if type(message) == "table" then
+        payload = json.encode(message)
+    else
+        payload = tostring(message)
     end
-    stmt:finalize()
-
-    return results
+    
+    local subscribers = client:publish(channel, payload)
+    return subscribers  -- จำนวน subscribers ที่ได้รับ
 end
 
-function DocumentStore:delete(collection, id)
-    local stmt = self._db:prepare(
-        "DELETE FROM documents WHERE id = ? AND collection = ?"
+-- Publish ไปยัง channels ต่างๆ
+local subs
+
+subs = publish("notifications:user:101", {
+    type = "like",
+    from = "alice",
+    post_id = 42
+})
+print("notification delivered to", subs, "subscribers")
+
+subs = publish("chat:room:general", {
+    user = "bob",
+    text = "Hello everyone!",
+    ts   = os.time()
+})
+print("chat message delivered to", subs, "subscribers")
+
+subs = publish("system:alerts", {
+    level   = "warning",
+    message = "High CPU usage detected",
+    server  = "web-01"
+})
+print("alert delivered to", subs, "subscribers")
+
+-- Pattern-based channel (wildcard)
+subs = publish("events:orders:created", {
+    order_id = 12345,
+    total    = 299.99,
+    user_id  = 101
+})
+print("order event delivered to", subs, "subscribers")
+
+client:quit()
+```
+
+### ตัวอย่างที่ 6: Subscriber
+
+```lua
+-- subscriber.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+local client = redis.connect("127.0.0.1", 6379)
+
+-- Handler functions
+local handlers = {}
+
+handlers["notifications:user:101"] = function(channel, data)
+    if data.type == "like" then
+        print(string.format("  [NOTIFICATION] %s liked your post #%d",
+            data.from, data.post_id))
+    end
+end
+
+handlers["chat:room:general"] = function(channel, data)
+    print(string.format("  [CHAT] %s: %s", data.user, data.text))
+end
+
+handlers["system:alerts"] = function(channel, data)
+    print(string.format("  [ALERT:%s] %s: %s",
+        data.level:upper(), data.server, data.message))
+end
+
+-- Subscribe to channels
+local channels = {
+    "notifications:user:101",
+    "chat:room:general",
+    "system:alerts"
+}
+
+print("Subscribing to:", table.concat(channels, ", "))
+
+-- redis-lua subscribe callback
+client:subscribe(table.unpack(channels))
+
+-- Listen loop
+local received = 0
+local max_messages = 5  -- รับแค่ 5 messages แล้วหยุด (สำหรับตัวอย่าง)
+
+for msg in client:receive() do
+    if msg.kind == "message" then
+        local ok, data = pcall(json.decode, msg.payload)
+        if ok and type(data) == "table" then
+            local handler = handlers[msg.channel]
+            if handler then
+                handler(msg.channel, data)
+            else
+                print(string.format("  [%s] %s", msg.channel, msg.payload))
+            end
+        end
+        received = received + 1
+        if received >= max_messages then break end
+    elseif msg.kind == "subscribe" then
+        print(string.format("  Subscribed to '%s' (total: %d)",
+            msg.channel, msg.number))
+    end
+end
+
+client:unsubscribe()
+client:quit()
+```
+
+### ตัวอย่างที่ 7: Pattern Subscribe (PSUBSCRIBE)
+
+```lua
+-- pattern_subscribe.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+local client = redis.connect("127.0.0.1", 6379)
+
+-- PSUBSCRIBE รองรับ wildcard patterns:
+-- * = ตัวอักษรอะไรก็ได้
+-- ? = ตัวอักษรหนึ่งตัว
+-- [abc] = ตัวอักษรใดตัวหนึ่งใน set
+
+-- Subscribe ด้วย patterns
+client:psubscribe(
+    "events:orders:*",      -- orders ทุกประเภท
+    "notifications:user:*", -- notifications ทุก user
+    "system:*"              -- system messages ทั้งหมด
+)
+
+print("Pattern subscribed")
+
+-- Event router
+local function route_event(pattern, channel, payload)
+    local ok, data = pcall(json.decode, payload)
+    if not ok then data = {raw = payload} end
+    
+    -- Extract event type from channel
+    local parts = {}
+    for p in channel:gmatch("[^:]+") do
+        table.insert(parts, p)
+    end
+    
+    local category = parts[1]
+    
+    if category == "events" then
+        local resource = parts[2]
+        local action   = parts[3]
+        print(string.format("  [EVENT] %s.%s - %s",
+            resource, action, json.encode(data)))
+    elseif category == "notifications" then
+        local user_id = parts[3]
+        print(string.format("  [NOTIFY] User %s: %s",
+            user_id, json.encode(data)))
+    elseif category == "system" then
+        print(string.format("  [SYSTEM] %s", json.encode(data)))
+    end
+end
+
+-- Listen
+local count = 0
+for msg in client:receive() do
+    if msg.kind == "pmessage" then
+        route_event(msg.pattern, msg.channel, msg.payload)
+        count = count + 1
+        if count >= 3 then break end
+    elseif msg.kind == "psubscribe" then
+        print(string.format("  Psubscribed to '%s'", msg.channel))
+    end
+end
+
+client:punsubscribe()
+client:quit()
+```
+
+---
+
+## 60.4 Redis Streams
+
+### ตัวอย่างที่ 8: XADD - เพิ่ม Events ใน Stream
+
+```lua
+-- xadd_stream.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+local client = redis.connect("127.0.0.1", 6379)
+
+local STREAM = "events:log"
+
+-- ล้าง stream เก่า
+client:del(STREAM)
+
+-- XADD เพิ่ม event เข้า stream
+-- syntax: XADD key [MAXLEN count] id field value [field value ...]
+-- id = "*" ให้ Redis สร้างอัตโนมัติ
+
+-- เพิ่ม events แบบธรรมดา
+local id1 = client:xadd(STREAM, "*",
+    "type",    "user.login",
+    "user_id", "101",
+    "ip",      "192.168.1.1",
+    "ts",      tostring(os.time()))
+
+print("Added event:", id1)  -- เช่น 1706000000000-0
+
+-- เพิ่ม events ด้วย custom id prefix
+local id2 = client:xadd(STREAM, "*",
+    "type",      "order.created",
+    "order_id",  "ORD-2025-001",
+    "user_id",   "102",
+    "amount",    "299.99")
+
+print("Added event:", id2)
+
+-- XADD พร้อม MAXLEN (จำกัดขนาด stream)
+-- ~ = approximate trimming (เร็วกว่า)
+local id3 = client:xadd(STREAM, "MAXLEN", "~", 1000, "*",
+    "type",    "page.view",
+    "user_id", "103",
+    "page",    "/products/42")
+
+print("Added with maxlen:", id3)
+
+-- ดูขนาด stream
+local len = client:xlen(STREAM)
+print("Stream length:", len)
+
+-- ดู range ของ ids
+local first, last = client:xrange(STREAM, "-", "+", "COUNT", 1),
+                    client:xrevrange(STREAM, "+", "-", "COUNT", 1)
+if first and first[1] then
+    print("First ID:", first[1][1])
+end
+
+client:quit()
+```
+
+### ตัวอย่างที่ 9: XREAD - อ่าน Stream
+
+```lua
+-- xread_stream.lua
+local redis = require("redis")
+
+local client = redis.connect("127.0.0.1", 6379)
+local STREAM = "events:log"
+
+-- Helper: parse stream entry
+local function parse_entry(entry)
+    local id = entry[1]
+    local fields = entry[2]
+    local data = {_id = id}
+    for i = 1, #fields, 2 do
+        data[fields[i]] = fields[i+1]
+    end
+    return data
+end
+
+-- XRANGE - ดึงทุก event ใน range
+print("=== All events (XRANGE) ===")
+local entries = client:xrange(STREAM, "-", "+")
+for _, entry in ipairs(entries or {}) do
+    local e = parse_entry(entry)
+    print(string.format("  [%s] type=%s user=%s",
+        e._id, e.type or "?", e.user_id or "?"))
+end
+
+-- XREAD - อ่าน events หลังจาก id ที่กำหนด
+print("\n=== XREAD from beginning ===")
+local result = client:xread("COUNT", 10, "STREAMS", STREAM, "0")
+if result then
+    for _, stream_data in ipairs(result) do
+        local stream_name = stream_data[1]
+        local events = stream_data[2]
+        print("Stream:", stream_name)
+        for _, entry in ipairs(events) do
+            local e = parse_entry(entry)
+            print(string.format("  [%s] %s", e._id, e.type or "?"))
+        end
+    end
+end
+
+-- XREVRANGE - ดึง events ล่าสุดก่อน
+print("\n=== Latest 2 events (XREVRANGE) ===")
+local latest = client:xrevrange(STREAM, "+", "-", "COUNT", 2)
+for _, entry in ipairs(latest or {}) do
+    local e = parse_entry(entry)
+    print(string.format("  [%s] %s", e._id, e.type or "?"))
+end
+
+-- XREAD แบบ blocking (รอ events ใหม่)
+-- local result = client:xread("COUNT", 10, "BLOCK", 5000, "STREAMS", STREAM, "$")
+-- "$" = เริ่มจาก id ล่าสุด (เฉพาะ events ใหม่)
+
+client:quit()
+```
+
+---
+
+## 60.5 Consumer Groups
+
+### ตัวอย่างที่ 10: สร้าง Consumer Group
+
+```lua
+-- consumer_group.lua
+local redis = require("redis")
+
+local client = redis.connect("127.0.0.1", 6379)
+local STREAM = "jobs:processing"
+local GROUP  = "workers"
+
+-- ล้าง stream เก่า
+client:del(STREAM)
+
+-- สร้าง Consumer Group
+-- XGROUP CREATE stream group $ MKSTREAM
+-- $ = เริ่มจาก events ใหม่เท่านั้น
+-- 0 = เริ่มจากต้น stream
+local ok, err = pcall(function()
+    client:xgroup("CREATE", STREAM, GROUP, "0", "MKSTREAM")
+end)
+if ok then
+    print("Consumer group '" .. GROUP .. "' created")
+else
+    -- อาจมี group อยู่แล้ว
+    print("Group exists or error:", err)
+end
+
+-- เพิ่ม jobs
+for i = 1, 5 do
+    client:xadd(STREAM, "*",
+        "job_id",   tostring(i),
+        "type",     "process_data",
+        "payload",  "data_" .. i,
+        "priority", tostring(math.random(1, 5)))
+end
+
+print("Added 5 jobs to stream")
+
+-- ดู group info
+local groups = client:xinfo("GROUPS", STREAM)
+if groups then
+    print("\nGroup info:")
+    for _, g in ipairs(groups) do
+        -- g คือ flat array: {key, val, key, val, ...}
+        local info = {}
+        for i = 1, #g, 2 do
+            info[g[i]] = g[i+1]
+        end
+        print(string.format("  name=%s pending=%s consumers=%s",
+            info["name"] or "?",
+            info["pending"] or "?",
+            info["consumers"] or "?"))
+    end
+end
+
+client:quit()
+```
+
+### ตัวอย่างที่ 11: XREADGROUP - Consumer Worker
+
+```lua
+-- xreadgroup_worker.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+local STREAM   = "jobs:processing"
+local GROUP    = "workers"
+
+-- Helper: parse stream entry to table
+local function parse_entry(entry)
+    local id = entry[1]
+    local fields = entry[2]
+    local data = {_id = id}
+    for i = 1, #fields, 2 do
+        data[fields[i]] = fields[i+1]
+    end
+    return data
+end
+
+-- Worker function
+local function run_consumer(consumer_id)
+    local client = redis.connect("127.0.0.1", 6379)
+    local consumer_name = "worker-" .. consumer_id
+    
+    print(string.format("Consumer '%s' started", consumer_name))
+    
+    local processed = 0
+    local max_jobs = 3  -- process 3 jobs แล้วหยุด (สำหรับตัวอย่าง)
+    
+    while processed < max_jobs do
+        -- XREADGROUP: ดึง jobs ที่ยังไม่มีใครเอา
+        -- ">" = jobs ใหม่ที่ยังไม่ถูก deliver
+        local result = client:xreadgroup(
+            "GROUP", GROUP, consumer_name,
+            "COUNT", 1,
+            "BLOCK", 2000,  -- block 2 วินาที
+            "STREAMS", STREAM, ">"
+        )
+        
+        if result and result[1] then
+            local stream_data = result[1]
+            local events = stream_data[2]
+            
+            for _, entry in ipairs(events) do
+                local job = parse_entry(entry)
+                local job_id = job._id
+                
+                print(string.format("  %s: Processing job #%s (type=%s)",
+                    consumer_name, job.job_id or "?", job.type or "?"))
+                
+                -- simulate processing
+                local success = true
+                -- ทำงานจริงที่นี่...
+                
+                if success then
+                    -- ACK: ยืนยันว่า process สำเร็จ
+                    client:xack(STREAM, GROUP, job_id)
+                    print(string.format("    ACK: job #%s done", job_id))
+                else
+                    -- ไม่ ACK = job จะกลับไปอยู่ใน PEL
+                    print(string.format("    NACK: job #%s failed", job_id))
+                end
+                
+                processed = processed + 1
+            end
+        else
+            print(string.format("%s: No jobs, timeout", consumer_name))
+            break
+        end
+    end
+    
+    print(string.format("Consumer '%s' processed %d jobs",
+        consumer_name, processed))
+    client:quit()
+end
+
+-- รัน consumers (sequential สำหรับตัวอย่าง)
+run_consumer(1)
+run_consumer(2)
+```
+
+### ตัวอย่างที่ 12: Pending Entries List (PEL)
+
+```lua
+-- pending_entries.lua
+local redis = require("redis")
+
+local client = redis.connect("127.0.0.1", 6379)
+local STREAM = "jobs:processing"
+local GROUP  = "workers"
+
+-- XPENDING - ดู pending messages
+local pending = client:xpending(STREAM, GROUP, "-", "+", 10)
+
+if pending and #pending > 0 then
+    print("Pending messages:")
+    for _, entry in ipairs(pending) do
+        -- entry = {id, consumer, idle_ms, delivery_count}
+        print(string.format("  ID: %s | Consumer: %s | Idle: %dms | Delivered: %dx",
+            entry[1], entry[2],
+            tonumber(entry[3]) or 0,
+            tonumber(entry[4]) or 0))
+    end
+else
+    print("No pending messages")
+end
+
+-- XCLAIM - รับ ownership ของ pending message ที่ค้างนาน
+local IDLE_THRESHOLD = 30000  -- 30 seconds
+
+local summary = client:xpending(STREAM, GROUP)
+if summary and summary[1] then
+    local pending_count = summary[1]
+    print(string.format("\nTotal pending: %d", pending_count))
+    
+    -- ดู entries ที่ idle นาน
+    local old_pending = client:xpending(STREAM, GROUP, "-", "+", 100)
+    for _, entry in ipairs(old_pending or {}) do
+        local msg_id       = entry[1]
+        local consumer     = entry[2]
+        local idle_ms      = tonumber(entry[3]) or 0
+        local delivery_cnt = tonumber(entry[4]) or 0
+        
+        if idle_ms > IDLE_THRESHOLD then
+            print(string.format("  Stale message %s from %s (idle=%ds, delivered=%dx)",
+                msg_id, consumer, idle_ms // 1000, delivery_cnt))
+            
+            -- XCLAIM: โอน ownership ให้ recovery worker
+            local claimed = client:xclaim(
+                STREAM, GROUP, "recovery-worker", 
+                IDLE_THRESHOLD, msg_id)
+            if claimed and #claimed > 0 then
+                print("  Claimed by recovery-worker")
+            end
+        end
+    end
+end
+
+client:quit()
+```
+
+---
+
+## 60.6 Reliable Queue with Acknowledgment
+
+### ตัวอย่างที่ 13: Reliable Queue Pattern
+
+```lua
+-- reliable_queue.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+-- Reliable Queue ใช้ 2 lists:
+-- jobs:pending  = รอ process
+-- jobs:inflight = กำลัง process (ยังไม่ ACK)
+
+local ReliableQueue = {}
+ReliableQueue.__index = ReliableQueue
+
+function ReliableQueue.new(name)
+    local self = setmetatable({}, ReliableQueue)
+    self.name = name
+    self.pending_key  = "rq:" .. name .. ":pending"
+    self.inflight_key = "rq:" .. name .. ":inflight"
+    self.failed_key   = "rq:" .. name .. ":failed"
+    self.client = redis.connect("127.0.0.1", 6379)
+    return self
+end
+
+function ReliableQueue:enqueue(job)
+    local payload = json.encode({
+        id         = job.id or tostring(os.time()) .. math.random(1000),
+        type       = job.type,
+        data       = job.data,
+        created_at = os.time(),
+        attempts   = 0
+    })
+    self.client:lpush(self.pending_key, payload)
+end
+
+function ReliableQueue:dequeue(timeout)
+    -- BRPOPLPUSH: atomic pop จาก pending, push ไปยัง inflight
+    local payload = self.client:brpoplpush(
+        self.pending_key, 
+        self.inflight_key, 
+        timeout or 5
     )
-    stmt:bind_values(id, collection)
-    stmt:step()
-    local affected = self._db:changes()
-    stmt:finalize()
-    return affected > 0
+    if not payload then return nil end
+    
+    local ok, job = pcall(json.decode, payload)
+    if not ok then return nil end
+    
+    job._payload = payload  -- เก็บ payload เดิมไว้สำหรับ ACK/NACK
+    return job
+end
+
+function ReliableQueue:ack(job)
+    -- ลบออกจาก inflight
+    local count = self.client:lrem(self.inflight_key, 1, job._payload)
+    return count > 0
+end
+
+function ReliableQueue:nack(job, reason)
+    job.attempts = (job.attempts or 0) + 1
+    job.last_error = reason
+    job.failed_at  = os.time()
+    
+    -- ลบออกจาก inflight
+    self.client:lrem(self.inflight_key, 1, job._payload)
+    
+    if job.attempts >= 3 then
+        -- ย้ายไป dead letter queue
+        self.client:lpush(self.failed_key, json.encode(job))
+        print(string.format("  Job %s moved to failed queue (attempts=%d)",
+            job.id, job.attempts))
+    else
+        -- ส่งกลับ pending สำหรับ retry
+        job._payload = nil
+        self.client:lpush(self.pending_key, json.encode(job))
+        print(string.format("  Job %s requeued (attempt %d/3)",
+            job.id, job.attempts))
+    end
+end
+
+function ReliableQueue:recover_inflight()
+    -- ย้าย inflight jobs กลับไป pending (เมื่อ worker crash)
+    local recovered = 0
+    while true do
+        local payload = self.client:rpoplpush(
+            self.inflight_key, self.pending_key)
+        if not payload then break end
+        recovered = recovered + 1
+    end
+    return recovered
+end
+
+function ReliableQueue:stats()
+    return {
+        pending  = self.client:llen(self.pending_key),
+        inflight = self.client:llen(self.inflight_key),
+        failed   = self.client:llen(self.failed_key),
+    }
+end
+
+function ReliableQueue:close()
+    self.client:quit()
 end
 
 -- ทดสอบ
-local store = DocumentStore.new(db)
+local queue = ReliableQueue.new("emails")
 
--- Insert documents
-print("=== Inserting Documents ===")
-local blog_id = store:insert("posts", {
-    title = "First Post",
-    content = "Hello World from SQLite Document Store",
-    tags = {"lua", "sqlite", "nosql"},
-    author = {name = "Admin", email = "admin@test.com"},
-    published = true,
-    views = 0
-})
-print("Inserted post:", blog_id)
+-- ล้าง queue เก่า
+queue.client:del(queue.pending_key, queue.inflight_key, queue.failed_key)
 
-store:insert("posts", {
-    title = "Lua Tutorial",
-    content = "Learning Lua programming language",
-    tags = {"lua", "tutorial"},
-    author = {name = "Teacher", email = "teacher@test.com"},
-    published = false,
-    views = 0
-})
-
-store:insert("users", {
-    name = "Test User",
-    email = "test@example.com",
-    role = "admin"
-})
-
--- Count
-print("\n=== Collections ===")
-print("Posts:", store:count("posts"))
-print("Users:", store:count("users"))
-
--- List
-print("\n=== All Posts ===")
-local posts = store:listAll("posts")
-for _, post in ipairs(posts) do
-    print("  [" .. post._id .. "]:", post._raw:sub(1, 60) .. "...")
+-- Enqueue jobs
+for i = 1, 5 do
+    queue:enqueue({
+        type = "send_email",
+        data = {
+            to      = "user" .. i .. "@example.com",
+            subject = "Test " .. i
+        }
+    })
 end
 
--- Find by ID
-print("\n=== Find Post ===")
-local found = store:findById("posts", blog_id)
-if found then
-    print("Found:", found._raw:sub(1, 80))
+print("Stats before:", queue:stats().pending, "pending")
+
+-- Process jobs
+for i = 1, 5 do
+    local job = queue:dequeue(1)
+    if job then
+        print(string.format("Processing: %s to %s",
+            job.type, job.data.to))
+        
+        -- Simulate: job 3 fails
+        if i == 3 then
+            queue:nack(job, "SMTP connection timeout")
+        else
+            queue:ack(job)
+            print("  ACK: done")
+        end
+    end
 end
 
--- Delete
-print("\n=== Delete Post ===")
-local deleted = store:delete("posts", blog_id)
-print("Deleted:", deleted)
-print("Remaining posts:", store:count("posts"))
+local stats = queue:stats()
+print(string.format("\nFinal stats: pending=%d inflight=%d failed=%d",
+    stats.pending, stats.inflight, stats.failed))
 
-db:close()
+queue:close()
 ```
 
 ---
 
-## 60.6 Key-Value Store
+## 60.7 Dead Letter Queue
 
-### ตัวอย่างที่ 10: Persistent Key-Value Store
+### ตัวอย่างที่ 14: Dead Letter Queue System
 
 ```lua
--- kv_store.lua
-local sqlite3 = require("lsqlite3")
+-- dead_letter_queue.lua
+local redis = require("redis")
+local json = require("dkjson")
 
--- KV Store class
-local KVStore = {}
-KVStore.__index = KVStore
+local DLQ_KEY     = "dlq:jobs"
+local DLQ_LOG_KEY = "dlq:log"
+local MAX_DLQ     = 1000  -- จำกัดขนาด DLQ
 
-function KVStore.new(path)
-    local self = setmetatable({}, KVStore)
-    self._db = sqlite3.open(path or ":memory:")
-    self._db:exec([[
-        CREATE TABLE IF NOT EXISTS kv_store (
-            key TEXT PRIMARY KEY,
-            value TEXT,
-            type TEXT DEFAULT 'string',
-            expires_at INTEGER,
-            created_at INTEGER DEFAULT (strftime('%s', 'now')),
-            updated_at INTEGER DEFAULT (strftime('%s', 'now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_kv_expires ON kv_store(expires_at)
-            WHERE expires_at IS NOT NULL;
-    ]])
-    return self
+local client = redis.connect("127.0.0.1", 6379)
+client:del(DLQ_KEY, DLQ_LOG_KEY)
+
+-- ส่ง job ไป DLQ
+local function send_to_dlq(job, reason)
+    local dlq_entry = {
+        original_job = job,
+        reason       = reason,
+        failed_at    = os.time(),
+        attempts     = job.attempts or 0
+    }
+    
+    -- เพิ่มใน DLQ พร้อม trim
+    client:lpush(DLQ_KEY, json.encode(dlq_entry))
+    client:ltrim(DLQ_KEY, 0, MAX_DLQ - 1)
+    
+    -- Log
+    client:lpush(DLQ_LOG_KEY, string.format(
+        "[%s] Job %s failed: %s",
+        os.date("%Y-%m-%d %H:%M:%S"),
+        job.id or "unknown",
+        reason
+    ))
+    client:ltrim(DLQ_LOG_KEY, 0, 999)
 end
 
-function KVStore:set(key, value, ttl_seconds)
-    local vtype = type(value)
-    local encoded_value
-
-    if vtype == "table" then
-        -- Simple serialization
-        encoded_value = require and tostring(value) or "{}"
-        vtype = "table"
-    elseif vtype == "number" or vtype == "boolean" then
-        encoded_value = tostring(value)
-    else
-        encoded_value = tostring(value or "")
-    end
-
-    local expires_at = ttl_seconds and (os.time() + ttl_seconds) or nil
-
-    local stmt = self._db:prepare([[
-        INSERT OR REPLACE INTO kv_store (key, value, type, expires_at, updated_at)
-        VALUES (?, ?, ?, ?, strftime('%s', 'now'))
-    ]])
-    stmt:bind_values(key, encoded_value, vtype, expires_at)
-    stmt:step()
-    stmt:finalize()
-
-    return true
-end
-
-function KVStore:get(key)
-    -- ลบ expired keys ก่อน
-    self:_cleanup_expired()
-
-    local stmt = self._db:prepare([[
-        SELECT value, type, expires_at FROM kv_store
-        WHERE key = ? AND (expires_at IS NULL OR expires_at > strftime('%s', 'now'))
-    ]])
-    stmt:bind_values(key)
-    local row = stmt:first_row()
-    stmt:finalize()
-
-    if not row then return nil end
-
-    local value, vtype = row[1], row[2]
-
-    if vtype == "number" then
-        return tonumber(value)
-    elseif vtype == "boolean" then
-        return value == "true"
-    else
-        return value
-    end
-end
-
-function KVStore:delete(key)
-    local stmt = self._db:prepare("DELETE FROM kv_store WHERE key = ?")
-    stmt:bind_values(key)
-    stmt:step()
-    local affected = self._db:changes()
-    stmt:finalize()
-    return affected > 0
-end
-
-function KVStore:exists(key)
-    self:_cleanup_expired()
-    local stmt = self._db:prepare([[
-        SELECT 1 FROM kv_store 
-        WHERE key = ? AND (expires_at IS NULL OR expires_at > strftime('%s', 'now'))
-    ]])
-    stmt:bind_values(key)
-    local row = stmt:first_row()
-    stmt:finalize()
-    return row ~= nil
-end
-
-function KVStore:ttl(key)
-    local stmt = self._db:prepare([[
-        SELECT expires_at - strftime('%s', 'now') FROM kv_store
-        WHERE key = ? AND expires_at IS NOT NULL
-    ]])
-    stmt:bind_values(key)
-    local row = stmt:first_row()
-    stmt:finalize()
-    return row and row[1] or -1
-end
-
-function KVStore:keys(pattern)
-    self:_cleanup_expired()
-    local sql = [[
-        SELECT key FROM kv_store
-        WHERE expires_at IS NULL OR expires_at > strftime('%s', 'now')
-    ]]
-
-    if pattern then
-        sql = sql .. " AND key LIKE ?"
-    end
-    sql = sql .. " ORDER BY key"
-
-    local stmt = self._db:prepare(sql)
-    if pattern then
-        stmt:bind_values(pattern:gsub("*", "%%"))
-    end
-
+-- ดู DLQ entries
+local function inspect_dlq(limit)
+    limit = limit or 10
+    local entries = client:lrange(DLQ_KEY, 0, limit - 1)
     local results = {}
-    for row in stmt:urows() do
-        table.insert(results, row[1])
+    for _, payload in ipairs(entries or {}) do
+        local ok, entry = pcall(json.decode, payload)
+        if ok then table.insert(results, entry) end
     end
-    stmt:finalize()
-
     return results
 end
 
-function KVStore:incr(key, amount)
-    amount = amount or 1
-    local current = tonumber(self:get(key)) or 0
-    local new_val = current + amount
-    self:set(key, new_val)
-    return new_val
+-- Replay: ส่ง job กลับไป queue หลัก
+local function replay_from_dlq(queue_key, count)
+    count = count or 1
+    local replayed = 0
+    
+    for _ = 1, count do
+        local payload = client:rpop(DLQ_KEY)
+        if not payload then break end
+        
+        local ok, entry = pcall(json.decode, payload)
+        if ok and entry.original_job then
+            local job = entry.original_job
+            job.attempts = 0  -- reset attempts
+            job.replayed_at = os.time()
+            client:lpush(queue_key, json.encode(job))
+            replayed = replayed + 1
+        end
+    end
+    
+    return replayed
 end
 
-function KVStore:_cleanup_expired()
-    self._db:exec([[
-        DELETE FROM kv_store 
-        WHERE expires_at IS NOT NULL AND expires_at <= strftime('%s', 'now')
-    ]])
+-- ทดสอบ
+local failed_jobs = {
+    {id = "JOB-001", type = "email", attempts = 3, to = "bad@invalid"},
+    {id = "JOB-002", type = "webhook", attempts = 3, url = "http://down.example.com"},
+    {id = "JOB-003", type = "sms", attempts = 3, phone = "+invalid"},
+}
+
+print("Sending failed jobs to DLQ:")
+send_to_dlq(failed_jobs[1], "Invalid email address")
+send_to_dlq(failed_jobs[2], "Webhook endpoint timeout after 3 attempts")
+send_to_dlq(failed_jobs[3], "Invalid phone number format")
+
+print("DLQ size:", client:llen(DLQ_KEY))
+
+-- Inspect
+print("\nDLQ contents:")
+for _, entry in ipairs(inspect_dlq()) do
+    print(string.format("  [%s] Job %s: %s",
+        os.date("%H:%M:%S", entry.failed_at),
+        entry.original_job.id,
+        entry.reason))
 end
 
-function KVStore:close()
-    self._db:close()
+-- Replay ไป main queue
+local main_queue = "jobs:main"
+local n = replay_from_dlq(main_queue, 1)
+print("\nReplayed", n, "job(s) from DLQ")
+print("DLQ remaining:", client:llen(DLQ_KEY))
+print("Main queue:", client:llen(main_queue))
+
+-- ดู DLQ log
+print("\nDLQ Log:")
+local logs = client:lrange(DLQ_LOG_KEY, 0, 4)
+for _, log in ipairs(logs or {}) do
+    print("  " .. log)
 end
 
--- ทดสอบ KV Store
-local kv = KVStore.new()
-
-print("=== Basic Operations ===")
-kv:set("username", "admin")
-kv:set("login_count", 42)
-kv:set("is_active", true)
-
-print("username:", kv:get("username"))
-print("login_count:", kv:get("login_count"))
-print("is_active:", kv:get("is_active"))
-
-print("\n=== Increment ===")
-kv:incr("login_count")
-kv:incr("login_count")
-kv:incr("login_count", 10)
-print("login_count after incr:", kv:get("login_count"))
-
-print("\n=== TTL (Time-To-Live) ===")
-kv:set("session_token", "abc123xyz", 3600)  -- expires in 1 hour
-print("session_token:", kv:get("session_token"))
-print("TTL remaining:", kv:ttl("session_token"), "seconds")
-
-print("\n=== Keys Pattern ===")
-kv:set("user:1:name", "สมชาย")
-kv:set("user:1:email", "somchai@test.com")
-kv:set("user:2:name", "สมหญิง")
-kv:set("user:2:email", "somying@test.com")
-kv:set("config:debug", "true")
-
-local user_keys = kv:keys("user:*")
-print("User keys:")
-for _, k in ipairs(user_keys) do
-    print("  " .. k .. " =", kv:get(k))
-end
-
-print("\nAll keys count:", #kv:keys())
-
-kv:close()
+client:quit()
 ```
 
 ---
 
-## 60.7 Database Migration Pattern
+## 60.8 Priority Queue ด้วย Sorted Sets
 
-### ตัวอย่างที่ 11: Schema Migration System
+### ตัวอย่างที่ 15: Priority Queue
 
 ```lua
--- migrations.lua
-local sqlite3 = require("lsqlite3")
+-- priority_queue.lua
+local redis = require("redis")
+local json = require("dkjson")
 
--- Migration Manager
-local MigrationManager = {}
-MigrationManager.__index = MigrationManager
+local PriorityQueue = {}
+PriorityQueue.__index = PriorityQueue
 
-function MigrationManager.new(db)
-    local self = setmetatable({}, MigrationManager)
-    self._db = db
-    self._migrations = {}
-    self:_init()
+function PriorityQueue.new(name)
+    local self = setmetatable({}, PriorityQueue)
+    self.key = "pq:" .. name
+    self.client = redis.connect("127.0.0.1", 6379)
     return self
 end
 
-function MigrationManager:_init()
-    self._db:exec([[
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            version TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            applied_at INTEGER DEFAULT (strftime('%s', 'now'))
-        )
-    ]])
-end
-
-function MigrationManager:add(version, name, up_fn, down_fn)
-    table.insert(self._migrations, {
-        version = version,
-        name = name,
-        up = up_fn,
-        down = down_fn,
+function PriorityQueue:enqueue(job, priority)
+    -- score ต่ำ = priority สูง (ZRANGEBYSCORE ดึงน้อยสุดก่อน)
+    -- ใช้ timestamp เพื่อให้ FIFO ภายใน priority เดียวกัน
+    priority = priority or 5
+    local score = priority * 1e13 + os.time() * 1000 + (os.clock() * 1000 % 1000)
+    
+    local payload = json.encode({
+        id         = job.id or tostring(math.random(100000)),
+        type       = job.type,
+        data       = job.data,
+        priority   = priority,
+        created_at = os.time()
     })
-    table.sort(self._migrations, function(a, b)
-        return a.version < b.version
-    end)
+    
+    self.client:zadd(self.key, score, payload)
+    return score
 end
 
-function MigrationManager:_is_applied(version)
-    local stmt = self._db:prepare(
-        "SELECT 1 FROM schema_migrations WHERE version = ?"
-    )
-    stmt:bind_values(version)
-    local row = stmt:first_row()
-    stmt:finalize()
-    return row ~= nil
+function PriorityQueue:dequeue()
+    -- ZPOPMIN: ดึง element ที่มี score ต่ำสุด (priority สูงสุด)
+    local result = self.client:zpopmin(self.key, 1)
+    if not result or #result == 0 then return nil end
+    
+    local payload = result[1]
+    local ok, job = pcall(json.decode, payload)
+    if not ok then return nil end
+    return job
 end
 
-function MigrationManager:migrate()
-    local applied = 0
-
-    for _, migration in ipairs(self._migrations) do
-        if not self:_is_applied(migration.version) then
-            print(string.format("  Applying migration %s: %s",
-                migration.version, migration.name))
-
-            self._db:exec("BEGIN")
-            local ok, err = pcall(migration.up, self._db)
-
-            if ok then
-                local stmt = self._db:prepare(
-                    "INSERT INTO schema_migrations (version, name) VALUES (?, ?)"
-                )
-                stmt:bind_values(migration.version, migration.name)
-                stmt:step()
-                stmt:finalize()
-                self._db:exec("COMMIT")
-                applied = applied + 1
-                print("    -> Applied successfully")
-            else
-                self._db:exec("ROLLBACK")
-                error(string.format("Migration %s failed: %s",
-                    migration.version, err))
-            end
-        end
-    end
-
-    if applied == 0 then
-        print("  No pending migrations")
-    else
-        print(string.format("  Applied %d migration(s)", applied))
-    end
-end
-
-function MigrationManager:rollback(steps)
-    steps = steps or 1
-    local rolled_back = 0
-
-    -- หา migrations ที่ applied แล้ว (เรียง descending)
-    local applied_migrations = {}
-    for _, migration in ipairs(self._migrations) do
-        if self:_is_applied(migration.version) then
-            table.insert(applied_migrations, migration)
-        end
-    end
-
-    -- Reverse
-    for i = 1, #applied_migrations / 2 do
-        local j = #applied_migrations - i + 1
-        applied_migrations[i], applied_migrations[j] = applied_migrations[j], applied_migrations[i]
-    end
-
-    for i = 1, math.min(steps, #applied_migrations) do
-        local migration = applied_migrations[i]
-        if not migration.down then
-            print(string.format("  Migration %s has no rollback", migration.version))
-            break
-        end
-
-        print(string.format("  Rolling back %s: %s",
-            migration.version, migration.name))
-
-        self._db:exec("BEGIN")
-        local ok, err = pcall(migration.down, self._db)
-
+function PriorityQueue:peek(count)
+    count = count or 5
+    local results = self.client:zrange(self.key, 0, count - 1, "WITHSCORES")
+    local items = {}
+    for i = 1, #(results or {}), 2 do
+        local ok, job = pcall(json.decode, results[i])
         if ok then
-            local stmt = self._db:prepare(
-                "DELETE FROM schema_migrations WHERE version = ?"
-            )
-            stmt:bind_values(migration.version)
-            stmt:step()
-            stmt:finalize()
-            self._db:exec("COMMIT")
-            rolled_back = rolled_back + 1
-            print("    -> Rolled back successfully")
-        else
-            self._db:exec("ROLLBACK")
-            error(string.format("Rollback %s failed: %s",
-                migration.version, err))
+            job._score = tonumber(results[i+1])
+            table.insert(items, job)
         end
     end
-
-    print(string.format("  Rolled back %d migration(s)", rolled_back))
+    return items
 end
 
-function MigrationManager:status()
-    print("=== Migration Status ===")
-    for _, migration in ipairs(self._migrations) do
-        local applied = self:_is_applied(migration.version)
-        print(string.format("  [%s] %s: %s",
-            applied and "x" or " ",
-            migration.version,
-            migration.name))
+function PriorityQueue:size()
+    return self.client:zcard(self.key)
+end
+
+function PriorityQueue:close()
+    self.client:quit()
+end
+
+-- ทดสอบ
+local pq = PriorityQueue.new("tasks")
+pq.client:del(pq.key)
+
+-- เพิ่ม jobs ด้วย priorities ต่างกัน (1=highest, 5=lowest)
+pq:enqueue({type = "maintenance",  data = "routine check"},      5)  -- low
+pq:enqueue({type = "backup",       data = "daily backup"},       4)
+pq:enqueue({type = "report",       data = "monthly report"},     3)
+pq:enqueue({type = "payment",      data = "process payment"},    1)  -- critical
+pq:enqueue({type = "notification", data = "send email"},         2)
+pq:enqueue({type = "urgent_fix",   data = "production bug"},     1)  -- critical
+pq:enqueue({type = "analytics",    data = "generate stats"},     5)  -- low
+
+print("Priority Queue size:", pq:size())
+print("\nQueue order (highest priority first):")
+for _, item in ipairs(pq:peek(7)) do
+    print(string.format("  P%d: %-15s %s",
+        item.priority, item.type, item.data))
+end
+
+print("\nDequeuing in priority order:")
+while pq:size() > 0 do
+    local job = pq:dequeue()
+    if job then
+        print(string.format("  [P%d] %s: %s",
+            job.priority, job.type, job.data))
     end
 end
 
--- ทดสอบ Migrations
-local db = sqlite3.open(":memory:")
-local mgr = MigrationManager.new(db)
-
--- Define migrations
-mgr:add("001", "create_users_table",
-    function(db)  -- up
-        db:exec([[
-            CREATE TABLE users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL
-            )
-        ]])
-    end,
-    function(db)  -- down
-        db:exec("DROP TABLE users")
-    end
-)
-
-mgr:add("002", "add_users_age_column",
-    function(db)
-        db:exec("ALTER TABLE users ADD COLUMN age INTEGER")
-    end,
-    function(db)
-        -- SQLite ไม่รองรับ DROP COLUMN ใน version เก่า
-        -- แต่สำหรับ demo:
-        print("    (SQLite: cannot drop column, skipping)")
-    end
-)
-
-mgr:add("003", "create_products_table",
-    function(db)
-        db:exec([[
-            CREATE TABLE products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                price REAL NOT NULL,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
-            )
-        ]])
-    end,
-    function(db)
-        db:exec("DROP TABLE products")
-    end
-)
-
--- Run migrations
-print("=== Running Migrations ===")
-mgr:migrate()
-
-mgr:status()
-
--- Run again (should skip)
-print("\n=== Re-running (should skip) ===")
-mgr:migrate()
-
--- Rollback 1
-print("\n=== Rollback 1 Step ===")
-mgr:rollback(1)
-mgr:status()
-
--- Re-migrate
-print("\n=== Re-migrate ===")
-mgr:migrate()
-mgr:status()
-
-db:close()
+pq:close()
 ```
 
 ---
 
-## 60.8 Connection Pool สำหรับ SQLite
+## 60.9 Job Retry กับ Exponential Backoff
 
-### ตัวอย่างที่ 12: Database Connection Pool
+### ตัวอย่างที่ 16: Retry Manager
 
 ```lua
--- connection_pool.lua
-local sqlite3 = require("lsqlite3")
+-- retry_manager.lua
+local redis = require("redis")
+local json = require("dkjson")
 
--- SQLite Connection Pool
-local Pool = {}
-Pool.__index = Pool
+local RetryManager = {}
+RetryManager.__index = RetryManager
 
-function Pool.new(db_path, pool_size)
-    local self = setmetatable({}, Pool)
-    self._path = db_path or ":memory:"
-    self._size = pool_size or 5
-    self._connections = {}
-    self._available = {}
-
-    -- สร้าง connections ล่วงหน้า
-    for i = 1, self._size do
-        local conn = sqlite3.open(self._path)
-        -- เปิด WAL mode สำหรับ concurrent access
-        conn:exec("PRAGMA journal_mode=WAL")
-        conn:exec("PRAGMA synchronous=NORMAL")
-        self._connections[i] = conn
-        self._available[i] = true
-    end
-
+function RetryManager.new(name, opts)
+    local self = setmetatable({}, RetryManager)
+    self.name    = name
+    self.queue   = "retry:" .. name .. ":queue"
+    self.delayed = "retry:" .. name .. ":delayed"  -- sorted set
+    self.dead    = "retry:" .. name .. ":dead"
+    self.client  = redis.connect("127.0.0.1", 6379)
+    
+    self.max_attempts = opts and opts.max_attempts or 5
+    self.base_delay   = opts and opts.base_delay or 1   -- seconds
+    self.max_delay    = opts and opts.max_delay or 3600  -- 1 hour
+    
     return self
 end
 
-function Pool:acquire(timeout)
-    timeout = timeout or 5  -- seconds
-    local start = os.time()
+-- Exponential backoff: delay = base * 2^(attempt-1) + jitter
+function RetryManager:calc_delay(attempt)
+    local delay = self.base_delay * (2 ^ (attempt - 1))
+    -- เพิ่ม jitter เพื่อหลีกเลี่ยง thundering herd
+    local jitter = math.random(0, math.floor(delay * 0.1))
+    delay = math.min(delay + jitter, self.max_delay)
+    return math.floor(delay)
+end
 
-    while true do
-        for i, available in ipairs(self._available) do
-            if available then
-                self._available[i] = false
-                return i, self._connections[i]
+function RetryManager:submit(job)
+    job.attempts = job.attempts or 0
+    job.id = job.id or tostring(os.time()) .. "_" .. math.random(9999)
+    self.client:lpush(self.queue, json.encode(job))
+end
+
+function RetryManager:process_next()
+    local payload = self.client:rpop(self.queue)
+    if not payload then return nil end
+    
+    local ok, job = pcall(json.decode, payload)
+    if not ok then return nil end
+    
+    return job
+end
+
+function RetryManager:retry(job, error_msg)
+    job.attempts = (job.attempts or 0) + 1
+    job.last_error = error_msg
+    job.last_retry_at = os.time()
+    
+    if job.attempts >= self.max_attempts then
+        -- ส่งไป dead letter queue
+        job.dead_reason = "Max attempts reached"
+        self.client:lpush(self.dead, json.encode(job))
+        print(string.format("  Job %s dead after %d attempts: %s",
+            job.id, job.attempts, error_msg))
+        return false
+    end
+    
+    -- คำนวณ delay
+    local delay = self:calc_delay(job.attempts)
+    local execute_at = os.time() + delay
+    
+    -- เก็บใน sorted set (score = execute_at timestamp)
+    self.client:zadd(self.delayed, execute_at, json.encode(job))
+    
+    print(string.format("  Job %s scheduled for retry %d/%d in %ds",
+        job.id, job.attempts, self.max_attempts, delay))
+    return true
+end
+
+function RetryManager:move_ready_jobs()
+    -- ย้าย delayed jobs ที่ถึงเวลาแล้วไปยัง queue
+    local now = os.time()
+    local ready = self.client:zrangebyscore(
+        self.delayed, 0, now, "LIMIT", 0, 100)
+    
+    local moved = 0
+    for _, payload in ipairs(ready or {}) do
+        self.client:zrem(self.delayed, payload)
+        self.client:lpush(self.queue, payload)
+        moved = moved + 1
+    end
+    
+    return moved
+end
+
+function RetryManager:stats()
+    return {
+        queued  = self.client:llen(self.queue),
+        delayed = self.client:zcard(self.delayed),
+        dead    = self.client:llen(self.dead),
+    }
+end
+
+function RetryManager:close()
+    self.client:quit()
+end
+
+-- ทดสอบ
+local rm = RetryManager.new("api_calls", {
+    max_attempts = 4,
+    base_delay   = 1,
+    max_delay    = 60
+})
+
+-- ล้างข้อมูลเก่า
+rm.client:del(rm.queue, rm.delayed, rm.dead)
+
+-- Submit jobs
+rm:submit({type = "api_call", url = "https://api.example.com/users", id = "job-1"})
+rm:submit({type = "api_call", url = "https://api.example.com/orders", id = "job-2"})
+
+print("Initial stats:", rm:stats().queued, "queued")
+print("\nSimulating failures:")
+
+-- Simulate processing กับ failures
+for round = 1, 4 do
+    -- Move ready jobs ก่อน
+    local moved = rm:move_ready_jobs()
+    if moved > 0 then
+        print(string.format("\nRound %d: Moved %d delayed jobs to queue", 
+            round, moved))
+    end
+    
+    local job = rm:process_next()
+    if job then
+        print(string.format("Round %d: Processing job '%s' (attempt %d)",
+            round, job.id, (job.attempts or 0) + 1))
+        
+        -- Simulate failure
+        local success = (round == 4)  -- สำเร็จใน round 4
+        if success then
+            print("  SUCCESS!")
+        else
+            rm:retry(job, "Connection refused (simulated)")
+        end
+    end
+end
+
+print("\nFinal stats:", 
+    "queued=" .. rm:stats().queued,
+    "delayed=" .. rm:stats().delayed,
+    "dead=" .. rm:stats().dead)
+
+rm:close()
+```
+
+---
+
+## 60.10 Worker Pool Pattern
+
+### ตัวอย่างที่ 17: Worker Pool
+
+```lua
+-- worker_pool.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+-- Worker Pool ด้วย Lua coroutines (single-threaded simulation)
+
+local WorkerPool = {}
+WorkerPool.__index = WorkerPool
+
+function WorkerPool.new(queue_name, worker_count)
+    local self = setmetatable({}, WorkerPool)
+    self.queue_name   = queue_name
+    self.worker_count = worker_count or 4
+    self.workers      = {}
+    self.running      = false
+    
+    -- สร้าง Redis connection สำหรับแต่ละ worker
+    for i = 1, worker_count do
+        self.workers[i] = {
+            id         = i,
+            client     = redis.connect("127.0.0.1", 6379),
+            processed  = 0,
+            errors     = 0,
+            busy       = false
+        }
+    end
+    
+    return self
+end
+
+function WorkerPool:register_handler(job_type, handler_fn)
+    if not self.handlers then self.handlers = {} end
+    self.handlers[job_type] = handler_fn
+end
+
+function WorkerPool:process_job(worker, job)
+    worker.busy = true
+    local start_time = os.clock()
+    
+    local handler = self.handlers and self.handlers[job.type]
+    
+    local success, err
+    if handler then
+        success, err = pcall(handler, job)
+    else
+        success, err = false, "No handler for job type: " .. (job.type or "nil")
+    end
+    
+    local elapsed = os.clock() - start_time
+    
+    if success then
+        worker.processed = worker.processed + 1
+    else
+        worker.errors = worker.errors + 1
+        -- Log error
+        worker.client:lpush("errors:" .. self.queue_name,
+            json.encode({
+                job_id    = job.id,
+                job_type  = job.type,
+                error     = tostring(err),
+                worker_id = worker.id,
+                ts        = os.time()
+            })
+        )
+    end
+    
+    worker.busy = false
+    return success, elapsed
+end
+
+function WorkerPool:run_once()
+    -- แต่ละ worker พยายามดึง job
+    for _, worker in ipairs(self.workers) do
+        if not worker.busy then
+            local payload = worker.client:rpop(self.queue_name)
+            if payload then
+                local ok, job = pcall(json.decode, payload)
+                if ok then
+                    local success, elapsed = self:process_job(worker, job)
+                    print(string.format(
+                        "  Worker-%d: %s job '%s' in %.3fms",
+                        worker.id,
+                        success and "OK" or "FAIL",
+                        job.type or "?",
+                        elapsed * 1000))
+                end
             end
         end
-
-        -- ถ้าหมด pool รอ
-        if os.time() - start > timeout then
-            return nil, nil, "timeout: no connections available"
-        end
-
-        -- ใน production จะใช้ coroutine yield ที่นี่
-        -- แต่สำหรับ demo ใช้ busy wait แทน
-        os.execute("sleep 0.01")
     end
 end
 
-function Pool:release(conn_id)
-    if conn_id and self._available[conn_id] == false then
-        self._available[conn_id] = true
+function WorkerPool:stats()
+    local total_processed = 0
+    local total_errors = 0
+    for _, w in ipairs(self.workers) do
+        total_processed = total_processed + w.processed
+        total_errors = total_errors + w.errors
+    end
+    return {
+        workers   = self.worker_count,
+        processed = total_processed,
+        errors    = total_errors,
+    }
+end
+
+function WorkerPool:close()
+    for _, worker in ipairs(self.workers) do
+        worker.client:quit()
     end
 end
 
-function Pool:execute(fn)
-    local conn_id, conn, err = self:acquire()
-    if not conn then
-        return nil, err
-    end
+-- ทดสอบ
+local pool = WorkerPool.new("jobs:worker", 3)
 
-    local ok, result = pcall(fn, conn)
-    self:release(conn_id)
+-- ล้าง queue
+pool.workers[1].client:del("jobs:worker")
 
-    if ok then
-        return result
-    else
-        return nil, result
+-- Register handlers
+pool:register_handler("send_email", function(job)
+    -- simulate email sending
+    if math.random() < 0.1 then
+        error("SMTP server unavailable")
     end
+    return true
+end)
+
+pool:register_handler("resize_image", function(job)
+    -- simulate image processing
+    return true
+end)
+
+pool:register_handler("generate_pdf", function(job)
+    if math.random() < 0.2 then
+        error("PDF generation failed")
+    end
+    return true
+end)
+
+-- Enqueue jobs
+local producer = redis.connect("127.0.0.1", 6379)
+local job_types = {"send_email", "resize_image", "generate_pdf"}
+
+for i = 1, 12 do
+    producer:lpush("jobs:worker", json.encode({
+        id   = "job-" .. i,
+        type = job_types[((i-1) % 3) + 1],
+        data = {n = i}
+    }))
+end
+producer:quit()
+
+print("Processing 12 jobs with 3 workers:")
+-- Process ทุก jobs
+for round = 1, 6 do
+    print(string.format("\nRound %d:", round))
+    pool:run_once()
 end
 
-function Pool:stats()
-    local total = #self._connections
-    local used = 0
-    for _, available in ipairs(self._available) do
-        if not available then used = used + 1 end
-    end
-    return {total = total, used = used, available = total - used}
-end
-
-function Pool:close()
-    for _, conn in ipairs(self._connections) do
-        conn:close()
-    end
-end
-
--- ทดสอบ Pool
-print("=== Connection Pool Demo ===")
-local pool = Pool.new(":memory:", 3)
-
--- Initialize schema ใน connection แรก
-local _, conn1 = pool:acquire()
-conn1:exec([[
-    CREATE TABLE IF NOT EXISTS counter (
-        key TEXT PRIMARY KEY,
-        value INTEGER DEFAULT 0
-    )
-]])
-conn1:exec("INSERT OR IGNORE INTO counter (key, value) VALUES ('hits', 0)")
-pool:release(1)
-
-print("Pool stats:", pool:stats().total, "total,",
-    pool:stats().available, "available")
-
--- Execute queries ผ่าน pool
-for i = 1, 5 do
-    local result = pool:execute(function(db)
-        db:exec("UPDATE counter SET value = value + 1 WHERE key = 'hits'")
-        for row in db:nrows("SELECT value FROM counter WHERE key = 'hits'") do
-            return row.value
-        end
-    end)
-    print(string.format("  Request %d: counter = %s", i, tostring(result)))
-end
-
--- Stats
 local stats = pool:stats()
-print(string.format("\nFinal pool stats: %d total, %d available, %d used",
-    stats.total, stats.available, stats.used))
+print(string.format("\nPool stats: %d processed, %d errors",
+    stats.processed, stats.errors))
 
 pool:close()
 ```
 
 ---
 
-## 60.9 Caching Layer
+## 60.11 Rate Limiting
 
-### ตัวอย่างที่ 13: SQLite-backed Cache
+### ตัวอย่างที่ 18: Rate Limiter ด้วย Redis
 
 ```lua
--- sqlite_cache.lua
+-- rate_limiter.lua
+local redis = require("redis")
+
+local client = redis.connect("127.0.0.1", 6379)
+
+-- Fixed Window Rate Limiter
+local function rate_limit_fixed(user_id, max_requests, window_seconds)
+    local key = string.format("rl:fixed:%s:%d",
+        user_id, math.floor(os.time() / window_seconds))
+    
+    local count = client:incr(key)
+    if count == 1 then
+        client:expire(key, window_seconds)
+    end
+    
+    return count <= max_requests, count, max_requests
+end
+
+-- Sliding Window Rate Limiter (accurate แต่ใช้ memory มากกว่า)
+local function rate_limit_sliding(user_id, max_requests, window_seconds)
+    local key = "rl:sliding:" .. user_id
+    local now = os.time()
+    local window_start = now - window_seconds
+    
+    -- ลบ entries เก่า
+    client:zremrangebyscore(key, 0, window_start)
+    
+    -- นับ requests ใน window
+    local count = client:zcard(key)
+    
+    if count < max_requests then
+        -- เพิ่ม request นี้
+        client:zadd(key, now, tostring(now) .. "_" .. math.random(99999))
+        client:expire(key, window_seconds + 1)
+        return true, count + 1, max_requests
+    end
+    
+    return false, count, max_requests
+end
+
+-- Token Bucket Rate Limiter
+local function rate_limit_token_bucket(user_id, capacity, refill_rate)
+    local key_tokens = "rl:bucket:" .. user_id .. ":tokens"
+    local key_last   = "rl:bucket:" .. user_id .. ":last"
+    
+    local now = os.time()
+    local last_refill = tonumber(client:get(key_last)) or now
+    local tokens = tonumber(client:get(key_tokens)) or capacity
+    
+    -- เติม tokens
+    local elapsed = now - last_refill
+    tokens = math.min(capacity, tokens + elapsed * refill_rate)
+    
+    if tokens >= 1 then
+        tokens = tokens - 1
+        client:set(key_tokens, tostring(tokens))
+        client:set(key_last, tostring(now))
+        client:expire(key_tokens, 3600)
+        client:expire(key_last, 3600)
+        return true, math.floor(tokens)
+    end
+    
+    return false, 0
+end
+
+-- ทดสอบ Rate Limiters
+print("=== Fixed Window (5 req/10s) ===")
+client:del("rl:fixed:user123:" .. math.floor(os.time() / 10))
+for i = 1, 7 do
+    local allowed, count, max = rate_limit_fixed("user123", 5, 10)
+    print(string.format("  Request %d: %s (%d/%d)",
+        i, allowed and "ALLOWED" or "BLOCKED", count, max))
+end
+
+print("\n=== Sliding Window (5 req/10s) ===")
+client:del("rl:sliding:user456")
+for i = 1, 7 do
+    local allowed, count, max = rate_limit_sliding("user456", 5, 10)
+    print(string.format("  Request %d: %s (%d/%d)",
+        i, allowed and "ALLOWED" or "BLOCKED", count, max))
+end
+
+print("\n=== Token Bucket (capacity=5, refill=1/s) ===")
+client:del("rl:bucket:user789:tokens", "rl:bucket:user789:last")
+for i = 1, 7 do
+    local allowed, remaining = rate_limit_token_bucket("user789", 5, 1.0)
+    print(string.format("  Request %d: %s (tokens remaining: %d)",
+        i, allowed and "ALLOWED" or "BLOCKED", remaining))
+end
+
+client:quit()
+```
+
+---
+
+## 60.12 Lua Scripts ใน Redis (EVAL)
+
+### ตัวอย่างที่ 19: Atomic Operations ด้วย EVAL
+
+```lua
+-- redis_eval.lua
+local redis = require("redis")
+local client = redis.connect("127.0.0.1", 6379)
+
+-- EVAL ให้เรา run Lua scripts บน Redis server แบบ atomic
+
+-- Script 1: Atomic get-and-increment
+local incr_script = [[
+    local current = redis.call('GET', KEYS[1])
+    current = tonumber(current) or 0
+    local new_val = current + tonumber(ARGV[1])
+    redis.call('SET', KEYS[1], new_val)
+    return new_val
+]]
+
+client:set("counter", "10")
+local result = client:eval(incr_script, 1, "counter", "5")
+print("Atomic increment by 5:", result)  -- 15
+
+-- Script 2: Conditional set (ถ้าค่าปัจจุบัน < threshold)
+local cond_set_script = [[
+    local current = tonumber(redis.call('GET', KEYS[1])) or 0
+    local threshold = tonumber(ARGV[1])
+    local new_val = tonumber(ARGV[2])
+    
+    if current < threshold then
+        redis.call('SET', KEYS[1], new_val)
+        return 1  -- สำเร็จ
+    end
+    return 0  -- ไม่ได้เซ็ต
+]]
+
+client:set("stock", "5")
+local set_result = client:eval(cond_set_script, 1, "stock", "10", "100")
+print("Set if < 10:", set_result == 1 and "SET" or "NOT SET")
+print("Stock now:", client:get("stock"))  -- 100
+
+-- Script 3: Distributed lock (Redlock simplified)
+local acquire_lock_script = [[
+    local key = KEYS[1]
+    local token = ARGV[1]
+    local ttl = tonumber(ARGV[2])
+    
+    if redis.call('EXISTS', key) == 0 then
+        redis.call('SET', key, token, 'PX', ttl)
+        return 1
+    end
+    return 0
+]]
+
+local release_lock_script = [[
+    local key = KEYS[1]
+    local token = ARGV[1]
+    
+    if redis.call('GET', key) == token then
+        redis.call('DEL', key)
+        return 1
+    end
+    return 0
+]]
+
+-- ใช้ distributed lock
+local lock_key = "lock:resource"
+local my_token = tostring(os.time()) .. "_" .. math.random(99999)
+
+local acquired = client:eval(acquire_lock_script, 1, lock_key, my_token, 10000)
+print("\nLock acquired:", acquired == 1)
+
+-- ทำงานที่ต้องการ exclusive access
+print("Doing critical work...")
+
+-- Release lock
+local released = client:eval(release_lock_script, 1, lock_key, my_token)
+print("Lock released:", released == 1)
+
+client:quit()
+```
+
+### ตัวอย่างที่ 20: EVALSHA - Script Caching
+
+```lua
+-- evalsha.lua
+local redis = require("redis")
+local client = redis.connect("127.0.0.1", 6379)
+
+-- SCRIPT LOAD: โหลด script และได้ SHA1 กลับมา
+-- EVALSHA: เรียก script ด้วย SHA1 (ประหยัด bandwidth)
+
+local dequeue_script = [[
+    -- Atomic dequeue: ดึง job และ track ใน inflight set
+    local queue_key    = KEYS[1]
+    local inflight_key = KEYS[2]
+    local job_id_key   = KEYS[3]
+    
+    local payload = redis.call('RPOP', queue_key)
+    if not payload then return nil end
+    
+    -- เพิ่มใน inflight hash
+    local job_id = redis.call('INCR', job_id_key)
+    redis.call('HSET', inflight_key, job_id, payload)
+    
+    return {job_id, payload}
+]]
+
+-- โหลด script
+local sha = client:script("LOAD", dequeue_script)
+print("Script SHA1:", sha)
+
+-- ตรวจสอบว่า script อยู่ใน cache
+local exists = client:script("EXISTS", sha)
+print("Script cached:", exists[1] == 1)
+
+-- สร้าง queue data
+local QUEUE = "mq:test"
+local INFLIGHT = "mq:test:inflight"
+local JOB_ID = "mq:test:job_id"
+
+client:del(QUEUE, INFLIGHT, JOB_ID)
+
+-- Enqueue
+for i = 1, 3 do
+    client:lpush(QUEUE, string.format('{"type":"job","n":%d}', i))
+end
+
+-- Dequeue ด้วย EVALSHA
+print("\nDequeuing with EVALSHA:")
+for i = 1, 4 do
+    local result = client:evalsha(sha, 3, QUEUE, INFLIGHT, JOB_ID)
+    if result then
+        print(string.format("  Job #%s: %s", result[1], result[2]))
+    else
+        print("  Queue empty")
+    end
+end
+
+-- ดู inflight jobs
+local inflight = client:hgetall(INFLIGHT)
+print("\nInflight jobs:")
+for k, v in pairs(inflight or {}) do
+    print(string.format("  ID=%s Payload=%s", k, v))
+end
+
+-- SCRIPT FLUSH - ล้าง cache ทั้งหมด (ระวัง!)
+-- client:script("FLUSH")
+
+client:quit()
+```
+
+---
+
+## 60.13 Monitoring และ Metrics
+
+### ตัวอย่างที่ 21: Queue Metrics
+
+```lua
+-- queue_metrics.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+local client = redis.connect("127.0.0.1", 6379)
+
+local Metrics = {}
+Metrics.__index = Metrics
+
+function Metrics.new(namespace)
+    local self = setmetatable({}, Metrics)
+    self.ns = namespace or "metrics"
+    self.client = client
+    return self
+end
+
+function Metrics:increment(name, value)
+    value = value or 1
+    return self.client:incrbyfloat(self.ns .. ":" .. name, value)
+end
+
+function Metrics:gauge(name, value)
+    self.client:set(self.ns .. ":" .. name, value)
+end
+
+function Metrics:record_time(name, duration_ms)
+    local key = self.ns .. ":timing:" .. name
+    -- เก็บเป็น sorted set (score = timestamp, value = duration)
+    self.client:zadd(key, os.time(), duration_ms)
+    -- เก็บแค่ 1000 entries ล่าสุด
+    self.client:zremrangebyrank(key, 0, -1001)
+end
+
+function Metrics:get_stats(name)
+    local timings = self.client:zrange(
+        self.ns .. ":timing:" .. name, 0, -1)
+    if not timings or #timings == 0 then
+        return nil
+    end
+    
+    -- คำนวณ percentiles
+    local values = {}
+    for _, v in ipairs(timings) do
+        table.insert(values, tonumber(v) or 0)
+    end
+    table.sort(values)
+    
+    local function percentile(sorted, p)
+        local idx = math.ceil(#sorted * p / 100)
+        return sorted[math.max(1, idx)]
+    end
+    
+    local sum = 0
+    for _, v in ipairs(values) do sum = sum + v end
+    
+    return {
+        count = #values,
+        avg   = sum / #values,
+        min   = values[1],
+        max   = values[#values],
+        p50   = percentile(values, 50),
+        p95   = percentile(values, 95),
+        p99   = percentile(values, 99),
+    }
+end
+
+-- simulate queue metrics
+local metrics = Metrics.new("queue")
+
+-- Simulate processing times
+math.randomseed(42)
+for i = 1, 100 do
+    local duration = 10 + math.random(0, 90) + (math.random() < 0.05 and 500 or 0)
+    metrics:record_time("job_duration", duration)
+    
+    if math.random() < 0.05 then
+        metrics:increment("errors")
+    else
+        metrics:increment("processed")
+    end
+end
+
+metrics:gauge("queue_depth", 42)
+metrics:gauge("workers_active", 8)
+
+-- แสดง stats
+local stats = metrics:get_stats("job_duration")
+if stats then
+    print("Job Duration Stats:")
+    print(string.format("  Count: %d", stats.count))
+    print(string.format("  Avg:   %.1fms", stats.avg))
+    print(string.format("  Min:   %.1fms", stats.min))
+    print(string.format("  Max:   %.1fms", stats.max))
+    print(string.format("  p50:   %.1fms", stats.p50))
+    print(string.format("  p95:   %.1fms", stats.p95))
+    print(string.format("  p99:   %.1fms", stats.p99))
+end
+
+print("\nCounters:")
+print("  Processed:", client:get("queue:processed"))
+print("  Errors:", client:get("queue:errors"))
+print("  Queue depth:", client:get("queue:queue_depth"))
+
+client:quit()
+```
+
+---
+
+## 60.14 ตัวอย่างครบวงจร: Task Queue System
+
+### ตัวอย่างที่ 22: Complete Task Queue
+
+```lua
+-- task_queue_system.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+local TaskQueue = {}
+TaskQueue.__index = TaskQueue
+
+function TaskQueue.new(name, opts)
+    local self = setmetatable({}, TaskQueue)
+    opts = opts or {}
+    
+    self.name        = name
+    self.client      = redis.connect("127.0.0.1", 6379)
+    self.max_retries = opts.max_retries or 3
+    self.handlers    = {}
+    
+    -- Key names
+    self.keys = {
+        pending  = "tq:" .. name .. ":pending",
+        delayed  = "tq:" .. name .. ":delayed",
+        inflight = "tq:" .. name .. ":inflight",
+        dead     = "tq:" .. name .. ":dead",
+        stats    = "tq:" .. name .. ":stats",
+    }
+    
+    return self
+end
+
+function TaskQueue:submit(job_type, data, opts)
+    opts = opts or {}
+    local job = {
+        id         = tostring(os.time()) .. "_" .. math.random(99999),
+        type       = job_type,
+        data       = data,
+        priority   = opts.priority or 5,
+        attempts   = 0,
+        max_retries = opts.max_retries or self.max_retries,
+        created_at = os.time(),
+        scheduled_at = opts.delay and (os.time() + opts.delay) or nil
+    }
+    
+    if job.scheduled_at then
+        -- Delayed job
+        self.client:zadd(self.keys.delayed, job.scheduled_at, json.encode(job))
+    else
+        -- ใช้ priority score
+        local score = job.priority * 1e13 + os.time()
+        self.client:zadd(self.keys.pending, score, json.encode(job))
+    end
+    
+    self.client:hincrby(self.keys.stats, "submitted", 1)
+    return job.id
+end
+
+function TaskQueue:register(job_type, handler)
+    self.handlers[job_type] = handler
+end
+
+function TaskQueue:_promote_delayed()
+    local now = os.time()
+    local ready = self.client:zrangebyscore(self.keys.delayed, 0, now, "LIMIT", 0, 50)
+    for _, payload in ipairs(ready or {}) do
+        self.client:zrem(self.keys.delayed, payload)
+        local ok, job = pcall(json.decode, payload)
+        if ok then
+            local score = job.priority * 1e13 + os.time()
+            self.client:zadd(self.keys.pending, score, json.encode(job))
+        end
+    end
+end
+
+function TaskQueue:process_next()
+    self:_promote_delayed()
+    
+    -- ดึง job ที่ priority สูงสุด
+    local result = self.client:zpopmin(self.keys.pending, 1)
+    if not result or #result == 0 then return nil, "empty" end
+    
+    local payload = result[1]
+    local ok, job = pcall(json.decode, payload)
+    if not ok then return nil, "invalid" end
+    
+    -- Track inflight
+    self.client:hset(self.keys.inflight, job.id, payload)
+    
+    -- Process
+    local handler = self.handlers[job.type]
+    local success, err
+    
+    if handler then
+        success, err = pcall(handler, job.data, job)
+    else
+        success, err = false, "No handler for: " .. job.type
+    end
+    
+    -- Remove from inflight
+    self.client:hdel(self.keys.inflight, job.id)
+    
+    if success then
+        self.client:hincrby(self.keys.stats, "completed", 1)
+        return job, nil
+    else
+        job.attempts = job.attempts + 1
+        job.last_error = tostring(err)
+        
+        if job.attempts <= job.max_retries then
+            -- Retry with backoff
+            local delay = 2 ^ (job.attempts - 1)
+            local retry_at = os.time() + delay
+            self.client:zadd(self.keys.delayed, retry_at, json.encode(job))
+            self.client:hincrby(self.keys.stats, "retried", 1)
+        else
+            -- Dead letter
+            self.client:lpush(self.keys.dead, json.encode(job))
+            self.client:hincrby(self.keys.stats, "failed", 1)
+        end
+        
+        return nil, err
+    end
+end
+
+function TaskQueue:get_stats()
+    local s = self.client:hgetall(self.keys.stats) or {}
+    return {
+        submitted = tonumber(s["submitted"]) or 0,
+        completed = tonumber(s["completed"]) or 0,
+        retried   = tonumber(s["retried"])   or 0,
+        failed    = tonumber(s["failed"])    or 0,
+        pending   = self.client:zcard(self.keys.pending),
+        delayed   = self.client:zcard(self.keys.delayed),
+        inflight  = self.client:hlen(self.keys.inflight),
+        dead      = self.client:llen(self.keys.dead),
+    }
+end
+
+function TaskQueue:flush()
+    for _, key in pairs(self.keys) do
+        self.client:del(key)
+    end
+end
+
+function TaskQueue:close()
+    self.client:quit()
+end
+
+-- ทดสอบ
+local tq = TaskQueue.new("demo", {max_retries = 2})
+tq:flush()
+
+-- Register handlers
+tq:register("email", function(data, job)
+    if data.to:match("@invalid$") then
+        error("Invalid email domain")
+    end
+    print(string.format("    Email sent to %s", data.to))
+    return true
+end)
+
+tq:register("webhook", function(data, job)
+    print(string.format("    Webhook: POST to %s", data.url))
+    return true
+end)
+
+tq:register("report", function(data, job)
+    print(string.format("    Report '%s' generated", data.title))
+    return true
+end)
+
+-- Submit jobs
+tq:submit("email", {to = "alice@example.com"}, {priority = 2})
+tq:submit("webhook", {url = "https://hook.example.com/events"}, {priority = 1})
+tq:submit("email", {to = "bad@invalid"}, {priority = 2})  -- จะ fail
+tq:submit("report", {title = "Monthly Summary"}, {priority = 3})
+tq:submit("email", {to = "bob@example.com"}, {priority = 2, delay = 1})  -- delayed
+
+print("=== Processing Queue ===")
+for round = 1, 8 do
+    local job, err = tq:process_next()
+    if job then
+        print(string.format("Round %d: OK - %s", round, job.type))
+    elseif err == "empty" then
+        print(string.format("Round %d: Queue empty, waiting...", round))
+        -- ในตัวอย่าง simulate delay ด้วยการรอ
+        -- os.execute("sleep 1")
+        break
+    else
+        print(string.format("Round %d: FAIL - %s", round, err))
+    end
+end
+
+print("\n=== Final Stats ===")
+local stats = tq:get_stats()
+for k, v in pairs(stats) do
+    print(string.format("  %-12s: %d", k, v))
+end
+
+tq:close()
+```
+
+---
+
+## 60.15 ตัวอย่างที่ 23: Pub/Sub Event Bus
+
+```lua
+-- event_bus.lua
+-- Event Bus สำหรับ microservices
+
+local redis = require("redis")
+local json = require("dkjson")
+
+local EventBus = {}
+EventBus.__index = EventBus
+
+function EventBus.new()
+    local self = setmetatable({}, EventBus)
+    self.pub_client = redis.connect("127.0.0.1", 6379)
+    self.sub_client = redis.connect("127.0.0.1", 6379)
+    self.handlers   = {}
+    self.middleware  = {}
+    return self
+end
+
+function EventBus:use(middleware_fn)
+    table.insert(self.middleware, middleware_fn)
+end
+
+function EventBus:on(event_pattern, handler)
+    if not self.handlers[event_pattern] then
+        self.handlers[event_pattern] = {}
+    end
+    table.insert(self.handlers[event_pattern], handler)
+end
+
+function EventBus:emit(event_name, data)
+    local event = {
+        name      = event_name,
+        data      = data,
+        timestamp = os.time(),
+        id        = tostring(os.time()) .. "_" .. math.random(99999)
+    }
+    
+    -- รัน middleware
+    for _, mw in ipairs(self.middleware) do
+        event = mw(event) or event
+    end
+    
+    local payload = json.encode(event)
+    local receivers = self.pub_client:publish("events:" .. event_name, payload)
+    return receivers
+end
+
+function EventBus:listen(timeout)
+    -- Subscribe to all events
+    self.sub_client:psubscribe("events:*")
+    
+    local count = 0
+    for msg in self.sub_client:receive() do
+        if msg.kind == "pmessage" then
+            local ok, event = pcall(json.decode, msg.payload)
+            if ok then
+                -- หา handlers ที่ match
+                local event_name = event.name
+                for pattern, handlers in pairs(self.handlers) do
+                    -- simple pattern matching
+                    local match = false
+                    if pattern == event_name then
+                        match = true
+                    elseif pattern:sub(-1) == "*" then
+                        local prefix = pattern:sub(1, -2)
+                        match = event_name:sub(1, #prefix) == prefix
+                    end
+                    
+                    if match then
+                        for _, handler in ipairs(handlers) do
+                            pcall(handler, event.data, event)
+                        end
+                    end
+                end
+                
+                count = count + 1
+                if count >= (timeout or 5) then break end
+            end
+        elseif msg.kind == "psubscribe" then
+            print("Listening on pattern:", msg.channel)
+        end
+    end
+    
+    self.sub_client:punsubscribe()
+end
+
+function EventBus:close()
+    self.pub_client:quit()
+    self.sub_client:quit()
+end
+
+-- ใช้งาน
+local bus = EventBus.new()
+
+-- Middleware: เพิ่ม logging
+bus:use(function(event)
+    print(string.format("  [LOG] %s at %s",
+        event.name, os.date("%H:%M:%S", event.timestamp)))
+    return event
+end)
+
+-- Register event handlers
+bus:on("user.created", function(data, event)
+    print(string.format("    → Send welcome email to %s", data.email))
+end)
+
+bus:on("user.created", function(data, event)
+    print(string.format("    → Create user profile for %s", data.username))
+end)
+
+bus:on("order.*", function(data, event)
+    print(string.format("    → Order event: %s (order_id=%s)",
+        event.name, data.order_id or "?"))
+end)
+
+bus:on("payment.completed", function(data, event)
+    print(string.format("    → Update account balance: $%.2f", data.amount))
+end)
+
+-- Emit events (ต้องมี subscriber แล้ว)
+-- ในตัวอย่างจริงจะรันใน process แยก
+print("Event Bus example (emit side):")
+local n
+n = bus:emit("user.created", {username = "alice", email = "alice@example.com"})
+print(string.format("user.created delivered to %d subscribers", n))
+
+n = bus:emit("order.created", {order_id = "ORD-001", total = 99.99})
+print(string.format("order.created delivered to %d subscribers", n))
+
+n = bus:emit("payment.completed", {order_id = "ORD-001", amount = 99.99})
+print(string.format("payment.completed delivered to %d subscribers", n))
+
+bus:close()
+```
+
+---
+
+## 60.16 ตัวอย่างเพิ่มเติม
+
+### ตัวอย่างที่ 23: Pipelines และ Batch Commands
+
+```lua
+-- redis_pipeline.lua
+local redis = require("redis")
+local client = redis.connect("127.0.0.1", 6379)
+
+-- Pipeline: ส่ง commands หลายตัวพร้อมกัน (ลด network round-trips)
+
+-- แบบไม่ใช้ pipeline (n round-trips)
+local t1 = os.clock()
+client:del("pl:test")
+for i = 1, 1000 do
+    client:lpush("pl:test", "item_" .. i)
+end
+local t_no_pipeline = os.clock() - t1
+print(string.format("Without pipeline: %.4fs", t_no_pipeline))
+
+-- แบบใช้ pipeline (1 round-trip)
+client:del("pl:test2")
+local t2 = os.clock()
+local responses = client:pipeline(function(pipe)
+    for i = 1, 1000 do
+        pipe:lpush("pl:test2", "item_" .. i)
+    end
+end)
+local t_pipeline = os.clock() - t2
+print(string.format("With pipeline:    %.4fs (%.1fx faster)",
+    t_pipeline, t_no_pipeline / math.max(t_pipeline, 0.0001)))
+
+print("Pipeline responses:", #(responses or {}))
+print("List length:", client:llen("pl:test2"))
+
+-- Multi-Get ด้วย pipeline
+client:mset("k1", "v1", "k2", "v2", "k3", "v3")
+
+local values = {}
+client:pipeline(function(pipe)
+    pipe:get("k1")
+    pipe:get("k2")
+    pipe:get("k3")
+    pipe:get("k_notexist")
+end)
+
+-- cleanup
+client:del("pl:test", "pl:test2", "k1", "k2", "k3")
+client:quit()
+```
+
+### ตัวอย่างที่ 24: Sorted Set สำหรับ Leaderboard
+
+```lua
+-- leaderboard.lua
+local redis = require("redis")
+local client = redis.connect("127.0.0.1", 6379)
+local LB_KEY = "leaderboard:game1"
+client:del(LB_KEY)
+
+-- เพิ่มคะแนน
+local players = {
+    {"alice", 4500}, {"bob", 3200}, {"carol", 5800},
+    {"dave", 2100},  {"eve", 4900}, {"frank", 3700},
+    {"grace", 6200}, {"henry", 1500}
+}
+for _, p in ipairs(players) do
+    client:zadd(LB_KEY, p[2], p[1])
+end
+
+-- Top 5 (score สูงสุดก่อน)
+print("Top 5 Players:")
+local top = client:zrevrange(LB_KEY, 0, 4, "WITHSCORES")
+for i = 1, #(top or {}), 2 do
+    local rank = (i + 1) // 2
+    print(string.format("  #%d %-10s %s pts", rank, top[i], top[i+1]))
+end
+
+-- Rank ของ player
+local alice_rank = client:zrevrank(LB_KEY, "alice")
+print(string.format("\nAlice's rank: #%d", (alice_rank or 0) + 1))
+
+-- Score ของ player
+local alice_score = client:zscore(LB_KEY, "alice")
+print(string.format("Alice's score: %s", alice_score))
+
+-- อัปเดตคะแนน
+client:zincrby(LB_KEY, 500, "alice")
+print("Alice after +500:", client:zscore(LB_KEY, "alice"))
+
+-- Players ใน score range
+print("\nPlayers 3000-5000 pts:")
+local mid = client:zrangebyscore(LB_KEY, 3000, 5000, "WITHSCORES")
+for i = 1, #(mid or {}), 2 do
+    print(string.format("  %-10s %s pts", mid[i], mid[i+1]))
+end
+
+client:del(LB_KEY)
+client:quit()
+```
+
+### ตัวอย่างที่ 25: Session Management
+
+```lua
+-- session_manager.lua
+local redis = require("redis")
+local json = require("dkjson")
+
+local SessionManager = {}
+SessionManager.__index = SessionManager
+
+function SessionManager.new(ttl_seconds)
+    local self = setmetatable({}, SessionManager)
+    self.client = redis.connect("127.0.0.1", 6379)
+    self.ttl    = ttl_seconds or 3600  -- 1 hour default
+    self.prefix = "session:"
+    return self
+end
+
+function SessionManager:_gen_token()
+    -- สร้าง random session token
+    local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    local token = {}
+    for _ = 1, 32 do
+        local idx = math.random(1, #chars)
+        table.insert(token, chars:sub(idx, idx))
+    end
+    return table.concat(token)
+end
+
+function SessionManager:create(user_id, data)
+    local token = self:_gen_token()
+    local key = self.prefix .. token
+    
+    local session = {
+        user_id    = user_id,
+        data       = data or {},
+        created_at = os.time(),
+        last_seen  = os.time()
+    }
+    
+    self.client:setex(key, self.ttl, json.encode(session))
+    return token
+end
+
+function SessionManager:get(token)
+    local key = self.prefix .. token
+    local payload = self.client:get(key)
+    if not payload then return nil end
+    
+    local ok, session = pcall(json.decode, payload)
+    if not ok then return nil end
+    
+    -- Refresh TTL (sliding window)
+    session.last_seen = os.time()
+    self.client:setex(key, self.ttl, json.encode(session))
+    return session
+end
+
+function SessionManager:destroy(token)
+    return self.client:del(self.prefix .. token) > 0
+end
+
+function SessionManager:update(token, new_data)
+    local session = self:get(token)
+    if not session then return false end
+    
+    for k, v in pairs(new_data) do
+        session.data[k] = v
+    end
+    
+    local key = self.prefix .. token
+    self.client:setex(key, self.ttl, json.encode(session))
+    return true
+end
+
+function SessionManager:close()
+    self.client:quit()
+end
+
+-- ทดสอบ
+local sm = SessionManager.new(1800)
+math.randomseed(os.time())
+
+-- สร้าง session
+local token = sm:create(101, {role = "admin", ip = "192.168.1.1"})
+print("Session created:", token:sub(1,8) .. "...")
+
+-- อ่าน session
+local session = sm:get(token)
+if session then
+    print(string.format("User: %d, Role: %s",
+        session.user_id, session.data.role))
+end
+
+-- อัปเดต session data
+sm:update(token, {last_page = "/dashboard"})
+local updated = sm:get(token)
+print("Last page:", updated and updated.data.last_page or "nil")
+
+-- ลบ session
+local destroyed = sm:destroy(token)
+print("Session destroyed:", destroyed)
+print("Session after destroy:", sm:get(token) == nil and "nil" or "exists")
+
+sm:close()
+```
+
+### ตัวอย่างที่ 26: Cache-Aside Pattern
+
+```lua
+-- cache_aside.lua
+local redis = require("redis")
+local json = require("dkjson")
 local sqlite3 = require("lsqlite3")
+
+-- Cache-Aside: ดึงจาก cache ก่อน ถ้าไม่มีค่อยดึงจาก database
 
 local Cache = {}
 Cache.__index = Cache
 
-function Cache.new(options)
-    options = options or {}
+function Cache.new(ttl)
     local self = setmetatable({}, Cache)
-    self._db = sqlite3.open(options.path or ":memory:")
-    self._max_size = options.max_size or 1000
-    self._default_ttl = options.default_ttl or 3600
-    self._hits = 0
-    self._misses = 0
-    self:_init()
+    self.redis = redis.connect("127.0.0.1", 6379)
+    self.db    = sqlite3.open(":memory:")
+    self.ttl   = ttl or 300  -- 5 minutes
+    self.hits  = 0
+    self.misses = 0
+    
+    -- สร้าง test database
+    self.db:exec([[
+        CREATE TABLE users (
+            id    INTEGER PRIMARY KEY,
+            name  TEXT,
+            email TEXT
+        );
+        INSERT INTO users VALUES
+            (1, 'Alice', 'alice@example.com'),
+            (2, 'Bob',   'bob@example.com'),
+            (3, 'Carol', 'carol@example.com');
+    ]])
+    
     return self
 end
 
-function Cache:_init()
-    self._db:exec([[
-        CREATE TABLE IF NOT EXISTS cache (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            created_at INTEGER DEFAULT (strftime('%s', 'now')),
-            expires_at INTEGER,
-            hit_count INTEGER DEFAULT 0,
-            last_accessed INTEGER DEFAULT (strftime('%s', 'now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at);
-        CREATE INDEX IF NOT EXISTS idx_cache_accessed ON cache(last_accessed);
-    ]])
-end
-
-function Cache:set(key, value, ttl)
-    ttl = ttl or self._default_ttl
-    local expires_at = os.time() + ttl
-
-    -- Serialize value
-    local serialized
-    if type(value) == "string" then
-        serialized = "s:" .. value
-    elseif type(value) == "number" then
-        serialized = "n:" .. tostring(value)
-    elseif type(value) == "boolean" then
-        serialized = "b:" .. (value and "1" or "0")
-    else
-        serialized = "t:" .. tostring(value)
+function Cache:get_user(user_id)
+    local cache_key = "user:" .. user_id
+    
+    -- 1. ลอง cache ก่อน
+    local cached = self.redis:get(cache_key)
+    if cached then
+        self.hits = self.hits + 1
+        local ok, data = pcall(json.decode, cached)
+        if ok then return data, "cache" end
     end
-
-    -- Evict if too large
-    local count_row = self._db:nrows("SELECT COUNT(*) as c FROM cache")()
-    if count_row and count_row.c >= self._max_size then
-        self:_evict()
+    
+    -- 2. Cache miss: ดึงจาก database
+    self.misses = self.misses + 1
+    local user
+    local stmt = self.db:prepare("SELECT * FROM users WHERE id = ?")
+    stmt:bind_values(user_id)
+    if stmt:step() == sqlite3.ROW then
+        user = {
+            id    = stmt:get_value(0),
+            name  = stmt:get_value(1),
+            email = stmt:get_value(2)
+        }
     end
-
-    local stmt = self._db:prepare([[
-        INSERT OR REPLACE INTO cache (key, value, expires_at, hit_count, last_accessed)
-        VALUES (?, ?, ?, 0, strftime('%s', 'now'))
-    ]])
-    stmt:bind_values(key, serialized, expires_at)
-    stmt:step()
     stmt:finalize()
-end
-
-function Cache:get(key)
-    -- Cleanup expired
-    self._db:exec(string.format(
-        "DELETE FROM cache WHERE expires_at <= %d", os.time()
-    ))
-
-    local stmt = self._db:prepare([[
-        SELECT value FROM cache 
-        WHERE key = ? AND expires_at > strftime('%s', 'now')
-    ]])
-    stmt:bind_values(key)
-    local row = stmt:first_row()
-    stmt:finalize()
-
-    if not row then
-        self._misses = self._misses + 1
-        return nil
+    
+    if user then
+        -- 3. เก็บลง cache
+        self.redis:setex(cache_key, self.ttl, json.encode(user))
     end
-
-    -- Update stats
-    self._db:exec(string.format([[
-        UPDATE cache 
-        SET hit_count = hit_count + 1, last_accessed = strftime('%%s', 'now')
-        WHERE key = '%s'
-    ]], key:gsub("'", "''")))
-
-    self._hits = self._hits + 1
-
-    -- Deserialize
-    local serialized = row[1]
-    local prefix = serialized:sub(1, 2)
-    local val = serialized:sub(3)
-
-    if prefix == "s:" then return val
-    elseif prefix == "n:" then return tonumber(val)
-    elseif prefix == "b:" then return val == "1"
-    else return val
-    end
+    
+    return user, "db"
 end
 
-function Cache:delete(key)
-    local stmt = self._db:prepare("DELETE FROM cache WHERE key = ?")
-    stmt:bind_values(key)
-    stmt:step()
-    stmt:finalize()
-end
-
-function Cache:_evict()
-    -- LRU eviction: ลบ 10% ของ entries ที่ใช้งานน้อยที่สุด
-    local evict_count = math.max(1, math.floor(self._max_size * 0.1))
-    self._db:exec(string.format([[
-        DELETE FROM cache WHERE key IN (
-            SELECT key FROM cache ORDER BY last_accessed ASC LIMIT %d
-        )
-    ]], evict_count))
+function Cache:invalidate(user_id)
+    return self.redis:del("user:" .. user_id) > 0
 end
 
 function Cache:stats()
-    local count_row = self._db:nrows("SELECT COUNT(*) as c FROM cache")()
-    local total = count_row and count_row.c or 0
-    local hit_rate = (self._hits + self._misses) > 0
-        and (self._hits / (self._hits + self._misses) * 100)
-        or 0
-
+    local total = self.hits + self.misses
     return {
-        size = total,
-        hits = self._hits,
-        misses = self._misses,
-        hit_rate = string.format("%.1f%%", hit_rate)
+        hits     = self.hits,
+        misses   = self.misses,
+        hit_rate = total > 0 and (self.hits / total * 100) or 0
     }
 end
 
--- Memoize helper
-function Cache:memoize(key_fn, compute_fn, ttl)
-    return function(...)
-        local key = key_fn(...)
-        local cached = self:get(key)
-        if cached ~= nil then
-            return cached
-        end
-        local result = compute_fn(...)
-        self:set(key, result, ttl)
-        return result
-    end
-end
-
--- ทดสอบ Cache
-local cache = Cache.new({max_size = 100, default_ttl = 60})
-
-print("=== Basic Cache Operations ===")
-cache:set("user:1", "สมชาย")
-cache:set("config:debug", true)
-cache:set("counter", 42)
-
-print("user:1 =", cache:get("user:1"))
-print("config:debug =", cache:get("config:debug"))
-print("counter =", cache:get("counter"))
-print("missing =", tostring(cache:get("nonexistent")))
-
-print("\n=== Memoization ===")
-local expensive_compute = function(n)
-    -- จำลอง expensive operation
-    local sum = 0
-    for i = 1, n do sum = sum + i end
-    return sum
-end
-
-local memoized = cache:memoize(
-    function(n) return "sum:" .. n end,
-    expensive_compute,
-    300
-)
-
-print("sum(100) =", memoized(100))
-print("sum(100) cached =", memoized(100))  -- จาก cache
-print("sum(200) =", memoized(200))
-
-print("\n=== Cache Stats ===")
-local stats = cache:stats()
-print(string.format("  Size: %d, Hits: %d, Misses: %d, Hit Rate: %s",
-    stats.size, stats.hits, stats.misses, stats.hit_rate))
-```
-
----
-
-## 60.10 Pattern: Repository Pattern
-
-### ตัวอย่างที่ 14: Repository Pattern พร้อม Unit of Work
-
-```lua
--- repository_pattern.lua
-local sqlite3 = require("lsqlite3")
-
--- Repository base class
-local Repository = {}
-Repository.__index = Repository
-
-function Repository.new(db, table_name)
-    return setmetatable({
-        _db = db,
-        _table = table_name,
-    }, Repository)
-end
-
-function Repository:findAll(options)
-    options = options or {}
-    local sql = "SELECT * FROM " .. self._table
-
-    local wheres = {}
-    local values = {}
-
-    if options.where then
-        for col, val in pairs(options.where) do
-            table.insert(wheres, col .. " = ?")
-            table.insert(values, val)
-        end
-    end
-
-    if #wheres > 0 then
-        sql = sql .. " WHERE " .. table.concat(wheres, " AND ")
-    end
-
-    if options.order then sql = sql .. " ORDER BY " .. options.order end
-    if options.limit then sql = sql .. " LIMIT " .. options.limit end
-    if options.offset then sql = sql .. " OFFSET " .. options.offset end
-
-    local stmt = self._db:prepare(sql)
-    if #values > 0 then
-        stmt:bind_values(table.unpack(values))
-    end
-
-    local results = {}
-    for row in stmt:nrows() do
-        table.insert(results, row)
-    end
-    stmt:finalize()
-
-    return results
-end
-
-function Repository:findById(id)
-    local stmt = self._db:prepare(
-        "SELECT * FROM " .. self._table .. " WHERE id = ?"
-    )
-    stmt:bind_values(id)
-    local row = stmt:first_row()
-    stmt:finalize()
-    return row
-end
-
-function Repository:save(entity)
-    if entity.id then
-        return self:_update(entity)
-    else
-        return self:_insert(entity)
-    end
-end
-
-function Repository:_insert(entity)
-    local cols = {}
-    local placeholders = {}
-    local values = {}
-
-    for k, v in pairs(entity) do
-        if k ~= "id" then
-            table.insert(cols, k)
-            table.insert(placeholders, "?")
-            table.insert(values, v)
-        end
-    end
-
-    local sql = string.format(
-        "INSERT INTO %s (%s) VALUES (%s)",
-        self._table,
-        table.concat(cols, ", "),
-        table.concat(placeholders, ", ")
-    )
-
-    local stmt = self._db:prepare(sql)
-    stmt:bind_values(table.unpack(values))
-    stmt:step()
-    stmt:finalize()
-
-    entity.id = self._db:last_insert_rowid()
-    return entity
-end
-
-function Repository:_update(entity)
-    local sets = {}
-    local values = {}
-
-    for k, v in pairs(entity) do
-        if k ~= "id" then
-            table.insert(sets, k .. " = ?")
-            table.insert(values, v)
-        end
-    end
-
-    table.insert(values, entity.id)
-
-    local sql = string.format(
-        "UPDATE %s SET %s WHERE id = ?",
-        self._table,
-        table.concat(sets, ", ")
-    )
-
-    local stmt = self._db:prepare(sql)
-    stmt:bind_values(table.unpack(values))
-    stmt:step()
-    stmt:finalize()
-
-    return entity
-end
-
-function Repository:delete(id)
-    local stmt = self._db:prepare(
-        "DELETE FROM " .. self._table .. " WHERE id = ?"
-    )
-    stmt:bind_values(id)
-    stmt:step()
-    local affected = self._db:changes()
-    stmt:finalize()
-    return affected > 0
-end
-
--- Unit of Work
-local UnitOfWork = {}
-UnitOfWork.__index = UnitOfWork
-
-function UnitOfWork.new(db)
-    local self = setmetatable({}, UnitOfWork)
-    self._db = db
-    self._new = {}
-    self._dirty = {}
-    self._deleted = {}
-    return self
-end
-
-function UnitOfWork:register_new(entity, repo)
-    table.insert(self._new, {entity = entity, repo = repo})
-end
-
-function UnitOfWork:register_dirty(entity, repo)
-    table.insert(self._dirty, {entity = entity, repo = repo})
-end
-
-function UnitOfWork:register_deleted(id, repo)
-    table.insert(self._deleted, {id = id, repo = repo})
-end
-
-function UnitOfWork:commit()
-    self._db:exec("BEGIN")
-
-    local ok, err = pcall(function()
-        for _, item in ipairs(self._new) do
-            item.repo:save(item.entity)
-        end
-        for _, item in ipairs(self._dirty) do
-            item.repo:save(item.entity)
-        end
-        for _, item in ipairs(self._deleted) do
-            item.repo:delete(item.id)
-        end
-    end)
-
-    if ok then
-        self._db:exec("COMMIT")
-        self._new = {}
-        self._dirty = {}
-        self._deleted = {}
-        return true
-    else
-        self._db:exec("ROLLBACK")
-        return false, err
-    end
+function Cache:close()
+    self.redis:quit()
+    self.db:close()
 end
 
 -- ทดสอบ
-local db = sqlite3.open(":memory:")
+local cache = Cache.new(60)
 
-db:exec([[
-    CREATE TABLE customers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        email TEXT,
-        tier TEXT DEFAULT 'standard'
-    );
-    CREATE TABLE orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customer_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        status TEXT DEFAULT 'pending'
-    )
-]])
-
-local customer_repo = Repository.new(db, "customers")
-local order_repo = Repository.new(db, "orders")
-
--- สร้าง Unit of Work
-local uow = UnitOfWork.new(db)
-
-local c1 = {name = "ลูกค้า VIP", email = "vip@test.com", tier = "premium"}
-local c2 = {name = "ลูกค้าทั่วไป", email = "normal@test.com", tier = "standard"}
-
-uow:register_new(c1, customer_repo)
-uow:register_new(c2, customer_repo)
-
-local ok, err = uow:commit()
-print("Commit result:", ok, err)
-
-print("\n=== Customers ===")
-for _, c in ipairs(customer_repo:findAll({order = "id"})) do
-    print(string.format("  [%d] %s (%s)", c.id, c.name, c.tier))
+-- First access (cache miss)
+for id = 1, 3 do
+    local user, source = cache:get_user(id)
+    if user then
+        print(string.format("User %d from %s: %s", id, source, user.name))
+    end
 end
 
--- Add orders
-local uow2 = UnitOfWork.new(db)
-uow2:register_new({customer_id = c1.id, amount = 5000, status = "paid"}, order_repo)
-uow2:register_new({customer_id = c1.id, amount = 3500, status = "pending"}, order_repo)
-uow2:register_new({customer_id = c2.id, amount = 1200, status = "paid"}, order_repo)
-uow2:commit()
-
-print("\n=== Orders for Customer 1 ===")
-for _, o in ipairs(order_repo:findAll({where = {customer_id = c1.id}})) do
-    print(string.format("  Order #%d: %.2f (%s)", o.id, o.amount, o.status))
+-- Second access (cache hit)
+print("\nSecond access:")
+for id = 1, 3 do
+    local user, source = cache:get_user(id)
+    if user then
+        print(string.format("User %d from %s: %s", id, source, user.name))
+    end
 end
 
-db:close()
+local stats = cache:stats()
+print(string.format("\nCache stats: %d hits, %d misses, %.1f%% hit rate",
+    stats.hits, stats.misses, stats.hit_rate))
+
+-- Invalidate cache
+cache:invalidate(1)
+print("\nAfter invalidating user 1:")
+local user, source = cache:get_user(1)
+print(string.format("User 1 from %s: %s", source, user and user.name or "nil"))
+
+cache:close()
 ```
 
----
-
-## 60.11 สรุปและ Best Practices
-
-### ตัวอย่างที่ 15: Best Practices Checklist
+### ตัวอย่างที่ 27: HyperLogLog (Approximate Counting)
 
 ```lua
--- best_practices.lua
--- รวม best practices ทั้งหมดสำหรับ SQLite/NoSQL ใน Lua
+-- hyperloglog.lua
+-- HyperLogLog: นับ unique items แบบ approximate ใช้ memory น้อยมาก
+local redis = require("redis")
+local client = redis.connect("127.0.0.1", 6379)
 
---[[
-✅ SQLite Best Practices:
+local DAU_KEY = "hll:dau:"  -- Daily Active Users
 
-1. Connection Management
-   - ใช้ connection pool สำหรับ multi-threaded apps
-   - ปิด connection เมื่อไม่ใช้งาน
-   - ใช้ WAL mode สำหรับ concurrent reads
+-- Simulate user visits
+local function record_visit(date, user_id)
+    local key = DAU_KEY .. date
+    client:pfadd(key, tostring(user_id))
+    client:expire(key, 90 * 24 * 3600)  -- keep 90 days
+end
 
-2. Performance
-   - ใช้ transactions สำหรับ batch writes
-   - สร้าง indexes บน columns ที่ query บ่อย
-   - ใช้ prepared statements (ไม่ต้อง parse SQL ซ้ำ)
-   - เปิด PRAGMA cache_size สำหรับ large databases
+-- สร้างข้อมูล test
+math.randomseed(42)
+local dates = {"2025-01-01", "2025-01-02", "2025-01-03"}
+local user_pool = 1000  -- มี users ทั้งหมด 1000 คน
 
-3. Data Safety
-   - ใช้ transactions สำหรับ operations ที่ต้องเป็น atomic
-   - Handle errors อย่างเหมาะสม
-   - Backup ก่อน migration
-
-4. Schema Design
-   - ใช้ INTEGER PRIMARY KEY AUTOINCREMENT
-   - เพิ่ม created_at/updated_at ในทุกตาราง
-   - ใช้ FOREIGN KEY constraints
-
-5. Security
-   - ใช้ parameterized queries (ไม่ใช้ string concatenation)
-   - Validate input ก่อน insert
-   - จำกัด file permissions ของ .db file
-]]
-
-local sqlite3 = require("lsqlite3")
-
-local function demonstrate_pragmas(db)
-    print("=== SQLite PRAGMAs ===")
-
-    -- WAL mode: เพิ่ม concurrent read performance
-    db:exec("PRAGMA journal_mode=WAL")
-
-    -- Cache size (หน่วย KB หรือ จำนวน pages ถ้าเป็น negative)
-    db:exec("PRAGMA cache_size=-10000")  -- ~10MB cache
-
-    -- Synchronous mode (NORMAL = good balance)
-    db:exec("PRAGMA synchronous=NORMAL")
-
-    -- Foreign key support (ปิดโดย default!)
-    db:exec("PRAGMA foreign_keys=ON")
-
-    -- ตรวจสอบ pragmas
-    for row in db:nrows("PRAGMA journal_mode") do
-        print("  journal_mode:", row[1])
-    end
-    for row in db:nrows("PRAGMA foreign_keys") do
-        print("  foreign_keys:", row[1] == 1 and "ON" or "OFF")
-    end
-    for row in db:nrows("PRAGMA cache_size") do
-        print("  cache_size:", row[1])
+for _, date in ipairs(dates) do
+    -- แต่ละวันมี users ประมาณ 300-500 คน visit
+    local visits = math.random(300, 500)
+    for _ = 1, visits do
+        record_visit(date, math.random(1, user_pool))
     end
 end
 
-local function demonstrate_safe_queries(db)
-    print("\n=== Safe Query Patterns ===")
-
-    db:exec("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)")
-    db:exec("INSERT INTO test VALUES (1, 'Alice', 100), (2, 'Bob', 200)")
-
-    -- ✅ GOOD: Parameterized query
-    local stmt = db:prepare("SELECT * FROM test WHERE name = ? AND value > ?")
-    stmt:bind_values("Alice", 50)
-    for row in stmt:nrows() do
-        print("  Safe query found:", row.name, row.value)
-    end
-    stmt:finalize()
-
-    -- ❌ BAD: String concatenation (SQL injection risk!)
-    -- local user_input = "' OR '1'='1"
-    -- db:exec("SELECT * FROM test WHERE name = '" .. user_input .. "'")
-    -- ^ อย่าทำแบบนี้!
-
-    print("  ✅ Always use parameterized queries!")
+-- นับ DAU แต่ละวัน
+print("Daily Active Users (approximate):")
+for _, date in ipairs(dates) do
+    local count = client:pfcount(DAU_KEY .. date)
+    print(string.format("  %s: ~%d users", date, count))
 end
 
-local db = sqlite3.open(":memory:")
+-- Monthly Active Users (union ของทุกวัน)
+local all_keys = {}
+for _, date in ipairs(dates) do
+    table.insert(all_keys, DAU_KEY .. date)
+end
 
-demonstrate_pragmas(db)
-demonstrate_safe_queries(db)
+local mau_key = "hll:mau:2025-01"
+-- PFMERGE: merge หลาย HLL เป็นหนึ่ง
+client:pfmerge(mau_key, table.unpack(all_keys))
+local mau = client:pfcount(mau_key)
+print(string.format("\nMonthly Active Users: ~%d unique users", mau))
+print(string.format("(from pool of %d users over %d days)", user_pool, #dates))
 
-print("\n=== Summary ===")
-print([[
-SQLite ใน Lua เหมาะสำหรับ:
-  ✅ Desktop/mobile applications
-  ✅ Configuration storage
-  ✅ Local caching
-  ✅ Prototype development
-  ✅ Embedded systems
+-- Memory usage comparison
+-- HLL ใช้ ~12KB ต่อ counter, ไม่ว่าจะนับ 100 หรือ 1 billion items
+print("\nHyperLogLog: accurate ~0.81%, uses max 12KB per counter")
 
-ไม่เหมาะสำหรับ:
-  ❌ High concurrency write workloads
-  ❌ Very large datasets (>1TB)
-  ❌ Distributed systems
-  ❌ Complex analytics queries
-]])
+-- Cleanup
+for _, date in ipairs(dates) do client:del(DAU_KEY .. date) end
+client:del(mau_key)
+client:quit()
+```
 
-db:close()
+### ตัวอย่างที่ 28: Bloom Filter Pattern
+
+```lua
+-- bloom_filter.lua
+-- Bloom Filter: ตรวจสอบว่า item "อาจ" มีหรือ "แน่นอนไม่มี"
+-- ใช้ Redis SETBIT/GETBIT
+
+local redis = require("redis")
+local client = redis.connect("127.0.0.1", 6379)
+
+local BloomFilter = {}
+BloomFilter.__index = BloomFilter
+
+function BloomFilter.new(name, size, hash_count)
+    local self = setmetatable({}, BloomFilter)
+    self.key        = "bloom:" .. name
+    self.size       = size or 1000000  -- 1M bits = 128KB
+    self.hash_count = hash_count or 5
+    self.client     = client
+    return self
+end
+
+-- Simple hash functions (ควรใช้ better hash functions ใน production)
+function BloomFilter:_hash(item, seed)
+    local h = seed * 0x5851f42d4c957f2d
+    for i = 1, #item do
+        h = h ~ (string.byte(item, i) * 0x14057b7ef767814f)
+        h = ((h << 7) | (h >> 57)) * 0x3c6ef372fe94f82b
+    end
+    return math.abs(math.floor(h % self.size))
+end
+
+function BloomFilter:add(item)
+    for i = 1, self.hash_count do
+        local bit_pos = self:_hash(item, i * 0x9e3779b97f4a7c15)
+        self.client:setbit(self.key, bit_pos, 1)
+    end
+end
+
+function BloomFilter:might_contain(item)
+    for i = 1, self.hash_count do
+        local bit_pos = self:_hash(item, i * 0x9e3779b97f4a7c15)
+        if self.client:getbit(self.key, bit_pos) == 0 then
+            return false  -- แน่นอนไม่มี
+        end
+    end
+    return true  -- อาจมี (false positive possible)
+end
+
+function BloomFilter:clear()
+    self.client:del(self.key)
+end
+
+-- ทดสอบ
+local bf = BloomFilter.new("emails", 100000, 5)
+bf:clear()
+
+-- เพิ่ม emails ที่ลงทะเบียนแล้ว
+local registered = {
+    "alice@example.com", "bob@example.com",
+    "carol@example.com", "dave@example.com"
+}
+for _, email in ipairs(registered) do
+    bf:add(email)
+    print("Added:", email)
+end
+
+-- ตรวจสอบ
+print("\nChecking emails:")
+local test_emails = {
+    "alice@example.com",    -- registered
+    "eve@example.com",      -- not registered
+    "bob@example.com",      -- registered
+    "frank@example.com",    -- not registered
+}
+for _, email in ipairs(test_emails) do
+    local result = bf:might_contain(email)
+    print(string.format("  %-30s %s", email,
+        result and "MIGHT EXIST (check DB)" or "DEFINITELY NOT EXISTS"))
+end
+
+bf:clear()
+client:quit()
+```
+
+### ตัวอย่างที่ 29: Geo Location Queue
+
+```lua
+-- geo_queue.lua
+-- ใช้ Redis GEO + Sorted Sets สำหรับ location-based queues
+
+local redis = require("redis")
+local json = require("dkjson")
+
+local client = redis.connect("127.0.0.1", 6379)
+local GEO_KEY = "geo:drivers"
+local JOB_KEY = "geo:jobs"
+
+client:del(GEO_KEY, JOB_KEY)
+
+-- เพิ่ม driver locations (longitude, latitude, member)
+local drivers = {
+    {name = "driver:1", lon = 100.523, lat = 13.736},  -- Bangkok area
+    {name = "driver:2", lon = 100.541, lat = 13.751},
+    {name = "driver:3", lon = 100.498, lat = 13.722},
+    {name = "driver:4", lon = 100.562, lat = 13.768},
+    {name = "driver:5", lon = 100.510, lat = 13.740},
+}
+
+for _, d in ipairs(drivers) do
+    client:geoadd(GEO_KEY, d.lon, d.lat, d.name)
+    print(string.format("Added %s at (%.3f, %.3f)", d.name, d.lon, d.lat))
+end
+
+-- ผู้โดยสารต้องการ driver ที่ใกล้ที่สุด
+local passenger_lon, passenger_lat = 100.530, 13.745
+
+print(string.format("\nPassenger at (%.3f, %.3f)", passenger_lon, passenger_lat))
+print("Nearby drivers (within 3km):")
+
+-- GEORADIUS: หา members ใน radius
+local nearby = client:georadius(
+    GEO_KEY,
+    passenger_lon, passenger_lat,
+    3, "km",
+    "WITHCOORD", "WITHDIST",
+    "COUNT", 5,
+    "ASC"  -- ใกล้สุดก่อน
+)
+
+for i, item in ipairs(nearby or {}) do
+    local name = item[1]
+    local dist = item[2]
+    local coord = item[3]
+    print(string.format("  %d. %s - %.3f km (%.3f, %.3f)",
+        i, name, tonumber(dist),
+        tonumber(coord[1]), tonumber(coord[2])))
+end
+
+-- คำนวณระยะทางระหว่าง 2 points
+local dist = client:geodist(GEO_KEY, "driver:1", "driver:2", "km")
+print(string.format("\nDistance driver:1 to driver:2: %.3f km",
+    tonumber(dist or 0)))
+
+client:del(GEO_KEY)
+client:quit()
+```
+
+### ตัวอย่างที่ 30: Distributed Counter
+
+```lua
+-- distributed_counter.lua
+local redis = require("redis")
+local client = redis.connect("127.0.0.1", 6379)
+
+-- Distributed counter ที่ accurate และ fast
+local Counter = {}
+Counter.__index = Counter
+
+function Counter.new(name)
+    local self = setmetatable({}, Counter)
+    self.key = "counter:" .. name
+    self.client = client
+    return self
+end
+
+-- Atomic increment
+function Counter:incr(amount)
+    amount = amount or 1
+    if amount == 1 then
+        return self.client:incr(self.key)
+    else
+        return self.client:incrby(self.key, amount)
+    end
+end
+
+-- Float increment
+function Counter:incr_float(amount)
+    return tonumber(self.client:incrbyfloat(self.key, amount))
+end
+
+-- Decrement
+function Counter:decr(amount)
+    amount = amount or 1
+    return self.client:decrby(self.key, amount)
+end
+
+-- Get current value
+function Counter:get()
+    return tonumber(self.client:get(self.key)) or 0
+end
+
+-- Reset
+function Counter:reset()
+    self.client:set(self.key, 0)
+end
+
+-- Set with TTL
+function Counter:set_expire(value, ttl)
+    self.client:setex(self.key, ttl, tostring(value))
+end
+
+-- Time-window counter (count events per minute/hour)
+function Counter:incr_window(window_seconds)
+    local window_key = self.key .. ":" ..
+        math.floor(os.time() / window_seconds)
+    local count = self.client:incr(window_key)
+    if count == 1 then
+        self.client:expire(window_key, window_seconds * 2)
+    end
+    return count
+end
+
+function Counter:get_window(window_seconds)
+    local window_key = self.key .. ":" ..
+        math.floor(os.time() / window_seconds)
+    return tonumber(self.client:get(window_key)) or 0
+end
+
+-- ทดสอบ
+local page_views = Counter.new("page_views")
+local api_calls  = Counter.new("api_calls")
+
+-- Reset
+page_views:reset()
+api_calls:reset()
+
+-- Simulate requests
+for _ = 1, 1000 do
+    page_views:incr()
+end
+for _ = 1, 250 do
+    api_calls:incr()
+end
+
+print("Page views:", page_views:get())   -- 1000
+print("API calls:", api_calls:get())     -- 250
+
+-- Decrement (เมื่อ user logout)
+local active_users = Counter.new("active_users")
+active_users:reset()
+for _ = 1, 50 do active_users:incr() end
+active_users:decr(5)  -- 5 users logged out
+print("Active users:", active_users:get())  -- 45
+
+-- Time-window counter
+local req_counter = Counter.new("requests")
+for _ = 1, 100 do
+    req_counter:incr_window(60)  -- นับใน 60-second window
+end
+print("Requests this minute:", req_counter:get_window(60))
+
+-- Cleanup
+client:del("counter:page_views", "counter:api_calls",
+           "counter:active_users")
+client:quit()
 ```
 
 ---
 
 ## แบบฝึกหัด
 
-**ข้อที่ 1:** สร้าง Todo application โดยใช้ SQLite ที่มีความสามารถ:
-- เพิ่ม/ลบ/แก้ไข task
-- จัดกลุ่ม task ด้วย tags
-- ค้นหา task ด้วย keyword
-- Export ข้อมูลเป็น JSON
+**ข้อ 1**: สร้าง distributed task scheduler ที่รองรับ:
+- One-time tasks (run once at specific time)
+- Recurring tasks (cron-like syntax)
+- Task cancellation
+ใช้ Redis Sorted Sets สำหรับ scheduling และ Streams สำหรับ execution log
 
-**ข้อที่ 2:** สร้าง Simple Event Sourcing system ที่:
-- บันทึก events ทุกอย่างลง SQLite
-- Rebuild state จาก events
-- Query events ตามช่วงเวลา
-- Snapshot state เป็น optimization
+**ข้อ 2**: Implement circuit breaker pattern บน Redis queue ที่จะ open circuit เมื่อ error rate สูงเกิน threshold (เช่น 50% ใน 1 นาที) และ half-open หลังจาก cooldown period
 
-**ข้อที่ 3:** พัฒนา Cache system ที่:
-- รองรับ TTL ต่างกันต่อ key
-- Implement LRU eviction
-- มี statistics (hit rate, miss rate)
-- รองรับ namespace (user:*, session:*, etc.)
+**ข้อ 3**: สร้าง message deduplication layer ที่ป้องกันการ process message ซ้ำ โดยใช้ Redis SET เพื่อ track message IDs ที่เคย process แล้ว พร้อม TTL สำหรับ cleanup อัตโนมัติ
 
-**ข้อที่ 4:** สร้าง Database Migration tool ที่:
-- อ่าน migration files จาก directory
-- Apply migrations ตาม version order
-- รองรับ rollback
-- แสดง migration status
+**ข้อ 4**: เขียน fan-out system ที่เมื่อมี event "post.published" จะ deliver ไปยัง followers ทุกคนอย่าง efficient (hint: ใช้ Redis pipeline และ consumer groups)
+
+**ข้อ 5**: สร้าง real-time dashboard ที่แสดง queue metrics ทุก 1 วินาที: จำนวน jobs pending, inflight, completed, failed และ throughput (jobs/second) โดยใช้ Redis Streams สำหรับ time-series data
 
 ---
 
-## สรุป
-
-ในบทนี้เราได้เรียนรู้:
-- **SQLite พื้นฐาน**: การเปิด/ปิด database, CRUD operations
-- **Prepared Statements**: ป้องกัน SQL injection, เพิ่มประสิทธิภาพ
-- **Transactions**: ACID properties, batch operations
-- **Indexes**: Query optimization
-- **ORM Pattern**: Abstract database operations
-- **Document Store**: NoSQL pattern ด้วย SQLite JSON
-- **Key-Value Store**: Simple persistent KV storage
-- **Connection Pool**: Manage multiple connections
-- **Caching**: SQLite-backed cache ด้วย TTL
-- **Repository Pattern**: Clean code architecture
-- **Migration System**: Schema version management
-
-**ถัดไป**: บทที่ 61 จะเรียนรู้เกี่ยวกับ LÖVE2D สำหรับพัฒนาเกม 2D ด้วย Lua
+> **บทถัดไป**: [บทที่ 61: LÖVE2D - 2D Game Development](part-61.md)
