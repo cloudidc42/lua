@@ -1,1114 +1,238 @@
-# บทที่ 45: LuaJIT - Just-In-Time Compilation
+# บทที่ 45: LuaJIT - Just-In-Time Compiler
 
 ## บทนำ
 
-LuaJIT คือ implementation ของ Lua ที่มี Just-In-Time (JIT) compiler ทำให้โค้ด Lua ทำงานได้เร็วขึ้นอย่างมากในบางกรณี LuaJIT ถูกสร้างโดย Mike Pall และเป็นหนึ่งใน dynamic language implementations ที่เร็วที่สุดในโลก
+LuaJIT เป็น implementation ของ Lua ที่มาพร้อมกับ Just-In-Time (JIT) compiler ทำให้โค้ด Lua ทำงานได้เร็วกว่า standard Lua interpreter มาก โดยเฉพาะโค้ดที่เกี่ยวกับการคำนวณตัวเลข สามารถเร็วได้ 2-5 เท่าหรือมากกว่า บางกรณีเร็วกว่า C ที่ไม่ได้ optimize ด้วย
+
+LuaJIT พัฒนาโดย Mike Pall และ compatible กับ Lua 5.1 เป็นหลัก แต่มี extension หลายอย่างที่ทำให้ทรงพลังมากขึ้น โดยเฉพาะ **FFI library** ที่ทำให้เรียก C functions ได้โดยตรงโดยไม่ต้องเขียน C binding
+
+> **บทก่อนหน้า**: [บทที่ 44: Embedding Lua in C Applications](part-44.md)
 
 ---
 
-## 45.1 LuaJIT คืออะไร
+## 45.1 LuaJIT vs Standard Lua
 
-### ตัวอย่างที่ 1: การตรวจสอบ LuaJIT
+### ตัวอย่างที่ 1: ความแตกต่างระหว่าง LuaJIT กับ Lua 5.4
 
 ```lua
--- check_luajit.lua
+-- compare_versions.lua
+-- ตรวจสอบว่ากำลังรัน LuaJIT หรือ standard Lua
 
--- ตรวจสอบว่ากำลังใช้ LuaJIT หรือไม่
+-- ตรวจสอบ version
+print("Lua version:", _VERSION)
+
+-- ตรวจสอบว่ามี jit module หรือเปล่า (เฉพาะ LuaJIT)
 if jit then
-    print("Running on LuaJIT")
-    print("Version:", jit.version)
+    print("Running on LuaJIT:", jit.version)
+    print("JIT status:", jit.status())
     print("Architecture:", jit.arch)
     print("OS:", jit.os)
-    
-    -- ข้อมูล JIT
-    local status = jit.status()
-    print("JIT enabled:", tostring(status))
-    
-    -- ดู JIT options
-    print("\nJIT configuration:")
-    for k, v in pairs(jit.opt and {} or {}) do
-        print(string.format("  %s = %s", k, tostring(v)))
-    end
 else
-    print("Running on standard Lua:", _VERSION)
-    print("LuaJIT features not available")
+    print("Running on standard Lua")
 end
 
--- ความแตกต่างระหว่าง LuaJIT และ Lua 5.4
-print("\n=== Feature Differences ===")
-print("Lua version:", _VERSION)
-
--- goto (LuaJIT + Lua 5.2+)
-local hasGoto = pcall(load, "::label:: goto label")
-print("goto support:", hasGoto)
-
--- integer types
-print("integer type support:", math.type ~= nil)
-
--- bit32 library
-print("bit32:", bit32 ~= nil)
-
--- bit library (LuaJIT specific)
-print("bit (LuaJIT):", bit ~= nil)
-
--- ffi library (LuaJIT specific)
-print("ffi (LuaJIT):", type(package and package.preload and package.preload.ffi) ~= "nil"
-    or pcall(require, "ffi"))
+-- ตัวอย่างผลลัพธ์:
+-- Running on LuaJIT: LuaJIT 2.1.0-beta3
+-- JIT status: true  SSE2 SSE3 SSE4.1 BMI2 fold cse dce fwd dse narrow loop abc sink fuse
+-- Architecture: x64
+-- OS: Linux
 ```
 
-### ตัวอย่างที่ 2: LuaJIT vs Standard Lua Differences
+### ตัวอย่างที่ 2: Benchmark เปรียบเทียบความเร็ว
 
 ```lua
--- luajit_differences.lua
+-- benchmark.lua
+-- เปรียบเทียบความเร็วของ LuaJIT vs standard Lua
 
-print("=== LuaJIT vs Lua 5.4 Differences ===\n")
-
--- 1. goto statement (LuaJIT, Lua 5.2+)
-print("1. goto statement:")
-local i = 0
-::continue::
-i = i + 1
-if i <= 3 then
-    io.write(i .. " ")
-    goto continue
-end
-print("")
-
--- 2. Number representation
-print("\n2. Number types:")
-if jit then
-    -- LuaJIT: default float (double), integer ต้องใช้ tonumber
-    print("LuaJIT uses double as default number type")
-    print("type(1):", type(1))  -- number
-    print("1 == 1.0:", 1 == 1.0)  -- true
-else
-    -- Lua 5.3+: แยก integer และ float
-    print("Lua 5.3+ has separate integer and float")
-    print("math.type(1):", math.type(1))      -- integer
-    print("math.type(1.0):", math.type(1.0))  -- float
+local function fibonacci(n)
+    if n < 2 then return n end
+    return fibonacci(n - 1) + fibonacci(n - 2)
 end
 
--- 3. Bit operations
-print("\n3. Bit operations:")
-if bit then
-    -- LuaJIT: bit library
-    print("LuaJIT bit library:")
-    print("  bit.band(0xFF, 0x0F):", bit.band(0xFF, 0x0F))
-    print("  bit.bor(0x10, 0x01):", bit.bor(0x10, 0x01))
-    print("  bit.lshift(1, 8):", bit.lshift(1, 8))
-elseif bit32 then
-    -- Lua 5.2: bit32 library
-    print("Lua 5.2 bit32 library")
-else
-    -- Lua 5.3+: native bitwise operators
-    print("Lua 5.3+ native bitwise:")
-    print("  0xFF & 0x0F:", 0xFF & 0x0F)
-    print("  0x10 | 0x01:", 0x10 | 0x01)
-    print("  1 << 8:", 1 << 8)
-end
-
--- 4. String internalization
-print("\n4. String handling:")
-local s1 = "hello"
-local s2 = "hello"
-print("String identity (s1 == s2):", s1 == s2)  -- true in both
-print("rawequal:", rawequal(s1, s2))  -- true (same interned string)
-```
-
----
-
-## 45.2 Performance Differences
-
-### ตัวอย่างที่ 3: Benchmark - Numeric Loop
-
-```lua
--- benchmark_numeric.lua
-
-local function benchmark(name, fn, iterations)
-    iterations = iterations or 1000000
-    
-    -- Warmup
-    fn(math.min(iterations, 1000))
-    
+local function benchmark(name, func, ...)
     local start = os.clock()
-    fn(iterations)
+    local result = func(...)
     local elapsed = os.clock() - start
-    
-    local rate = iterations / math.max(elapsed, 0.0001)
-    print(string.format("%-30s: %.4fs (%s iter/s)",
-        name, elapsed, formatNum(rate)))
-end
-
-local function formatNum(n)
-    if n >= 1e9 then return string.format("%.1fG", n / 1e9)
-    elseif n >= 1e6 then return string.format("%.1fM", n / 1e6)
-    elseif n >= 1e3 then return string.format("%.1fK", n / 1e3)
-    else return string.format("%.0f", n) end
-end
-
-print("=== Benchmark Suite ===")
-print("Lua version:", _VERSION)
-if jit then print("LuaJIT:", jit.version) end
-print()
-
--- Test 1: Simple counter loop
-benchmark("Counter loop (1M iterations)", function(n)
-    local sum = 0
-    for i = 1, n do
-        sum = sum + i
-    end
-    return sum
-end)
-
--- Test 2: Math operations
-benchmark("Math operations (1M)", function(n)
-    local result = 0
-    for i = 1, n do
-        result = result + math.sqrt(i)
-    end
-    return result
-end)
-
--- Test 3: String operations
-benchmark("String concat (100K)", function(n)
-    n = math.min(n, 100000)
-    local parts = {}
-    for i = 1, n do
-        parts[i] = tostring(i)
-    end
-    return table.concat(parts)
-end, 100000)
-
--- Test 4: Table operations
-benchmark("Table insert/read (1M)", function(n)
-    local t = {}
-    for i = 1, n do
-        t[i] = i
-    end
-    local sum = 0
-    for i = 1, n do
-        sum = sum + t[i]
-    end
-    return sum
-end)
-
--- Test 5: Function calls
-benchmark("Function calls (1M)", function(n)
-    local function double(x) return x * 2 end
-    local sum = 0
-    for i = 1, n do
-        sum = sum + double(i)
-    end
-    return sum
-end)
-
-print("\nNote: LuaJIT typically runs 5-100x faster than standard Lua")
-print("depending on the operation type")
-```
-
-### ตัวอย่างที่ 4: JIT-Friendly vs JIT-Unfriendly Code
-
-```lua
--- jit_friendly.lua
-
-print("=== JIT-Friendly Code Patterns ===\n")
-
--- Pattern 1: ใช้ local variables (ดีกว่า global)
-local function jitFriendly_locals()
-    -- GOOD: local variables
-    local sum = 0
-    local math_sqrt = math.sqrt  -- cache library function
-    for i = 1, 1000000 do
-        sum = sum + math_sqrt(i)
-    end
-    return sum
-end
-
-local function jitUnfriendly_globals()
-    -- BAD: global variable access (ช้ากว่า)
-    sum = 0  -- global
-    for i = 1, 1000000 do
-        sum = sum + math.sqrt(i)  -- non-cached
-    end
-    return sum
-end
-
--- Test speed
-local start = os.clock()
-local r1 = jitFriendly_locals()
-local t1 = os.clock() - start
-
-start = os.clock()
-local r2 = jitUnfriendly_globals()
-local t2 = os.clock() - start
-
-print(string.format("Local variables:  %.4fs (result=%.2f)", t1, r1))
-print(string.format("Global variables: %.4fs (result=%.2f)", t2, r2))
-print(string.format("Speedup: %.1fx", t2 / math.max(t1, 0.0001)))
-
--- Pattern 2: ประเภทข้อมูลที่สม่ำเสมอ
-print("\n--- Type Stability ---")
-local function stableTypes()
-    local sum = 0.0  -- จะเป็น float เสมอ
-    for i = 1, 1000000 do
-        sum = sum + i * 1.0  -- consistent float
-    end
-    return sum
-end
-
-local function unstableTypes()
-    local result = 0  -- จะสลับระหว่าง int และ float
-    for i = 1, 1000000 do
-        if i % 2 == 0 then
-            result = result + i      -- int
-        else
-            result = result + i / 2  -- float
-        end
-    end
-    return result
-end
-
-start = os.clock()
-stableTypes()
-local ts = os.clock() - start
-
-start = os.clock()
-unstableTypes()
-local tu = os.clock() - start
-
-print(string.format("Stable types:   %.4fs", ts))
-print(string.format("Unstable types: %.4fs", tu))
-```
-
----
-
-## 45.3 JIT Compilation Process
-
-### ตัวอย่างที่ 5: Understanding the JIT Pipeline
-
-```lua
--- jit_pipeline.lua
-
---[[
-LuaJIT JIT Compilation Pipeline:
-1. Interpreter (cold code)
-2. Recording (hotspot detection, default: 56 iterations)
-3. Compilation (trace compilation)
-4. Native code execution (hot paths)
-
-Tracing JIT:
-- Record execution trace (linear path)
-- Compile trace to native machine code
-- Re-enter trace when same path is taken
-- "Bail out" when trace mismatch
---]]
-
-if not jit then
-    print("LuaJIT not available, showing conceptual demo")
-    
-    -- จำลอง JIT behavior concept
-    local function demonstrateTracing()
-        local THRESHOLD = 56  -- iterations before JIT kicks in
-        local traces = {}
-        
-        local function hotLoop(n)
-            local sum = 0
-            for i = 1, n do
-                -- JIT ตรวจสอบ: ถ้าเจอ path เดิมซ้ำๆ จะ compile เป็น native code
-                sum = sum + i * i
-            end
-            return sum
-        end
-        
-        -- ครั้งแรกๆ: interpreted
-        print("Phase 1: Interpreted (warm-up)")
-        for i = 1, THRESHOLD do
-            hotLoop(100)
-        end
-        
-        -- หลัง threshold: "compiled" (simulation)
-        print("Phase 2: JIT Compiled (fast)")
-        local start = os.clock()
-        for i = 1, 1000 do
-            hotLoop(1000)
-        end
-        print(string.format("Time: %.4fs", os.clock() - start))
-    end
-    
-    demonstrateTracing()
-    return
-end
-
--- ถ้ามี LuaJIT จริง
-print("LuaJIT version:", jit.version)
-print("JIT status:", jit.status())
-
--- Control JIT compilation
-print("\n--- JIT Control ---")
-
--- ปิด JIT
-jit.off()
-print("JIT disabled")
-local start = os.clock()
-local sum = 0
-for i = 1, 1000000 do sum = sum + i end
-local tInterp = os.clock() - start
-print(string.format("Interpreted: %.4fs (sum=%d)", tInterp, sum))
-
--- เปิด JIT
-jit.on()
-print("\nJIT enabled")
-start = os.clock()
-sum = 0
-for i = 1, 1000000 do sum = sum + i end
-local tJIT = os.clock() - start
-print(string.format("JIT compiled: %.4fs (sum=%d)", tJIT, sum))
-print(string.format("Speedup: %.1fx", tInterp / math.max(tJIT, 0.0001)))
-```
-
-### ตัวอย่างที่ 6: JIT Flushing and Optimization
-
-```lua
--- jit_optimization.lua
-
-if not jit then
-    print("LuaJIT required for this example")
-    print("Showing optimization concepts instead:")
-    
-    -- Optimization patterns ที่ทำงานได้ทั้ง Lua และ LuaJIT
-    
-    -- 1. ลด table lookups
-    print("\n1. Reduce table lookups:")
-    local function slow()
-        local sum = 0
-        local t = {1, 2, 3, 4, 5}
-        for i = 1, 1000000 do
-            sum = sum + t[i % 5 + 1]
-        end
-        return sum
-    end
-    
-    -- Cache table reference
-    local function fast()
-        local sum = 0
-        local t = {1, 2, 3, 4, 5}
-        local t1, t2, t3, t4, t5 = t[1], t[2], t[3], t[4], t[5]
-        local vals = {t1, t2, t3, t4, t5}
-        for i = 1, 1000000 do
-            sum = sum + vals[i % 5 + 1]
-        end
-        return sum
-    end
-    
-    local s1 = os.clock()
-    slow()
-    s1 = os.clock() - s1
-    
-    local s2 = os.clock()
-    fast()
-    s2 = os.clock() - s2
-    
-    print(string.format("  Standard: %.4fs", s1))
-    print(string.format("  Cached:   %.4fs", s2))
-    return
-end
-
--- LuaJIT specific optimizations
-print("=== LuaJIT Optimizations ===\n")
-
--- 1. JIT flush: รีเซ็ต compiled code
-print("1. JIT flush (reset compiled traces):")
-jit.flush()
-print("   All JIT traces cleared")
-
--- 2. ดู JIT statistics
-if jit.util then
-    print("\n2. JIT statistics:")
-    local stats = {}
-    jit.util.stats(function(k, v) stats[k] = v end)
-    for k, v in pairs(stats) do
-        print(string.format("   %s = %s", k, tostring(v)))
-    end
-end
-
--- 3. Optimize specific function
-print("\n3. Function-level JIT control:")
-
-local function criticalFn(n)
-    local sum = 0
-    for i = 1, n do
-        sum = sum + i * i
-    end
-    return sum
-end
-
--- Force compile critical function
-jit.compile(criticalFn)
-print("   criticalFn compiled")
-
--- 4. Optimization options
-print("\n4. JIT optimization options:")
-jit.opt.start(2)  -- optimization level 2
-print("   Optimization level 2 set")
-
--- Test
-local start = os.clock()
-for _ = 1, 1000 do
-    criticalFn(10000)
-end
-print(string.format("   Time with opt level 2: %.4fs", os.clock() - start))
-```
-
----
-
-## 45.4 NYI (Not Yet Implemented)
-
-### ตัวอย่างที่ 7: NYI Functions ที่ต้องระวัง
-
-```lua
--- nyi_list.lua
--- NYI = สิ่งที่ LuaJIT ยังไม่ compile เป็น native code
-
---[[
-NYI Functions/Operations (LuaJIT 2.1):
-1. string.format with %q, some formats
-2. pairs() (use ipairs หรือ next ด้วยตนเอง)
-3. pcall/xpcall ใน JIT traces (causes bailout)
-4. table.sort (ไม่ JIT compiled)
-5. math.random/randomseed
-6. os.time, os.clock ใน trace
-7. tostring() for numbers in some cases
-8. string.gsub ที่ซับซ้อน
-9. coroutine operations ใน traces
-10. debug library functions
---]]
-
-print("=== NYI Awareness Demo ===\n")
-
--- Detect JIT availability
-local hasJIT = jit ~= nil
-
-local function timeIt(name, fn, n)
-    n = n or 1000000
-    local start = os.clock()
-    local result = fn(n)
-    local elapsed = os.clock() - start
-    print(string.format("%-35s %.4fs", name .. ":", elapsed))
+    print(string.format("%s: %.4f seconds (result=%s)", name, elapsed, tostring(result)))
     return elapsed
 end
 
--- 1. pairs vs ipairs (ipairs is JIT-friendly)
-print("1. Iteration methods:")
-local arr = {}
-for i = 1, 10000 do arr[i] = i end
+-- Fibonacci แบบ recursive (เหมาะกับ JIT optimization)
+benchmark("fibonacci(35)", fibonacci, 35)
 
-timeIt("ipairs (JIT-friendly)", function(n)
-    local sum = 0
-    for _ = 1, n // 10000 do
-        for _, v in ipairs(arr) do sum = sum + v end
-    end
-    return sum
-end)
-
-timeIt("pairs (may not JIT)", function(n)
-    local sum = 0
-    for _ = 1, n // 10000 do
-        for _, v in pairs(arr) do sum = sum + v end
-    end
-    return sum
-end)
-
-timeIt("numeric for (best)", function(n)
-    local sum = 0
-    local len = #arr
-    for _ = 1, n // 10000 do
-        for i = 1, len do sum = sum + arr[i] end
-    end
-    return sum
-end)
-
--- 2. pcall overhead
-print("\n2. pcall vs direct call:")
-
-local function safeMath(x)
-    if x <= 0 then error("must be positive") end
-    return math.sqrt(x)
-end
-
-timeIt("direct call", function(n)
+-- Loop นับล้านครั้ง
+local function count_loop(n)
     local sum = 0
     for i = 1, n do
-        sum = sum + math.sqrt(i)
-    end
-    return sum
-end)
-
-timeIt("pcall wrapped", function(n)
-    local sum = 0
-    for i = 1, n do
-        local ok, result = pcall(safeMath, i)
-        if ok then sum = sum + result end
-    end
-    return sum
-end, 100000)
-
--- 3. String operations
-print("\n3. String operations:")
-
-timeIt("tostring(number)", function(n)
-    local result
-    for i = 1, n do
-        result = tostring(i)
-    end
-    return result
-end, 100000)
-
-timeIt("string.format(%d)", function(n)
-    local result
-    for i = 1, n do
-        result = string.format("%d", i)
-    end
-    return result
-end, 100000)
-```
-
----
-
-## 45.5 Tracing JIT
-
-### ตัวอย่างที่ 8: Understanding Traces
-
-```lua
--- understanding_traces.lua
-
---[[
-Tracing JIT คือ:
-1. Observer execution path (trace)
-2. เมื่อ path ถูกเดินซ้ำหลายครั้ง (hot)
-3. Compile path นั้นเป็น native code
-4. Side exits: ถ้า condition แตกต่าง -> bailout
-
-Linear Trace: if/else จะมีหลาย traces
-Loop Trace: inner loops ที่ tight คือ ideal target
---]]
-
-print("=== Tracing JIT Concepts ===\n")
-
--- 1. Loop trace (ideal for JIT)
-print("1. Tight numeric loop - ideal JIT target:")
-local function tightLoop()
-    local sum = 0
-    -- JIT trace จะ: 
-    --   - ตรวจ i <= 1000000
-    --   - บวก sum
-    --   - increment i
-    --   - jump back (single trace)
-    for i = 1, 1000000 do
         sum = sum + i
     end
     return sum
 end
 
-local t1 = os.clock()
-local r1 = tightLoop()
-print(string.format("  Result: %d, Time: %.4fs", r1, os.clock() - t1))
+benchmark("count_loop(10M)", count_loop, 10000000)
 
--- 2. Loop with branches (multiple traces)
-print("\n2. Loop with conditional branches:")
-local function branchedLoop()
-    local sum = 0
-    -- JIT จะสร้าง trace แยกสำหรับแต่ละ branch
-    for i = 1, 1000000 do
-        if i % 3 == 0 then
-            sum = sum + i * 3
-        elseif i % 2 == 0 then
-            sum = sum + i * 2
-        else
-            sum = sum + i
-        end
+-- Floating point operations
+local function fp_ops(n)
+    local x = 1.0
+    for i = 1, n do
+        x = x * 1.0000001 + 0.000001
     end
-    return sum
+    return x
 end
 
-local t2 = os.clock()
-local r2 = branchedLoop()
-print(string.format("  Result: %d, Time: %.4fs", r2, os.clock() - t2))
-
--- 3. Loop with function calls (inline vs non-inline)
-print("\n3. Function call optimization:")
-
-local function square(x) return x * x end  -- likely inlined
-
-local function withInlineable()
-    local sum = 0
-    for i = 1, 1000000 do
-        sum = sum + square(i)  -- JIT may inline this
-    end
-    return sum
-end
-
--- Function that prevents inlining (complex or NYI)
-local function noInline(x)
-    if x <= 0 then error("bad") end
-    return x * x
-end
-
-local function withNonInlineable()
-    local sum = 0
-    for i = 1, 1000000 do
-        local ok, v = pcall(noInline, i)  -- pcall prevents inlining
-        if ok then sum = sum + v end
-    end
-    return sum
-end
-
-t1 = os.clock()
-local ri = withInlineable()
-ti = os.clock() - t1
-
-t1 = os.clock()
-local rn = withNonInlineable()
-tn = os.clock() - t1
-
-print(string.format("  Inlineable:     %.4fs", ti))
-print(string.format("  Non-inlineable: %.4fs", tn))
-print(string.format("  Overhead: %.1fx", tn / math.max(ti, 0.0001)))
+benchmark("fp_ops(10M)", fp_ops, 10000000)
 ```
 
 ---
 
-## 45.6 Optimization Tips
+## 45.2 การติดตั้ง LuaJIT
 
-### ตัวอย่างที่ 9: Top Optimization Patterns
+### ตัวอย่างที่ 3: วิธีติดตั้ง LuaJIT บน Ubuntu/Debian
 
-```lua
--- optimization_tips.lua
+```bash
+# ติดตั้งผ่าน package manager
+sudo apt-get update
+sudo apt-get install luajit
 
-print("=== LuaJIT Optimization Tips ===\n")
+# ตรวจสอบ version
+luajit -v
+# LuaJIT 2.1.0-beta3 -- Copyright (C) 2005-2017 Mike Pall.
 
--- TIP 1: Cache frequently accessed globals
-print("TIP 1: Cache globals and module functions")
-do
-    local function bad()
-        local sum = 0
-        for i = 1, 1000000 do
-            sum = sum + math.sin(i) + math.cos(i)
-        end
-        return sum
-    end
-    
-    local function good()
-        local sin = math.sin  -- cache
-        local cos = math.cos  -- cache
-        local sum = 0
-        for i = 1, 1000000 do
-            sum = sum + sin(i) + cos(i)
-        end
-        return sum
-    end
-    
-    local t1 = os.clock(); bad(); t1 = os.clock() - t1
-    local t2 = os.clock(); good(); t2 = os.clock() - t2
-    print(string.format("  Without cache: %.4fs", t1))
-    print(string.format("  With cache:    %.4fs", t2))
-    print(string.format("  Improvement:   %.1fx", t1 / math.max(t2, 0.0001)))
-end
+# ติดตั้งจาก source (version ล่าสุด)
+git clone https://github.com/LuaJIT/LuaJIT.git
+cd LuaJIT
+make
+sudo make install
 
--- TIP 2: Avoid type coercion
-print("\nTIP 2: Maintain consistent types")
-do
-    local function typeCoercion()
-        local sum = 0  -- int
-        for i = 1, 1000000 do
-            sum = sum + i / 3  -- coerces to float each time!
-        end
-        return sum
-    end
-    
-    local function consistentFloat()
-        local sum = 0.0  -- float
-        local div = 1 / 3  -- precompute
-        for i = 1, 1000000 do
-            sum = sum + i * div  -- stays float
-        end
-        return sum
-    end
-    
-    local t1 = os.clock(); typeCoercion(); t1 = os.clock() - t1
-    local t2 = os.clock(); consistentFloat(); t2 = os.clock() - t2
-    print(string.format("  With coercion: %.4fs", t1))
-    print(string.format("  Consistent:    %.4fs", t2))
-end
+# ทดสอบ
+luajit -e "print('Hello from LuaJIT!')"
+```
 
--- TIP 3: Array access pattern
-print("\nTIP 3: Array access patterns")
-do
-    local SIZE = 1000
-    local arr = {}
-    for i = 1, SIZE do arr[i] = i end
-    
-    -- Forward sequential: cache-friendly
-    local function forwardAccess()
-        local sum = 0
-        for _ = 1, 1000 do
-            for i = 1, SIZE do
-                sum = sum + arr[i]
-            end
-        end
-        return sum
-    end
-    
-    -- Random access: cache-unfriendly
-    local indices = {}
-    math.randomseed(42)
-    for i = 1, SIZE do indices[i] = math.random(1, SIZE) end
-    
-    local function randomAccess()
-        local sum = 0
-        for _ = 1, 1000 do
-            for i = 1, SIZE do
-                sum = sum + arr[indices[i]]
-            end
-        end
-        return sum
-    end
-    
-    local t1 = os.clock(); forwardAccess(); t1 = os.clock() - t1
-    local t2 = os.clock(); randomAccess(); t2 = os.clock() - t2
-    print(string.format("  Sequential:    %.4fs", t1))
-    print(string.format("  Random:        %.4fs", t2))
-end
+### ตัวอย่างที่ 4: ติดตั้งบน macOS และ Windows
 
--- TIP 4: String building
-print("\nTIP 4: String concatenation")
-do
-    local function badConcat(n)
-        local s = ""
-        for i = 1, n do
-            s = s .. tostring(i) .. ","  -- O(n^2) !!!
-        end
-        return s
-    end
-    
-    local function goodConcat(n)
-        local parts = {}
-        for i = 1, n do
-            parts[i] = tostring(i)
-        end
-        return table.concat(parts, ",")  -- O(n)
-    end
-    
-    local N = 10000
-    local t1 = os.clock(); badConcat(N); t1 = os.clock() - t1
-    local t2 = os.clock(); goodConcat(N); t2 = os.clock() - t2
-    print(string.format("  String concat:  %.4fs", t1))
-    print(string.format("  table.concat:   %.4fs", t2))
-    print(string.format("  Improvement:    %.0fx", t1 / math.max(t2, 0.0001)))
-end
+```bash
+# macOS ด้วย Homebrew
+brew install luajit
 
--- TIP 5: Avoid creating objects in hot loops
-print("\nTIP 5: Avoid allocations in hot paths")
-do
-    local function withAllocation()
-        local sum = 0
-        for i = 1, 1000000 do
-            local point = {x = i, y = i}  -- allocation every iteration!
-            sum = sum + point.x + point.y
-        end
-        return sum
-    end
-    
-    local function withoutAllocation()
-        local sum = 0
-        local px, py = 0, 0  -- reuse variables
-        for i = 1, 1000000 do
-            px, py = i, i
-            sum = sum + px + py
-        end
-        return sum
-    end
-    
-    local t1 = os.clock(); withAllocation(); t1 = os.clock() - t1
-    local t2 = os.clock(); withoutAllocation(); t2 = os.clock() - t2
-    print(string.format("  With alloc:    %.4fs", t1))
-    print(string.format("  Without alloc: %.4fs", t2))
-end
+# Windows ด้วย Scoop
+scoop install luajit
+
+# Windows ด้วย Chocolatey
+choco install luajit
+
+# ตรวจสอบการติดตั้ง
+luajit -v
+luajit -e "print(jit.version)"
+```
+
+### ตัวอย่างที่ 5: การรัน scripts ด้วย LuaJIT
+
+```bash
+# รัน script ธรรมดา
+luajit myscript.lua
+
+# รันพร้อมเปิด JIT verbosely
+luajit -jv myscript.lua
+
+# รันพร้อม dump JIT trace
+luajit -jdump myscript.lua
+
+# รันโดยปิด JIT (เพื่อ debug)
+luajit -joff myscript.lua
+
+# Interactive mode
+luajit
 ```
 
 ---
 
-## 45.7 FFI Library
+## 45.3 FFI Library พื้นฐาน
 
-### ตัวอย่างที่ 10: FFI Basics
+FFI (Foreign Function Interface) เป็น library ที่ทรงพลังที่สุดของ LuaJIT ทำให้เรียก C functions และใช้ C data types ได้โดยตรง
+
+### ตัวอย่างที่ 6: ffi.cdef - ประกาศ C declarations
 
 ```lua
 -- ffi_basics.lua
--- LuaJIT FFI (Foreign Function Interface)
--- ช่วยให้ call C functions โดยตรงโดยไม่ต้องเขียน C extension
-
-if not jit then
-    print("LuaJIT FFI requires LuaJIT")
-    print("Showing FFI concepts:")
-    
-    --[[
-    FFI ช่วยให้:
-    1. เรียก C library functions โดยตรง
-    2. ใช้ C structs
-    3. ไม่ต้องผ่าน C extension boilerplate
-    4. เร็วมาก (JIT compiles FFI calls)
-    
-    ตัวอย่าง FFI code (ต้องการ LuaJIT):
-    
-    local ffi = require("ffi")
-    
-    -- Declare C functions
-    ffi.cdef[[
-      double sqrt(double x);
-      int printf(const char *fmt, ...);
-      void *malloc(size_t size);
-      void free(void *ptr);
-    ]]
-    
-    -- Call C math
-    print(ffi.C.sqrt(2.0))  -- 1.4142...
-    ffi.C.printf("Hello from C! Pi = %.4f\n", math.pi)
-    ]]
-    
-    print("FFI concept shown above")
-    return
-end
-
--- LuaJIT FFI example
 local ffi = require("ffi")
 
--- Declare C standard library functions
+-- ประกาศ C functions และ types ที่จะใช้
 ffi.cdef[[
-    double sqrt(double x);
-    double pow(double base, double exp);
-    double fabs(double x);
-    
-    typedef struct {
-        double x;
-        double y;
-    } Point2D;
-    
-    typedef struct {
-        int width;
-        int height;
-        unsigned char *data;
-    } Image;
-    
+    /* Standard C library functions */
+    int printf(const char *fmt, ...);
     void *malloc(size_t size);
     void free(void *ptr);
-    void *memset(void *s, int c, size_t n);
+    size_t strlen(const char *s);
+    char *strcpy(char *dest, const char *src);
+    
+    /* Math functions */
+    double sin(double x);
+    double cos(double x);
+    double sqrt(double x);
+    double pow(double x, double y);
+    
+    /* Time functions */
+    typedef long time_t;
+    time_t time(time_t *t);
+    
+    /* Custom struct */
+    typedef struct {
+        int x;
+        int y;
+        int width;
+        int height;
+    } Rect;
 ]]
 
-print("=== FFI Basics ===\n")
+-- เรียกใช้ printf ผ่าน FFI
+ffi.C.printf("Hello from FFI! Pi = %.6f\n", math.pi)
 
--- 1. Call C math functions
-print("1. C math functions via FFI:")
-print("sqrt(2):", ffi.C.sqrt(2.0))
-print("pow(2, 10):", ffi.C.pow(2.0, 10.0))
-print("fabs(-3.14):", ffi.C.fabs(-3.14))
-
--- 2. FFI struct
-print("\n2. FFI struct:")
-local p = ffi.new("Point2D", {x = 3.0, y = 4.0})
-print(string.format("Point: x=%.1f, y=%.1f", p.x, p.y))
-
--- Calculate distance using FFI sqrt
-local dist = ffi.C.sqrt(p.x * p.x + p.y * p.y)
-print(string.format("Distance from origin: %.1f", dist))
-
--- 3. FFI array
-print("\n3. FFI array:")
-local arr = ffi.new("double[10]")
-for i = 0, 9 do  -- C arrays start at 0!
-    arr[i] = (i + 1) * 1.5
-end
-print("FFI array values:")
-for i = 0, 9 do
-    io.write(string.format("%.1f ", arr[i]))
-end
-print()
-
--- 4. C memory allocation
-print("\n4. Manual C memory:")
-local buf = ffi.cast("char *", ffi.C.malloc(64))
-ffi.C.memset(buf, 0, 64)
--- เขียนข้อมูล
-local msg = "Hello FFI!"
-for i = 0, #msg - 1 do
-    buf[i] = string.byte(msg, i + 1)
-end
-print("C buffer:", ffi.string(buf, #msg))
-ffi.C.free(buf)
+-- เรียก math functions
+local angle = math.pi / 4
+print(string.format("sin(45°) = %.6f", ffi.C.sin(angle)))
+print(string.format("cos(45°) = %.6f", ffi.C.cos(angle)))
+print(string.format("sqrt(2) = %.6f", ffi.C.sqrt(2.0)))
 ```
 
-### ตัวอย่างที่ 11: FFI with C Libraries
+### ตัวอย่างที่ 7: ffi.load - โหลด shared library
 
 ```lua
--- ffi_c_libraries.lua
-
-if not jit then
-    print("LuaJIT FFI required")
-    print([[
-    FFI Example (LuaJIT only):
-    
-    local ffi = require("ffi")
-    
-    -- ใช้ libc string functions
-    ffi.cdef[[
-        size_t strlen(const char *s);
-        int strcmp(const char *s1, const char *s2);
-        char *strstr(const char *haystack, const char *needle);
-        char *strcpy(char *dest, const char *src);
-    ]]
-    
-    print(ffi.C.strlen("Hello"))  -- 5
-    print(ffi.C.strcmp("abc", "abd"))  -- negative number
-    
-    -- ใช้ libc math
-    ffi.cdef[[
-        double sin(double x);
-        double cos(double x);
-        double log(double x);
-    ]]
-    
-    print(ffi.C.sin(math.pi / 2))  -- 1.0
-    print(ffi.C.cos(0))  -- 1.0
-    print(ffi.C.log(math.exp(1)))  -- 1.0
-    ]])
-    return
-end
-
+-- ffi_load.lua
 local ffi = require("ffi")
 
--- String functions
-ffi.cdef[[
-    size_t strlen(const char *s);
-    int strcmp(const char *s1, const char *s2);
-    int strncmp(const char *s1, const char *s2, size_t n);
-    char *strstr(const char *haystack, const char *needle);
-    char *strchr(const char *s, int c);
-    int toupper(int c);
-    int tolower(int c);
-    int isdigit(int c);
-    int isalpha(int c);
-]]
+-- โหลด math library
+local m = ffi.load("m")  -- libm.so บน Linux
 
--- Math functions (different from Lua's math)
 ffi.cdef[[
     double sin(double x);
     double cos(double x);
+    double tan(double x);
+    double atan2(double y, double x);
     double exp(double x);
     double log(double x);
-    double log2(double x);
-    double log10(double x);
-    double ceil(double x);
-    double floor(double x);
-    double round(double x);
 ]]
 
-print("=== FFI C Library Access ===\n")
+-- ใช้งาน math functions
+print("sin(PI/2) =", m.sin(math.pi / 2))    -- 1.0
+print("cos(0) =", m.cos(0))                  -- 1.0
+print("atan2(1,1) =", m.atan2(1, 1))         -- 0.785... (pi/4)
 
--- String operations via FFI
-print("1. String functions:")
-local s = "Hello, LuaJIT World!"
-print("strlen:", ffi.C.strlen(s))
-print("strcmp('abc','abd'):", ffi.C.strcmp("abc", "abd"))
-
--- ค้นหา substring
-local found = ffi.C.strstr(s, "LuaJIT")
-if found ~= nil then
-    print("strstr found: offset", ffi.cast("intptr_t", found) - ffi.cast("intptr_t", ffi.cast("char*", s)))
+-- โหลด zlib (compression library)
+local ok, zlib = pcall(ffi.load, "z")
+if ok then
+    ffi.cdef[[
+        const char *zlibVersion(void);
+    ]]
+    print("zlib version:", ffi.string(zlib.zlibVersion()))
+else
+    print("zlib not available:", zlib)
 end
-
--- Character classification
-print("\n2. Character classification:")
-for _, c in ipairs({"A", "z", "5", "!", " "}) do
-    local b = string.byte(c)
-    print(string.format("  '%s': isdigit=%d isalpha=%d",
-        c, ffi.C.isdigit(b), ffi.C.isalpha(b)))
-end
-
--- Math via FFI
-print("\n3. Math functions:")
-print("sin(pi/2):", ffi.C.sin(math.pi / 2))
-print("log2(1024):", ffi.C.log2(1024))
-print("round(3.7):", ffi.C.round(3.7))
-
--- FFI Performance comparison
-print("\n4. Performance: Lua math vs FFI math:")
-local N = 10000000
-local sum = 0
-
-local start = os.clock()
-for i = 1, N do
-    sum = sum + math.sin(i * 0.001)
-end
-local t_lua = os.clock() - start
-print(string.format("Lua math.sin: %.4fs", t_lua))
-
-sum = 0
-local ffi_sin = ffi.C.sin
-start = os.clock()
-for i = 1, N do
-    sum = sum + ffi_sin(i * 0.001)
-end
-local t_ffi = os.clock() - start
-print(string.format("FFI C sin:    %.4fs", t_ffi))
-print(string.format("Difference:   %.1fx", t_lua / math.max(t_ffi, 0.0001)))
 ```
 
-### ตัวอย่างที่ 12: FFI Structs และ Pointers
+### ตัวอย่างที่ 8: ffi.new - สร้าง C data types
 
 ```lua
--- ffi_structs.lua
-
-if not jit then
-    print([[
-    FFI Struct Example (LuaJIT only):
-    
-    local ffi = require("ffi")
-    
-    ffi.cdef[[
-        typedef struct {
-            float r, g, b, a;
-        } Color;
-        
-        typedef struct {
-            int x, y, w, h;
-        } Rect;
-        
-        // Array of structs
-        typedef struct {
-            Color pixels[256];
-            int count;
-        } Palette;
-    ]]
-    
-    local red = ffi.new("Color", {r=1.0, g=0.0, b=0.0, a=1.0})
-    print(red.r, red.g, red.b)  -- 1.0  0.0  0.0
-    
-    -- Modify fields
-    red.b = 0.5
-    print("Modified:", red.r, red.g, red.b)  -- 1.0  0.0  0.5
-    
-    -- Create array of structs
-    local palette = ffi.new("Color[256]")
-    for i = 0, 255 do
-        palette[i].r = i / 255.0
-        palette[i].g = (255 - i) / 255.0
-        palette[i].b = 0.5
-        palette[i].a = 1.0
-    end
-    print("Palette[0]:", palette[0].r, palette[0].g)
-    print("Palette[128]:", palette[128].r, palette[128].g)
-    ]])
-    return
-end
-
+-- ffi_new.lua
 local ffi = require("ffi")
 
 ffi.cdef[[
@@ -1117,1218 +241,1502 @@ ffi.cdef[[
     } Vec3;
     
     typedef struct {
-        float m[16];  // 4x4 matrix
-    } Mat4;
+        uint8_t r, g, b, a;
+    } Color;
     
-    typedef struct {
-        Vec3 position;
-        Vec3 normal;
-        float u, v;
-    } Vertex;
+    typedef struct Node {
+        int value;
+        struct Node *next;
+    } Node;
 ]]
 
-print("=== FFI Structs ===\n")
+-- สร้าง struct
+local v = ffi.new("Vec3", {x = 1.0, y = 2.0, z = 3.0})
+print(string.format("Vector: (%.1f, %.1f, %.1f)", v.x, v.y, v.z))
 
--- สร้าง Vec3
-local v1 = ffi.new("Vec3", {x=1.0, y=2.0, z=3.0})
-local v2 = ffi.new("Vec3", {x=4.0, y=5.0, z=6.0})
+-- แก้ไขค่า
+v.x = v.x + 1
+v.y = v.y * 2
+print(string.format("Modified: (%.1f, %.1f, %.1f)", v.x, v.y, v.z))
 
-print("v1:", v1.x, v1.y, v1.z)
-print("v2:", v2.x, v2.y, v2.z)
+-- สร้าง Color
+local red = ffi.new("Color", {r = 255, g = 0, b = 0, a = 255})
+print(string.format("Color: RGB(%d, %d, %d)", red.r, red.g, red.b))
 
--- Vector operations
-local function vec3_add(a, b)
-    return ffi.new("Vec3", {x=a.x+b.x, y=a.y+b.y, z=a.z+b.z})
+-- สร้าง array
+local arr = ffi.new("int[10]")
+for i = 0, 9 do  -- C arrays เริ่มที่ index 0
+    arr[i] = i * i
 end
 
-local function vec3_dot(a, b)
-    return a.x*b.x + a.y*b.y + a.z*b.z
+io.write("Squares: ")
+for i = 0, 9 do
+    io.write(arr[i] .. " ")
 end
-
-local function vec3_length(v)
-    return math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
-end
-
-local v3 = vec3_add(v1, v2)
-print("\nv1 + v2:", v3.x, v3.y, v3.z)
-print("dot product:", vec3_dot(v1, v2))
-print("|v1|:", vec3_length(v1))
-
--- Array of structs: Vertex buffer
-print("\n--- Vertex Buffer ---")
-local N = 1000000
-local vertices = ffi.new("Vertex[?]", N)  -- array of N vertices
-
--- Initialize
-local start = os.clock()
-for i = 0, N - 1 do
-    vertices[i].position.x = i * 0.001
-    vertices[i].position.y = i * 0.002
-    vertices[i].position.z = 0
-    vertices[i].normal.x = 0
-    vertices[i].normal.y = 0
-    vertices[i].normal.z = 1
-    vertices[i].u = (i % 1000) / 1000.0
-    vertices[i].v = (i // 1000) / 1000.0
-end
-local t = os.clock() - start
-
-print(string.format("Initialized %d vertices in %.4fs", N, t))
-print(string.format("Memory: %.1f MB", ffi.sizeof("Vertex") * N / 1024 / 1024))
-print("First vertex:", vertices[0].position.x, vertices[0].position.y)
-print("Last vertex:", vertices[N-1].position.x, vertices[N-1].position.y)
-```
-
----
-
-## 45.8 When to Use LuaJIT vs Lua 5.4
-
-### ตัวอย่างที่ 13: Decision Guide
-
-```lua
--- decision_guide.lua
-
-print("=== LuaJIT vs Lua 5.4 Decision Guide ===\n")
-
-local function showDecision(scenario, luajitPros, lua54Pros, recommendation)
-    print("Scenario: " .. scenario)
-    print("  LuaJIT pros: " .. luajitPros)
-    print("  Lua 5.4 pros: " .. lua54Pros)
-    print("  Recommendation: " .. recommendation)
-    print()
-end
-
-showDecision(
-    "High-performance numerical computation",
-    "JIT compilation, 5-50x faster for numeric loops",
-    "Integers are native (no float overhead), Lua 5.3+",
-    "USE LuaJIT if maximum speed needed"
-)
-
-showDecision(
-    "Systems that need C interop (FFI)",
-    "FFI: call C without writing wrappers, very fast",
-    "Standard C extension API, more portable",
-    "USE LuaJIT for rapid C integration"
-)
-
-showDecision(
-    "Long-running server/daemon",
-    "JIT warm-up, memory usage similar",
-    "More predictable GC, stable long-term",
-    "Either works; LuaJIT for CPU-bound, Lua 5.4 for I/O-bound"
-)
-
-showDecision(
-    "Embedded in C application",
-    "Faster execution, but more complex build",
-    "Simpler embedding, standard API, Lua 5.4 features",
-    "Lua 5.4 for simplicity, LuaJIT for performance"
-)
-
-showDecision(
-    "Maximum compatibility",
-    "Based on Lua 5.1 (some 5.2 features)",
-    "Latest features: integers, bitwise, utf8, etc.",
-    "USE Lua 5.4 for latest language features"
-)
-
-showDecision(
-    "Game development",
-    "Excellent - widely used in games (Roblox etc.)",
-    "Growing support, better integer math",
-    "LuaJIT for established game engines"
-)
-
--- Feature comparison table
-print("=== Feature Comparison ===")
-print(string.format("%-30s %-12s %-12s", "Feature", "LuaJIT 2.1", "Lua 5.4"))
-print(string.rep("-", 56))
-
-local features = {
-    {"JIT compilation",         "YES",    "NO"},
-    {"FFI library",             "YES",    "NO (C ext)"},
-    {"Integers (math.type)",    "NO*",    "YES"},
-    {"Bitwise ops (<<, &)",     "NO*",    "YES"},
-    {"Integer size",            "32/64b", "64-bit"},
-    {"goto statement",          "YES",    "YES"},
-    {"Generalized for",         "NO",     "YES"},
-    {"to-be-closed vars",       "NO",     "YES"},
-    {"UTF-8 library",           "Limited","YES"},
-    {"debug.getuservalue",      "YES*",   "YES (v2)"},
-    {"string.pack/unpack",      "YES*",   "YES"},
-    {"Coroutine C-API",         "YES",    "YES"},
-    {"ARM64 support",           "YES",    "YES"},
-    {"RISC-V support",          "Limited","YES"},
-}
-
-for _, f in ipairs(features) do
-    print(string.format("%-30s %-12s %-12s", f[1], f[2], f[3]))
-end
-
-print("\n* = partially supported or requires workaround")
-```
-
----
-
-## 45.9 Benchmarks
-
-### ตัวอย่างที่ 14: Comprehensive Benchmark Suite
-
-```lua
--- benchmark_suite.lua
-
-local ITERATIONS = 1000000
-
-local function run(name, fn)
-    -- warmup
-    for _ = 1, 100 do fn() end
-    
-    local start = os.clock()
-    for _ = 1, ITERATIONS do
-        fn()
-    end
-    local elapsed = os.clock() - start
-    local mops = ITERATIONS / elapsed / 1e6  -- million ops per second
-    
-    print(string.format("  %-30s %8.2f Mops/s  (%6.4fs)", name, mops, elapsed))
-end
-
-print("=== Comprehensive Benchmark ===")
-print(string.format("Iterations: %d\n", ITERATIONS))
-print("Platform: " .. _VERSION .. (jit and (" / " .. jit.version) or ""))
 print()
 
--- Arithmetic
-print("ARITHMETIC:")
-run("integer add", function() return 1 + 2 end)
-run("float add", function() return 1.5 + 2.5 end)
-run("integer mul", function() return 7 * 13 end)
-run("float mul", function() return 1.5 * 2.5 end)
-run("float div", function() return 7.0 / 3.0 end)
-run("math.sqrt", function() return math.sqrt(2.0) end)
-run("math.sin", function() return math.sin(0.5) end)
-run("math.floor", function() return math.floor(3.7) end)
+-- sizeof
+print("sizeof Vec3:", ffi.sizeof("Vec3"))
+print("sizeof Color:", ffi.sizeof("Color"))
+print("sizeof int[10]:", ffi.sizeof("int[10]"))
+```
 
--- String
-print("\nSTRING:")
-local s = "Hello, World! This is a test string."
-run("string.len", function() return #s end)
-run("string.sub", function() return s:sub(1, 5) end)
-run("string.upper", function() return s:upper() end)
-run("string.byte", function() return s:byte(1) end)
-run("string.find", function() return s:find("World") end)
-run("string.format %d", function() return string.format("%d", 42) end)
-run("string.format %s", function() return string.format("%s", "test") end)
+### ตัวอย่างที่ 9: ffi.string - แปลง C strings
 
--- Table
-print("\nTABLE:")
-local arr = {}
-for i = 1, 100 do arr[i] = i end
+```lua
+-- ffi_string.lua
+local ffi = require("ffi")
 
-run("table read [i]", function()
-    local sum = 0
-    for i = 1, 100 do sum = sum + arr[i] end
-    return sum
-end)
-run("table write [i]", function()
-    for i = 1, 100 do arr[i] = i * 2 end
-end)
-run("table.insert + remove", function()
-    local t = {}
-    table.insert(t, 1)
-    table.remove(t, 1)
-end)
+ffi.cdef[[
+    size_t strlen(const char *s);
+    char *strcat(char *dest, const char *src);
+    int sprintf(char *str, const char *format, ...);
+]]
 
--- Function calls
-print("\nFUNCTION CALLS:")
-local function id(x) return x end
-local function add(a, b) return a + b end
-local function fib(n) return n <= 1 and n or fib(n-1) + fib(n-2) end
+-- แปลง Lua string เป็น C string และกลับ
+local lua_str = "Hello, World!"
 
-run("identity call", function() return id(42) end)
-run("two args", function() return add(1, 2) end)
-run("fib(10)", function() return fib(10) end)
+-- strlen
+local len = ffi.C.strlen(lua_str)
+print("Length:", len)  -- 13
 
--- Object-oriented
-print("\nOOP:")
-local Counter = {}
-Counter.__index = Counter
-function Counter.new(n) return setmetatable({n=n}, Counter) end
-function Counter:increment() self.n = self.n + 1 end
-function Counter:get() return self.n end
+-- สร้าง C char array
+local buf = ffi.new("char[100]")
+ffi.copy(buf, lua_str)
+print("From C buffer:", ffi.string(buf))
 
-run("method call", function()
-    local c = Counter.new(0)
-    c:increment()
-    return c:get()
-end)
+-- ffi.string กับ length
+local data = ffi.new("uint8_t[5]", {72, 101, 108, 108, 111})  -- "Hello"
+local s = ffi.string(data, 5)
+print("From bytes:", s)  -- Hello
 
--- Closure
-print("\nCLOSURES:")
-local function makeAdder(x)
-    return function(y) return x + y end
+-- sprintf ผ่าน FFI
+local result_buf = ffi.new("char[256]")
+ffi.C.sprintf(result_buf, "Pi = %.4f, e = %.4f", math.pi, math.exp(1))
+print(ffi.string(result_buf))
+```
+
+---
+
+## 45.4 การเรียก C Functions ผ่าน FFI
+
+### ตัวอย่างที่ 10: เรียก Standard Library functions
+
+```lua
+-- call_c_functions.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    /* String functions */
+    int strcmp(const char *s1, const char *s2);
+    int strncmp(const char *s1, const char *s2, size_t n);
+    char *strstr(const char *haystack, const char *needle);
+    char *strtok(char *str, const char *delim);
+    
+    /* Memory functions */
+    void *memcpy(void *dest, const void *src, size_t n);
+    void *memset(void *s, int c, size_t n);
+    int memcmp(const void *s1, const void *s2, size_t n);
+    
+    /* Stdlib */
+    int atoi(const char *nptr);
+    double atof(const char *nptr);
+    void qsort(void *base, size_t nmemb, size_t size,
+               int (*compar)(const void *, const void *));
+]]
+
+-- strcmp
+local r1 = ffi.C.strcmp("apple", "banana")
+local r2 = ffi.C.strcmp("apple", "apple")
+local r3 = ffi.C.strcmp("banana", "apple")
+print("apple vs banana:", r1 < 0 and "less" or r1 == 0 and "equal" or "greater")
+print("apple vs apple:", r2 == 0 and "equal" or "not equal")
+print("banana vs apple:", r3 > 0 and "greater" or "less")
+
+-- memset
+local buf = ffi.new("char[10]")
+ffi.C.memset(buf, string.byte('A'), 10)
+print("After memset:", ffi.string(buf, 10))  -- AAAAAAAAAA
+
+-- atoi, atof
+print("atoi('42'):", ffi.C.atoi("42"))        -- 42
+print("atof('3.14'):", ffi.C.atof("3.14"))    -- 3.14
+```
+
+### ตัวอย่างที่ 11: เรียก POSIX functions
+
+```lua
+-- posix_functions.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    /* File operations */
+    typedef struct FILE FILE;
+    FILE *fopen(const char *path, const char *mode);
+    int fclose(FILE *stream);
+    size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
+    size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
+    int feof(FILE *stream);
+    
+    /* Process */
+    int getpid(void);
+    int getppid(void);
+    
+    /* Environment */
+    char *getenv(const char *name);
+    
+    /* System info */
+    typedef struct {
+        long uptime;
+        unsigned long loads[3];
+        unsigned long totalram;
+        unsigned long freeram;
+        unsigned long sharedram;
+        unsigned long bufferram;
+        unsigned long totalswap;
+        unsigned long freeswap;
+        unsigned short procs;
+        unsigned long totalhigh;
+        unsigned long freehigh;
+        unsigned int mem_unit;
+    } sysinfo_t;
+    
+    int sysinfo(sysinfo_t *info);
+]]
+
+-- getpid
+print("Current PID:", ffi.C.getpid())
+print("Parent PID:", ffi.C.getppid())
+
+-- getenv
+local path = ffi.C.getenv("PATH")
+if path ~= nil then
+    print("PATH:", ffi.string(path):sub(1, 50) .. "...")
 end
-local add5 = makeAdder(5)
 
-run("closure call", function() return add5(3) end)
-run("create closure", function() return makeAdder(42) end)
-
-print("\nNote: Results vary by CPU, OS, and Lua version")
-if jit then
-    print("JIT acceleration active")
-else
-    print("Standard interpreter (no JIT)")
+-- sysinfo (Linux only)
+if ffi.os == "Linux" then
+    local info = ffi.new("sysinfo_t")
+    if ffi.C.sysinfo(info) == 0 then
+        print(string.format("Total RAM: %.1f MB", 
+            tonumber(info.totalram) * tonumber(info.mem_unit) / 1024 / 1024))
+        print(string.format("Free RAM: %.1f MB",
+            tonumber(info.freeram) * tonumber(info.mem_unit) / 1024 / 1024))
+        print("Running processes:", info.procs)
+    end
 end
 ```
 
 ---
 
-## 45.10 ตัวอย่างเพิ่มเติม
+## 45.5 JIT Optimization Hints
 
-### ตัวอย่างที่ 15: LuaJIT FFI Performance
+### ตัวอย่างที่ 12: jit.on และ jit.off
 
 ```lua
--- ffi_performance.lua
+-- jit_control.lua
 
+-- ตรวจสอบว่ามี jit module
 if not jit then
-    print("FFI performance demo (LuaJIT required)")
-    
-    -- แสดง equivalent operations ใน pure Lua
-    print("\nEquivalent pure Lua implementations:")
-    
-    -- Image processing simulation
-    local function luaBlur(pixels, width, height)
-        local result = {}
-        for y = 1, height do
-            result[y] = {}
-            for x = 1, width do
-                local sum = 0
-                local count = 0
-                for dy = -1, 1 do
-                    for dx = -1, 1 do
-                        local nx = x + dx
-                        local ny = y + dy
-                        if nx >= 1 and nx <= width and ny >= 1 and ny <= height then
-                            sum = sum + pixels[ny][nx]
-                            count = count + 1
-                        end
-                    end
-                end
-                result[y][x] = sum / count
-            end
-        end
-        return result
+    print("Not running on LuaJIT")
+    os.exit(1)
+end
+
+print("JIT enabled:", jit.status())
+
+-- ปิด JIT สำหรับ function ที่ไม่ได้รับประโยชน์จาก JIT
+local function debug_heavy_function()
+    -- ฟังก์ชันที่ใช้ debug หรือ coroutines มาก
+    local t = {}
+    for i = 1, 100 do
+        t[i] = {x = i, y = i * 2}
     end
-    
-    -- Create test image
-    local W, H = 100, 100
-    local img = {}
-    for y = 1, H do
-        img[y] = {}
-        for x = 1, W do
-            img[y][x] = math.random(0, 255)
-        end
-    end
-    
-    local start = os.clock()
-    luaBlur(img, W, H)
-    local t = os.clock() - start
-    print(string.format("Lua image blur %dx%d: %.4fs", W, H, t))
-    print("FFI equivalent would be ~10-50x faster")
-    return
+    return t
 end
 
-local ffi = require("ffi")
+-- ปิด JIT เฉพาะ function นี้
+jit.off(debug_heavy_function)
 
--- FFI image processing
-ffi.cdef[[
-    typedef unsigned char uint8_t;
-    typedef unsigned int uint32_t;
-    
-    void *malloc(size_t size);
-    void free(void *ptr);
-    void *memcpy(void *dest, const void *src, size_t n);
-    void *memset(void *s, int c, size_t n);
-]]
+-- เปิด JIT กลับ (default)
+jit.on()
 
-print("=== FFI Performance Demo ===\n")
+-- ปิด JIT ทั้งหมด
+-- jit.off()
 
-local W, H = 200, 200
-local SIZE = W * H
+-- เปิดอีกครั้ง
+-- jit.on()
 
--- Allocate image buffers using FFI
-local imgBuf    = ffi.cast("uint8_t *", ffi.C.malloc(SIZE))
-local resultBuf = ffi.cast("uint8_t *", ffi.C.malloc(SIZE))
-
--- Initialize with random data
-math.randomseed(42)
-for i = 0, SIZE - 1 do
-    imgBuf[i] = math.random(0, 255)
-end
-
--- FFI blur implementation
-local function ffiBlur(src, dst, w, h)
-    for y = 0, h - 1 do
-        for x = 0, w - 1 do
-            local sum = 0
-            local count = 0
-            for dy = -1, 1 do
-                for dx = -1, 1 do
-                    local nx = x + dx
-                    local ny = y + dy
-                    if nx >= 0 and nx < w and ny >= 0 and ny < h then
-                        sum = sum + src[ny * w + nx]
-                        count = count + 1
-                    end
-                end
-            end
-            dst[y * w + x] = sum / count
-        end
-    end
-end
-
--- Benchmark
-local RUNS = 10
-local start = os.clock()
-for _ = 1, RUNS do
-    ffiBlur(imgBuf, resultBuf, W, H)
-end
-local t_ffi = (os.clock() - start) / RUNS
-
--- Pure Lua comparison
-local luaImg = {}
-for i = 0, SIZE - 1 do
-    luaImg[i] = imgBuf[i]
-end
-
-local function luaBlur(src, dst, w, h)
-    for y = 0, h - 1 do
-        for x = 0, w - 1 do
-            local sum = 0
-            local count = 0
-            for dy = -1, 1 do
-                for dx = -1, 1 do
-                    local nx = x + dx
-                    local ny = y + dy
-                    if nx >= 0 and nx < w and ny >= 0 and ny < h then
-                        sum = sum + src[ny * w + nx]
-                        count = count + 1
-                    end
-                end
-            end
-            dst[y * w + x] = sum / count
-        end
-    end
-end
-
-local luaDst = {}
-start = os.clock()
-for _ = 1, RUNS do
-    luaBlur(luaImg, luaDst, W, H)
-end
-local t_lua = (os.clock() - start) / RUNS
-
-print(string.format("Image size: %dx%d = %d pixels", W, H, SIZE))
-print(string.format("FFI blur:      %.4fs per run", t_ffi))
-print(string.format("Lua table:     %.4fs per run", t_lua))
-print(string.format("FFI speedup:   %.1fx", t_lua / math.max(t_ffi, 0.0001)))
-
--- Cleanup
-ffi.C.free(imgBuf)
-ffi.C.free(resultBuf)
+-- ตรวจสอบ status
+local status, flags = jit.status()
+print("JIT active:", status)
+print("JIT flags:", flags)
 ```
 
-### ตัวอย่างที่ 16: LuaJIT Bit Operations
+### ตัวอย่างที่ 13: jit.flush - ล้าง JIT cache
 
 ```lua
--- luajit_bit.lua
+-- jit_flush.lua
 
-print("=== Bit Operations ===\n")
+if not jit then error("Requires LuaJIT") end
 
--- LuaJIT มี bit library
--- Lua 5.3+ มี native bitwise operators
+-- jit.flush() ล้าง compiled traces ทั้งหมด
+-- ใช้เมื่อ:
+-- 1. เปลี่ยน code hotly (hot reload)
+-- 2. Debug JIT compilation
+-- 3. ลด memory footprint
 
-if bit then
-    print("Using LuaJIT bit library:")
-    local bit = bit  -- require('bit') ใน LuaJIT
-    
-    print(string.format("band(0xFF, 0x0F)   = 0x%02X", bit.band(0xFF, 0x0F)))
-    print(string.format("bor(0x10, 0x01)    = 0x%02X", bit.bor(0x10, 0x01)))
-    print(string.format("bxor(0xFF, 0x0F)   = 0x%02X", bit.bxor(0xFF, 0x0F)))
-    print(string.format("bnot(0xFF)         = 0x%08X", bit.bnot(0xFF)))
-    print(string.format("lshift(1, 8)       = %d", bit.lshift(1, 8)))
-    print(string.format("rshift(256, 4)     = %d", bit.rshift(256, 4)))
-    print(string.format("arshift(-1, 8)     = %d", bit.arshift(-1, 8)))
-    print(string.format("rol(0x12345678, 4) = 0x%08X", bit.rol(0x12345678, 4)))
-    print(string.format("ror(0x12345678, 4) = 0x%08X", bit.ror(0x12345678, 4)))
-    print(string.format("bswap(0x12345678)  = 0x%08X", bit.bswap(0x12345678)))
-    print(string.format("tobit(2^33)        = %d", bit.tobit(2^33)))
-    print(string.format("tohex(0xDEADBEEF)  = %s", bit.tohex(0xDEADBEEF)))
-else
-    -- Lua 5.3+ native operators
-    print("Using Lua 5.3+ native bitwise operators:")
-    print(string.format("0xFF & 0x0F   = 0x%02X", 0xFF & 0x0F))
-    print(string.format("0x10 | 0x01   = 0x%02X", 0x10 | 0x01))
-    print(string.format("0xFF ~ 0x0F   = 0x%02X", 0xFF ~ 0x0F))  -- xor
-    print(string.format("~0xFF         = %d", ~0xFF))
-    print(string.format("1 << 8        = %d", 1 << 8))
-    print(string.format("256 >> 4      = %d", 256 >> 4))
-end
-
--- Practical bit operations
-print("\n--- Practical Examples ---")
-
--- Pack/unpack RGB color
-local function packRGB(r, g, b)
-    if bit then
-        return bit.bor(bit.lshift(r, 16), bit.lshift(g, 8), b)
-    else
-        return (r << 16) | (g << 8) | b
-    end
-end
-
-local function unpackRGB(color)
-    if bit then
-        return bit.rshift(bit.band(color, 0xFF0000), 16),
-               bit.rshift(bit.band(color, 0x00FF00), 8),
-               bit.band(color, 0x0000FF)
-    else
-        return (color >> 16) & 0xFF,
-               (color >> 8) & 0xFF,
-               color & 0xFF
-    end
-end
-
-local red   = packRGB(255, 0, 0)
-local green = packRGB(0, 255, 0)
-local blue  = packRGB(0, 0, 255)
-local white = packRGB(255, 255, 255)
-
-print(string.format("Red:   #%06X", red))
-print(string.format("Green: #%06X", green))
-print(string.format("Blue:  #%06X", blue))
-print(string.format("White: #%06X", white))
-
-local r, g, b = unpackRGB(0xAB3F7C)
-print(string.format("Unpack #AB3F7C: r=%d g=%d b=%d", r, g, b))
-
--- Flags/bitmask
-print("\n--- Bitmask Flags ---")
-local FLAGS = {
-    VISIBLE  = 1,    -- bit 0
-    COLLIDABLE = 2,  -- bit 1
-    ACTIVE   = 4,    -- bit 2
-    ENEMY    = 8,    -- bit 3
-    BOSS     = 16,   -- bit 4
-}
-
-local function hasFlag(flags, flag)
-    if bit then return bit.band(flags, flag) ~= 0
-    else return (flags & flag) ~= 0 end
-end
-
-local function setFlag(flags, flag)
-    if bit then return bit.bor(flags, flag)
-    else return flags | flag end
-end
-
-local function clearFlag(flags, flag)
-    if bit then return bit.band(flags, bit.bnot(flag))
-    else return flags & ~flag end
-end
-
--- สร้าง entity flags
-local entity = setFlag(0, FLAGS.VISIBLE)
-entity = setFlag(entity, FLAGS.ACTIVE)
-entity = setFlag(entity, FLAGS.ENEMY)
-
-print(string.format("Entity flags: 0x%02X = %d", entity, entity))
-print("Is visible:", hasFlag(entity, FLAGS.VISIBLE))
-print("Is boss:", hasFlag(entity, FLAGS.BOSS))
-print("Is enemy:", hasFlag(entity, FLAGS.ENEMY))
-
--- Remove ENEMY flag
-entity = clearFlag(entity, FLAGS.ENEMY)
-print("After removing ENEMY:", hasFlag(entity, FLAGS.ENEMY))
-```
-
-### ตัวอย่างที่ 17: LuaJIT string.buffer
-
-```lua
--- luajit_buffer.lua
-
--- LuaJIT มี string.buffer สำหรับ efficient string building
-
-if not jit then
-    print("LuaJIT string.buffer not available")
-    print("Using table.concat alternative:\n")
-    
-    -- Alternative สำหรับ standard Lua
-    local Buffer = {}
-    Buffer.__index = Buffer
-    
-    function Buffer.new()
-        return setmetatable({parts = {}, size = 0}, Buffer)
-    end
-    
-    function Buffer:put(s)
-        s = tostring(s)
-        table.insert(self.parts, s)
-        self.size = self.size + #s
-        return self
-    end
-    
-    function Buffer:putf(fmt, ...)
-        return self:put(string.format(fmt, ...))
-    end
-    
-    function Buffer:tostring()
-        return table.concat(self.parts)
-    end
-    
-    function Buffer:reset()
-        self.parts = {}
-        self.size = 0
-    end
-    
-    -- ทดสอบ
-    local buf = Buffer.new()
-    buf:put("Hello")
-    buf:put(", ")
-    buf:put("World")
-    buf:put("!")
-    print("Buffer result:", buf:tostring())
-    print("Buffer size:", buf.size)
-    
-    -- Performance test
-    local start = os.clock()
-    local b = Buffer.new()
-    for i = 1, 100000 do
-        b:putf("%d,", i)
-    end
-    local result = b:tostring()
-    print(string.format("100K format ops: %.4fs, size=%d", os.clock() - start, #result))
-    return
-end
-
--- LuaJIT string.buffer
-local buffer = require("string.buffer")
-
-print("=== LuaJIT string.buffer ===\n")
-
--- สร้าง buffer
-local buf = buffer.new()
-
--- put: append string
-buf:put("Hello")
-buf:put(", ")
-buf:put("World")
-buf:put("!")
-
--- tostring: get result
-print("Basic:", tostring(buf))
-
--- putf: formatted put
-buf:reset()
-buf:putf("Pi = %.4f\n", math.pi)
-buf:putf("E  = %.4f\n", math.exp(1))
-print("Formatted:\n" .. tostring(buf))
-
--- Performance: buffer vs concat
-local N = 100000
-
-print("--- Performance Comparison ---")
-
--- String buffer
-local start = os.clock()
-local b = buffer.new()
-for i = 1, N do
-    b:putf("%d,", i)
-end
-local result1 = tostring(b)
-local t1 = os.clock() - start
-
--- table.concat
-start = os.clock()
-local parts = {}
-for i = 1, N do
-    parts[i] = string.format("%d,", i)
-end
-local result2 = table.concat(parts)
-local t2 = os.clock() - start
-
--- string concat (slow)
-start = os.clock()
-local s = ""
-for i = 1, math.min(N, 10000) do
-    s = s .. string.format("%d,", i)
-end
-local t3 = os.clock() - start
-
-print(string.format("string.buffer: %.4fs (%d bytes)", t1, #result1))
-print(string.format("table.concat:  %.4fs (%d bytes)", t2, #result2))
-print(string.format("string concat: %.4fs (10K only)", t3))
-print(string.format("buffer vs table.concat: %.1fx", t2 / math.max(t1, 0.0001)))
-```
-
-### ตัวอย่างที่ 18: Profiling LuaJIT Code
-
-```lua
--- profiling.lua
-
--- Simple profiler สำหรับ LuaJIT และ standard Lua
-
-local Profiler = {}
-Profiler.__index = Profiler
-
-function Profiler.new()
-    local self = setmetatable({}, Profiler)
-    self.data = {}
-    self.callStack = {}
-    self.active = false
-    return self
-end
-
-function Profiler:start()
-    self.active = true
-    debug.sethook(function(event)
-        local info = debug.getinfo(2, "Sn")
-        if not info then return end
-        
-        local name = (info.name or "?") .. "@" .. 
-                     (info.short_src or "?") .. ":" ..
-                     (info.linedefined or 0)
-        
-        local t = os.clock()
-        
-        if event == "call" then
-            table.insert(self.callStack, {name = name, startTime = t})
-        elseif event == "return" then
-            if #self.callStack > 0 then
-                local frame = table.remove(self.callStack)
-                local elapsed = t - frame.startTime
-                
-                if not self.data[frame.name] then
-                    self.data[frame.name] = {calls = 0, totalTime = 0, selfTime = 0}
-                end
-                local d = self.data[frame.name]
-                d.calls = d.calls + 1
-                d.totalTime = d.totalTime + elapsed
-                d.selfTime = d.selfTime + elapsed
-                
-                -- Subtract from parent
-                if #self.callStack > 0 then
-                    local parent = self.callStack[#self.callStack]
-                    if not self.data[parent.name] then
-                        self.data[parent.name] = {calls = 0, totalTime = 0, selfTime = 0}
-                    end
-                    self.data[parent.name].selfTime = 
-                        self.data[parent.name].selfTime - elapsed
-                end
-            end
-        end
-    end, "cr")
-end
-
-function Profiler:stop()
-    self.active = false
-    debug.sethook()
-end
-
-function Profiler:report(topN)
-    topN = topN or 10
-    
-    -- Sort by total time
-    local entries = {}
-    for name, data in pairs(self.data) do
-        table.insert(entries, {
-            name = name,
-            calls = data.calls,
-            totalTime = data.totalTime,
-            selfTime = math.max(data.selfTime, 0)
-        })
-    end
-    
-    table.sort(entries, function(a, b)
-        return a.totalTime > b.totalTime
-    end)
-    
-    print(string.format("\n%-40s %8s %10s %10s",
-        "Function", "Calls", "Total(ms)", "Self(ms)"))
-    print(string.rep("-", 72))
-    
-    for i = 1, math.min(topN, #entries) do
-        local e = entries[i]
-        -- ตัดชื่อให้สั้นลง
-        local name = e.name
-        if #name > 38 then
-            name = ".." .. name:sub(-36)
-        end
-        print(string.format("%-40s %8d %10.2f %10.2f",
-            name, e.calls,
-            e.totalTime * 1000,
-            e.selfTime * 1000))
-    end
-end
-
--- ทดสอบ profiler
-print("=== Profiling Demo ===\n")
-
--- Functions to profile
-local function fibonacci(n)
-    if n <= 1 then return n end
-    return fibonacci(n-1) + fibonacci(n-2)
-end
-
-local function sumArray(arr)
+local function heavy_computation(n)
     local sum = 0
-    for i = 1, #arr do sum = sum + arr[i] end
+    for i = 1, n do
+        sum = sum + math.sqrt(i)
+    end
     return sum
 end
 
-local function processData(n)
-    local arr = {}
-    for i = 1, n do arr[i] = i * i end
-    return sumArray(arr), fibonacci(math.min(n, 15))
+-- รันครั้งแรก (JIT จะ compile)
+local t1 = os.clock()
+heavy_computation(1000000)
+print(string.format("First run: %.4fs", os.clock() - t1))
+
+-- รันครั้งที่สอง (ใช้ compiled code)
+local t2 = os.clock()
+heavy_computation(1000000)
+print(string.format("Second run (JIT): %.4fs", os.clock() - t2))
+
+-- Flush แล้วรันใหม่
+jit.flush()
+
+local t3 = os.clock()
+heavy_computation(1000000)
+print(string.format("After flush: %.4fs", os.clock() - t3))
+
+-- jit.flush(func) - flush เฉพาะ function
+jit.flush(heavy_computation)
+```
+
+### ตัวอย่างที่ 14: jit.opt - ตั้งค่า optimization
+
+```lua
+-- jit_optimize.lua
+
+if not jit then error("Requires LuaJIT") end
+
+-- jit.opt.start ตั้งค่า optimization level
+require("jit.opt").start(3)  -- optimization level 0-4
+
+-- ตั้งค่า specific optimizations
+require("jit.opt").start(
+    "hotloop=10",      -- จำนวน iterations ก่อน JIT compile (default 56)
+    "hotexit=2",       -- จำนวน exits ก่อน compile side trace
+    "maxrecord=4000",  -- จำนวน bytecodes สูงสุดที่ record
+    "maxirpatch=500",  -- จำนวน IR instructions สูงสุดต่อ patch
+    "loopunroll=15",   -- จำนวน loop unroll iterations
+    "maxside=100",     -- จำนวน side traces สูงสุด
+    "maxtrace=1000",   -- จำนวน traces สูงสุด
+    "maxmcode=512"     -- ขนาด machine code สูงสุด (KB)
+)
+
+-- ใช้ jit.v สำหรับ verbose output
+-- luajit -jv script.lua
+
+-- ใช้ jit.dump สำหรับ detailed dump
+-- luajit -jdump script.lua
+
+print("JIT optimization configured")
+```
+
+---
+
+## 45.6 NYI (Not Yet Implemented) Gotchas
+
+NYI คือสิ่งที่ JIT compiler ยังไม่รองรับ ทำให้ต้อง fallback ไปใช้ interpreter ซึ่งช้ากว่า
+
+### ตัวอย่างที่ 15: สิ่งที่ทำให้ JIT deoptimize
+
+```lua
+-- nyi_examples.lua
+
+-- NYI #1: pcall/xpcall ใน hot loop (แก้ได้ใน LuaJIT 2.1+)
+-- ควรย้าย error handling ออกจาก hot loop
+local function bad_pattern()
+    local sum = 0
+    for i = 1, 1000000 do
+        local ok, val = pcall(function() return i * 2 end)
+        if ok then sum = sum + val end
+    end
+    return sum
 end
 
--- Profile
-local profiler = Profiler.new()
-profiler:start()
-
-for _ = 1, 100 do
-    processData(100)
+local function good_pattern()
+    local function double(i) return i * 2 end
+    local sum = 0
+    for i = 1, 1000000 do
+        sum = sum + double(i)
+    end
+    return sum
 end
 
-profiler:stop()
-profiler:report(10)
+-- NYI #2: coroutine.wrap ใน hot loop
+-- ใช้ state machine แทน
 
--- Alternative: simple timing profiler
-print("\n=== Simple Timer Profiler ===")
-local timers = {}
+-- NYI #3: string.format ใน hot loop (บางรูปแบบ)
+-- buffer ผลลัพธ์แล้วค่อย format ทีเดียว
 
-local function timed(name, fn, ...)
+-- NYI #4: table.sort ด้วย custom comparator บางแบบ
+-- ใช้ sort แบบธรรมดาหรือ sort ด้วย index
+
+-- NYI #5: ipairs บน non-contiguous tables (บางกรณี)
+-- ใช้ numeric for loop แทน
+
+-- ตรวจสอบ NYI ด้วย jit.dump
+-- luajit -jdump=r script.lua 2>&1 | grep "NYI"
+
+print("NYI examples loaded")
+print("Use: luajit -jdump=r nyi_examples.lua 2>&1 | grep NYI")
+```
+
+### ตัวอย่างที่ 16: วิธี workaround NYI
+
+```lua
+-- nyi_workaround.lua
+
+-- Workaround: แทนที่ type() ใน hot loop
+-- type() เป็น NYI ในบาง context
+
+-- Bad:
+local function check_types_bad(t)
+    local count = 0
+    for i = 1, #t do
+        if type(t[i]) == "number" then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- Good: ใช้ tonumber แทน
+local function check_types_good(t)
+    local count = 0
+    for i = 1, #t do
+        if tonumber(t[i]) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- Workaround: string.byte แทน pattern matching ใน hot loop
+local function count_spaces_bad(s)
+    local count = 0
+    for c in s:gmatch(" ") do
+        count = count + 1
+    end
+    return count
+end
+
+local function count_spaces_good(s)
+    local count = 0
+    local space = string.byte(" ")
+    for i = 1, #s do
+        if string.byte(s, i) == space then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- Test
+local data = {}
+for i = 1, 1000 do data[i] = i end
+print("Type check result:", check_types_good(data))
+
+local text = "Hello World This Is A Test String"
+print("Spaces in text:", count_spaces_good(text))
+```
+
+---
+
+## 45.7 Performance Comparison
+
+### ตัวอย่างที่ 17: Benchmark ครบถ้วน
+
+```lua
+-- full_benchmark.lua
+-- รัน: luajit full_benchmark.lua (LuaJIT)
+-- เปรียบเทียบกับ: lua full_benchmark.lua (standard Lua)
+
+local function bench(name, iterations, func)
+    -- Warmup
+    for _ = 1, math.min(iterations // 10, 100) do
+        func()
+    end
+    
     local start = os.clock()
-    local results = {fn(...)}
+    for _ = 1, iterations do
+        func()
+    end
     local elapsed = os.clock() - start
-    timers[name] = (timers[name] or 0) + elapsed
-    return table.unpack(results)
+    
+    local ops_per_sec = iterations / elapsed
+    print(string.format("%-30s: %8.3f ms (%s ops/sec)",
+        name, elapsed * 1000, 
+        ops_per_sec >= 1e6 and string.format("%.1fM", ops_per_sec/1e6)
+            or string.format("%.1fK", ops_per_sec/1e3)
+    ))
+end
+
+print("=== Performance Benchmark ===")
+print(string.format("Running on: %s", jit and jit.version or _VERSION))
+print()
+
+-- Test 1: Integer arithmetic
+bench("integer_add", 1000000, function()
+    local x = 0
+    for i = 1, 100 do x = x + i end
+    return x
+end)
+
+-- Test 2: Float arithmetic
+bench("float_mul", 1000000, function()
+    local x = 1.0
+    for i = 1, 100 do x = x * 1.001 end
+    return x
+end)
+
+-- Test 3: Table access
+local t = {}; for i = 1, 100 do t[i] = i end
+bench("table_read", 1000000, function()
+    local sum = 0
+    for i = 1, 100 do sum = sum + t[i] end
+    return sum
+end)
+
+-- Test 4: String operations
+bench("string_concat", 100000, function()
+    local parts = {}
+    for i = 1, 20 do parts[i] = tostring(i) end
+    return table.concat(parts)
+end)
+
+-- Test 5: Function call overhead
+local function add(a, b) return a + b end
+bench("function_call", 1000000, function()
+    local x = 0
+    for i = 1, 100 do x = add(x, i) end
+    return x
+end)
+
+-- Test 6: Math operations
+bench("math_sqrt", 1000000, function()
+    local x = 0
+    for i = 1, 100 do x = x + math.sqrt(i) end
+    return x
+end)
+```
+
+---
+
+## 45.8 FFI Struct และ Array
+
+### ตัวอย่างที่ 18: Complex Struct
+
+```lua
+-- ffi_struct.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    typedef struct {
+        double x, y;
+    } Point2D;
+    
+    typedef struct {
+        double x, y, z;
+    } Point3D;
+    
+    typedef struct {
+        Point2D min;
+        Point2D max;
+    } BoundingBox;
+    
+    typedef struct {
+        char name[64];
+        int id;
+        float score;
+        bool active;
+    } Player;
+    
+    typedef struct {
+        uint32_t count;
+        Player players[100];
+    } GameState;
+]]
+
+-- สร้าง Point
+local p1 = ffi.new("Point2D", {x = 3.0, y = 4.0})
+local p2 = ffi.new("Point2D", {x = 0.0, y = 0.0})
+
+-- คำนวณ distance
+local function distance(a, b)
+    local dx = a.x - b.x
+    local dy = a.y - b.y
+    return math.sqrt(dx*dx + dy*dy)
+end
+
+print(string.format("Distance: %.4f", distance(p1, p2)))  -- 5.0000
+
+-- BoundingBox
+local bbox = ffi.new("BoundingBox")
+bbox.min.x, bbox.min.y = -10.0, -10.0
+bbox.max.x, bbox.max.y = 10.0, 10.0
+
+local function contains(box, point)
+    return point.x >= box.min.x and point.x <= box.max.x
+       and point.y >= box.min.y and point.y <= box.max.y
+end
+
+print("Contains p1:", contains(bbox, p1))  -- true
+print("Contains (20,0):", contains(bbox, ffi.new("Point2D", {x=20, y=0})))  -- false
+
+-- GameState
+local state = ffi.new("GameState")
+state.count = 3
+
+for i = 0, 2 do
+    local name = string.format("Player%d", i+1)
+    ffi.copy(state.players[i].name, name)
+    state.players[i].id = i + 1
+    state.players[i].score = (i + 1) * 100.5
+    state.players[i].active = true
+end
+
+for i = 0, tonumber(state.count) - 1 do
+    print(string.format("Player: %s (ID=%d, Score=%.1f)",
+        ffi.string(state.players[i].name),
+        state.players[i].id,
+        state.players[i].score))
+end
+```
+
+### ตัวอย่างที่ 19: C Arrays กับ FFI
+
+```lua
+-- ffi_arrays.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    void *malloc(size_t size);
+    void free(void *ptr);
+    void *memset(void *s, int c, size_t n);
+    void qsort(void *base, size_t nmemb, size_t size,
+               int (*compar)(const void *, const void *));
+]]
+
+-- Static arrays
+local static_arr = ffi.new("int[10]", {5, 3, 8, 1, 9, 2, 7, 4, 6, 0})
+print("Original:")
+for i = 0, 9 do io.write(static_arr[i] .. " ") end
+print()
+
+-- qsort กับ C comparator
+local compare_int = ffi.cast("int (*)(const void *, const void *)",
+    function(a, b)
+        local ia = ffi.cast("const int *", a)[0]
+        local ib = ffi.cast("const int *", b)[0]
+        return ia < ib and -1 or ia > ib and 1 or 0
+    end
+)
+
+ffi.C.qsort(static_arr, 10, ffi.sizeof("int"), compare_int)
+print("Sorted:")
+for i = 0, 9 do io.write(static_arr[i] .. " ") end
+print()
+
+-- Dynamic arrays ด้วย malloc
+local size = 1000
+local dyn_arr = ffi.cast("float *", ffi.C.malloc(size * ffi.sizeof("float")))
+
+-- เติมข้อมูล
+for i = 0, size - 1 do
+    dyn_arr[i] = math.sin(i * 0.01) * 100
+end
+
+-- หา max
+local max_val = dyn_arr[0]
+for i = 1, size - 1 do
+    if dyn_arr[i] > max_val then max_val = dyn_arr[i] end
+end
+print(string.format("Max value: %.4f", max_val))
+
+-- Free memory
+ffi.C.free(dyn_arr)
+print("Memory freed")
+
+-- 2D arrays
+local rows, cols = 4, 4
+local matrix = ffi.new("float[4][4]")
+for i = 0, rows - 1 do
+    for j = 0, cols - 1 do
+        matrix[i][j] = i == j and 1.0 or 0.0  -- identity matrix
+    end
+end
+
+print("Identity Matrix:")
+for i = 0, rows - 1 do
+    for j = 0, cols - 1 do
+        io.write(string.format("%4.1f ", matrix[i][j]))
+    end
+    print()
+end
+```
+
+### ตัวอย่างที่ 20: FFI Pointers
+
+```lua
+-- ffi_pointers.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    void *malloc(size_t size);
+    void free(void *ptr);
+    
+    typedef struct LinkedNode {
+        int value;
+        struct LinkedNode *next;
+    } LinkedNode;
+]]
+
+-- สร้าง linked list
+local function create_node(value)
+    local node = ffi.cast("LinkedNode *", 
+        ffi.C.malloc(ffi.sizeof("LinkedNode")))
+    node.value = value
+    node.next = nil
+    return node
+end
+
+local function insert_front(head, value)
+    local node = create_node(value)
+    node.next = head
+    return node
+end
+
+local function print_list(head)
+    local current = head
+    local values = {}
+    while current ~= nil do
+        table.insert(values, tostring(current.value))
+        current = current.next
+    end
+    print("List: " .. table.concat(values, " -> "))
+end
+
+local function free_list(head)
+    local current = head
+    while current ~= nil do
+        local next = current.next
+        ffi.C.free(current)
+        current = next
+    end
 end
 
 -- ใช้งาน
-for _ = 1, 1000 do
-    timed("fibonacci(20)", fibonacci, 20)
-    timed("sumArray", sumArray, {1,2,3,4,5,6,7,8,9,10})
+local head = nil
+for i = 1, 5 do
+    head = insert_front(head, i * 10)
 end
 
-print("\nTimer results:")
-local timerEntries = {}
-for k, v in pairs(timers) do
-    table.insert(timerEntries, {name = k, time = v})
-end
-table.sort(timerEntries, function(a, b) return a.time > b.time end)
-
-for _, e in ipairs(timerEntries) do
-    print(string.format("  %-30s %.4fs", e.name, e.time))
-end
+print_list(head)  -- 50 -> 40 -> 30 -> 20 -> 10
+free_list(head)
+print("Linked list freed")
 ```
 
-### ตัวอย่างที่ 19: Hot Path Optimization
+---
+
+## 45.9 Practical Example: Fast Image Processing
+
+### ตัวอย่างที่ 21: Image Processing พื้นฐาน
 
 ```lua
--- hot_path_optimization.lua
+-- fast_image.lua
+-- Fast image processing using FFI
 
-print("=== Hot Path Optimization ===\n")
+local ffi = require("ffi")
 
---[[
-Hot path = ส่วนของโค้ดที่ execute บ่อยที่สุด
-Optimization principle: 80% ของเวลา อยู่ใน 20% ของโค้ด
-Focus optimization on the hot path
---]]
+ffi.cdef[[
+    void *malloc(size_t size);
+    void *calloc(size_t nmemb, size_t size);
+    void free(void *ptr);
+    void *memcpy(void *dest, const void *src, size_t n);
+    
+    typedef struct {
+        uint32_t width;
+        uint32_t height;
+        uint8_t  channels;  // 1=gray, 3=RGB, 4=RGBA
+        uint8_t  *data;
+    } Image;
+]]
 
--- Example: Particle system
-local ParticleSystem = {}
-ParticleSystem.__index = ParticleSystem
+-- สร้าง Image
+local function create_image(w, h, channels)
+    channels = channels or 3
+    local img = ffi.new("Image")
+    img.width = w
+    img.height = h
+    img.channels = channels
+    img.data = ffi.cast("uint8_t *", 
+        ffi.C.calloc(w * h * channels, 1))
+    return img
+end
 
-function ParticleSystem.new(maxParticles)
-    local self = setmetatable({}, ParticleSystem)
-    self.maxParticles = maxParticles
+-- ลบ Image
+local function free_image(img)
+    ffi.C.free(img.data)
+end
+
+-- Get pixel
+local function get_pixel(img, x, y)
+    local idx = (y * img.width + x) * img.channels
+    if img.channels == 3 then
+        return img.data[idx], img.data[idx+1], img.data[idx+2]
+    else
+        return img.data[idx]
+    end
+end
+
+-- Set pixel
+local function set_pixel(img, x, y, r, g, b)
+    local idx = (y * img.width + x) * img.channels
+    img.data[idx]   = r
+    img.data[idx+1] = g
+    img.data[idx+2] = b
+end
+
+-- สร้าง gradient image
+local function create_gradient(w, h)
+    local img = create_image(w, h, 3)
+    for y = 0, h - 1 do
+        for x = 0, w - 1 do
+            set_pixel(img, x, y,
+                math.floor(x / w * 255),  -- R
+                math.floor(y / h * 255),  -- G
+                128)                       -- B
+        end
+    end
+    return img
+end
+
+local img = create_gradient(256, 256)
+print(string.format("Created %dx%d image", img.width, img.height))
+
+local r, g, b = get_pixel(img, 128, 128)
+print(string.format("Center pixel: RGB(%d, %d, %d)", r, g, b))
+
+free_image(img)
+```
+
+### ตัวอย่างที่ 22: Image Filters ด้วย FFI
+
+```lua
+-- image_filters.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    void *malloc(size_t size);
+    void *calloc(size_t nmemb, size_t size);
+    void free(void *ptr);
+]]
+
+-- Grayscale conversion
+local function to_grayscale(src)
+    local w, h = src.width, src.height
+    local dst = {
+        width = w, height = h, channels = 1,
+        data = ffi.cast("uint8_t *", ffi.C.calloc(w * h, 1))
+    }
+    
+    for y = 0, h - 1 do
+        for x = 0, w - 1 do
+            local si = (y * w + x) * 3
+            -- BT.601 luma formula
+            local gray = math.floor(
+                0.299 * src.data[si] +
+                0.587 * src.data[si+1] +
+                0.114 * src.data[si+2]
+            )
+            dst.data[y * w + x] = gray
+        end
+    end
+    return dst
+end
+
+-- Brightness adjustment (FFI array access เร็วมาก)
+local function adjust_brightness(img, delta)
+    local total = img.width * img.height * img.channels
+    for i = 0, total - 1 do
+        local val = img.data[i] + delta
+        -- clamp ให้อยู่ใน [0, 255]
+        img.data[i] = val < 0 and 0 or val > 255 and 255 or val
+    end
+end
+
+-- Horizontal flip
+local function flip_horizontal(img)
+    local w, h, c = img.width, img.height, img.channels
+    local row_size = w * c
+    local row_buf = ffi.new("uint8_t[?]", row_size)
+    
+    for y = 0, h - 1 do
+        local row_start = y * row_size
+        -- copy row to buffer
+        ffi.copy(row_buf, img.data + row_start, row_size)
+        -- write back reversed
+        for x = 0, w - 1 do
+            for ch = 0, c - 1 do
+                img.data[row_start + x*c + ch] = 
+                    row_buf[(w-1-x)*c + ch]
+            end
+        end
+    end
+end
+
+-- Threshold (binary)
+local function threshold(img, thresh)
+    local total = img.width * img.height * img.channels
+    for i = 0, total - 1 do
+        img.data[i] = img.data[i] >= thresh and 255 or 0
+    end
+end
+
+print("Image filter functions defined")
+print("Functions: to_grayscale, adjust_brightness, flip_horizontal, threshold")
+```
+
+### ตัวอย่างที่ 23: Fast Convolution Filter
+
+```lua
+-- convolution.lua
+-- 2D convolution ด้วย FFI (เร็วกว่า pure Lua มาก)
+local ffi = require("ffi")
+
+ffi.cdef[[
+    void *calloc(size_t nmemb, size_t size);
+    void free(void *ptr);
+]]
+
+-- Gaussian blur kernel 3x3
+local BLUR_3x3 = {
+    {1/16, 2/16, 1/16},
+    {2/16, 4/16, 2/16},
+    {1/16, 2/16, 1/16},
+}
+
+-- Sharpen kernel
+local SHARPEN = {
+    { 0, -1,  0},
+    {-1,  5, -1},
+    { 0, -1,  0},
+}
+
+-- Edge detection (Sobel X)
+local SOBEL_X = {
+    {-1,  0,  1},
+    {-2,  0,  2},
+    {-1,  0,  1},
+}
+
+local function apply_kernel(src_data, dst_data, w, h, kernel, ksize)
+    local half = math.floor(ksize / 2)
+    
+    for y = half, h - 1 - half do
+        for x = half, w - 1 - half do
+            local sum = 0.0
+            for ky = 0, ksize - 1 do
+                for kx = 0, ksize - 1 do
+                    local sy = y + ky - half
+                    local sx = x + kx - half
+                    sum = sum + src_data[sy * w + sx] * kernel[ky+1][kx+1]
+                end
+            end
+            -- Clamp to [0, 255]
+            sum = math.max(0, math.min(255, sum))
+            dst_data[y * w + x] = math.floor(sum)
+        end
+    end
+end
+
+-- สร้าง test grayscale image (256x256)
+local W, H = 256, 256
+local src = ffi.cast("uint8_t *", ffi.C.calloc(W * H, 1))
+local dst = ffi.cast("uint8_t *", ffi.C.calloc(W * H, 1))
+
+-- สร้าง test pattern
+for y = 0, H - 1 do
+    for x = 0, W - 1 do
+        -- checkerboard pattern
+        src[y * W + x] = ((x // 32 + y // 32) % 2 == 0) and 255 or 0
+    end
+end
+
+-- วัดเวลา blur
+local t = os.clock()
+apply_kernel(src, dst, W, H, BLUR_3x3, 3)
+print(string.format("Blur: %.4fs for %dx%d image", os.clock() - t, W, H))
+
+-- วัดเวลา sharpen
+t = os.clock()
+apply_kernel(src, dst, W, H, SHARPEN, 3)
+print(string.format("Sharpen: %.4fs for %dx%d image", os.clock() - t, W, H))
+
+-- ตรวจสอบผลลัพธ์
+print("Center pixel after blur:", dst[128 * W + 128])
+
+ffi.C.free(src)
+ffi.C.free(dst)
+```
+
+### ตัวอย่างที่ 24: PNG Writing ด้วย FFI (ผ่าน libpng)
+
+```lua
+-- ffi_libpng.lua
+-- ตัวอย่างการใช้ libpng ผ่าน FFI
+
+local ffi = require("ffi")
+
+-- ลองโหลด libpng
+local ok, png = pcall(ffi.load, "png")
+if not ok then
+    print("libpng not available, showing API only")
+    -- แสดง API ที่จะใช้
+    ffi.cdef[[
+        typedef struct png_struct png_struct;
+        typedef png_struct *png_structp;
+        typedef struct png_info png_info;
+        typedef png_info *png_infop;
+        typedef unsigned char png_byte;
+        typedef unsigned int png_uint_32;
+        
+        png_structp png_create_write_struct(
+            const char *user_png_ver,
+            void *error_ptr, void *error_fn, void *warn_fn);
+        png_infop png_create_info_struct(png_structp png_ptr);
+        void png_destroy_write_struct(
+            png_structp *png_ptr_ptr, png_infop *info_ptr_ptr);
+        void png_set_IHDR(
+            png_structp png_ptr, png_infop info_ptr,
+            png_uint_32 width, png_uint_32 height,
+            int bit_depth, int color_type, int interlace_method,
+            int compression_method, int filter_method);
+        void png_write_row(png_structp png_ptr, png_byte *row);
+        void png_write_end(png_structp png_ptr, png_infop info_ptr);
+    ]]
+    print("PNG API declarations loaded (library not available)")
+    return
+end
+
+print("libpng loaded successfully")
+-- การใช้งานจริงจะ initialize png_struct, set IHDR, แล้ว write rows
+```
+
+---
+
+## 45.10 FFI Callbacks
+
+### ตัวอย่างที่ 25: C Callbacks จาก Lua
+
+```lua
+-- ffi_callbacks.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    void qsort(void *base, size_t nmemb, size_t size,
+               int (*compar)(const void *, const void *));
+    void *malloc(size_t size);
+    void free(void *ptr);
+]]
+
+-- สร้าง C callback จาก Lua function
+local compare_asc = ffi.cast("int (*)(const void *, const void *)",
+    function(a, b)
+        local ia = ffi.cast("const int *", a)[0]
+        local ib = ffi.cast("const int *", b)[0]
+        return ia - ib
+    end
+)
+
+local compare_desc = ffi.cast("int (*)(const void *, const void *)",
+    function(a, b)
+        local ia = ffi.cast("const int *", a)[0]
+        local ib = ffi.cast("const int *", b)[0]
+        return ib - ia
+    end
+)
+
+-- สร้าง array
+local n = 10
+local arr = ffi.new("int[10]", {64, 25, 12, 22, 11, 90, 45, 3, 78, 56})
+
+print("Original:")
+for i = 0, n-1 do io.write(arr[i] .. " ") end; print()
+
+-- Sort ascending
+ffi.C.qsort(arr, n, ffi.sizeof("int"), compare_asc)
+print("Sorted ascending:")
+for i = 0, n-1 do io.write(arr[i] .. " ") end; print()
+
+-- Sort descending
+ffi.C.qsort(arr, n, ffi.sizeof("int"), compare_desc)
+print("Sorted descending:")
+for i = 0, n-1 do io.write(arr[i] .. " ") end; print()
+
+-- cleanup callbacks
+compare_asc:free()
+compare_desc:free()
+```
+
+### ตัวอย่างที่ 26: Metatypes - OOP กับ FFI
+
+```lua
+-- ffi_metatype.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    typedef struct {
+        double x, y;
+    } Vec2;
+]]
+
+-- ใส่ methods บน C struct ด้วย metatype
+local Vec2MT = {
+    __add = function(a, b)
+        return ffi.new("Vec2", {x = a.x + b.x, y = a.y + b.y})
+    end,
+    __sub = function(a, b)
+        return ffi.new("Vec2", {x = a.x - b.x, y = a.y - b.y})
+    end,
+    __mul = function(a, s)
+        return ffi.new("Vec2", {x = a.x * s, y = a.y * s})
+    end,
+    __tostring = function(v)
+        return string.format("Vec2(%.3f, %.3f)", v.x, v.y)
+    end,
+    __index = {
+        length = function(self)
+            return math.sqrt(self.x * self.x + self.y * self.y)
+        end,
+        normalize = function(self)
+            local len = self:length()
+            if len == 0 then return ffi.new("Vec2", {x=0, y=0}) end
+            return ffi.new("Vec2", {x = self.x/len, y = self.y/len})
+        end,
+        dot = function(self, other)
+            return self.x * other.x + self.y * other.y
+        end,
+    }
+}
+
+ffi.metatype("Vec2", Vec2MT)
+
+-- ใช้งาน
+local a = ffi.new("Vec2", {x = 3.0, y = 4.0})
+local b = ffi.new("Vec2", {x = 1.0, y = 2.0})
+
+print("a:", tostring(a))
+print("b:", tostring(b))
+print("a + b:", tostring(a + b))
+print("a - b:", tostring(a - b))
+print("a * 2:", tostring(a * 2))
+print("|a|:", a:length())      -- 5.0
+print("norm(a):", tostring(a:normalize()))
+print("a · b:", a:dot(b))
+```
+
+---
+
+## 45.11 ตัวอย่างขั้นสูง: Fast Hash Table
+
+### ตัวอย่างที่ 27: Hash Table ด้วย FFI
+
+```lua
+-- ffi_hashtable.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    void *calloc(size_t nmemb, size_t size);
+    void free(void *ptr);
+    
+    typedef struct {
+        uint64_t key;
+        int64_t  value;
+        uint8_t  occupied;
+    } HEntry;
+    
+    typedef struct {
+        HEntry  *entries;
+        uint32_t capacity;
+        uint32_t count;
+    } HashTable;
+]]
+
+local HashTable = {}
+HashTable.__index = HashTable
+
+function HashTable.new(capacity)
+    capacity = capacity or 1024
+    local ht = setmetatable({}, HashTable)
+    ht._c = ffi.new("HashTable")
+    ht._c.capacity = capacity
+    ht._c.count = 0
+    ht._c.entries = ffi.cast("HEntry *",
+        ffi.C.calloc(capacity, ffi.sizeof("HEntry")))
+    return ht
+end
+
+function HashTable:_hash(key)
+    -- FNV-1a hash
+    local h = 0xcbf29ce484222325ULL
+    local fnv = 0x100000001b3ULL
+    for i = 1, #key do
+        h = ffi.cast("uint64_t", 
+            bit.bxor(tonumber(h), string.byte(key, i)))
+        h = h * fnv
+    end
+    return tonumber(h % self._c.capacity)
+end
+
+function HashTable:set(key, value)
+    local hash = self:_hash(tostring(key))
+    local cap = tonumber(self._c.capacity)
+    local idx = hash
+    
+    for _ = 1, cap do
+        local entry = self._c.entries[idx]
+        if entry.occupied == 0 or entry.key == hash then
+            entry.key = hash
+            entry.value = value
+            if entry.occupied == 0 then
+                entry.occupied = 1
+                self._c.count = self._c.count + 1
+            end
+            return
+        end
+        idx = (idx + 1) % cap
+    end
+    error("Hash table full!")
+end
+
+function HashTable:get(key)
+    local hash = self:_hash(tostring(key))
+    local cap = tonumber(self._c.capacity)
+    local idx = hash
+    
+    for _ = 1, cap do
+        local entry = self._c.entries[idx]
+        if entry.occupied == 0 then return nil end
+        if entry.key == hash then
+            return tonumber(entry.value)
+        end
+        idx = (idx + 1) % cap
+    end
+    return nil
+end
+
+function HashTable:destroy()
+    ffi.C.free(self._c.entries)
+end
+
+-- ทดสอบ
+local ht = HashTable.new(1024)
+
+-- Insert
+for i = 1, 100 do
+    ht:set("key_" .. i, i * 10)
+end
+
+-- Lookup
+print("key_1 =", ht:get("key_1"))    -- 10
+print("key_50 =", ht:get("key_50"))  -- 500
+print("key_100 =", ht:get("key_100")) -- 1000
+print("Count:", tonumber(ht._c.count))
+
+-- Benchmark
+local t = os.clock()
+for i = 1, 100000 do
+    ht:set("k" .. i, i)
+end
+print(string.format("100K inserts: %.4fs", os.clock() - t))
+
+ht:destroy()
+```
+
+---
+
+## 45.12 การจัดการ Memory ใน FFI
+
+### ตัวอย่างที่ 28: GC Integration
+
+```lua
+-- ffi_gc.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    void *malloc(size_t size);
+    void free(void *ptr);
+    
+    typedef struct {
+        int width, height;
+        uint8_t *pixels;
+    } Bitmap;
+]]
+
+-- วิธีที่ 1: ffi.gc - auto cleanup
+local function create_buffer(size)
+    local ptr = ffi.C.malloc(size)
+    if ptr == nil then error("malloc failed") end
+    -- ffi.gc จะเรียก free เมื่อ ptr ถูก GC
+    return ffi.gc(ptr, ffi.C.free)
+end
+
+local buf = create_buffer(1024)
+print("Buffer allocated:", buf ~= nil)
+-- buf จะถูก free อัตโนมัติเมื่อ garbage collected
+
+-- วิธีที่ 2: Wrapper object พร้อม destructor
+local Bitmap = {}
+Bitmap.__index = Bitmap
+
+function Bitmap.new(w, h)
+    local self = setmetatable({}, Bitmap)
+    self.width = w
+    self.height = h
+    self.pixels = ffi.gc(
+        ffi.cast("uint8_t *", ffi.C.malloc(w * h)),
+        ffi.C.free
+    )
+    return self
+end
+
+function Bitmap:pixel(x, y)
+    return self.pixels[y * self.width + x]
+end
+
+function Bitmap:set_pixel(x, y, value)
+    self.pixels[y * self.width + x] = value
+end
+
+-- ใช้งาน
+local bmp = Bitmap.new(100, 100)
+bmp:set_pixel(50, 50, 255)
+print("Pixel at (50,50):", bmp:pixel(50, 50))
+-- memory จะถูก free อัตโนมัติเมื่อ bmp ถูก GC
+
+print("Bitmap created with auto-cleanup")
+```
+
+### ตัวอย่างที่ 29: Memory Pool
+
+```lua
+-- memory_pool.lua
+local ffi = require("ffi")
+
+ffi.cdef[[
+    void *malloc(size_t size);
+    void free(void *ptr);
+    void *memset(void *s, int c, size_t n);
+]]
+
+-- Simple memory pool สำหรับ fixed-size allocations
+local Pool = {}
+Pool.__index = Pool
+
+function Pool.new(item_size, capacity)
+    local self = setmetatable({}, Pool)
+    self.item_size = item_size
+    self.capacity = capacity
     self.count = 0
     
-    -- สร้าง arrays แบบ parallel (structure of arrays)
-    -- ดีกว่า array of structs สำหรับ cache locality
-    self.x  = {}
-    self.y  = {}
-    self.vx = {}
-    self.vy = {}
-    self.life = {}
+    -- Allocate pool memory
+    self._data = ffi.gc(
+        ffi.cast("uint8_t *", ffi.C.malloc(item_size * capacity)),
+        ffi.C.free
+    )
+    
+    -- Free list (stack of available indices)
+    self._free = ffi.new("int[?]", capacity)
+    for i = 0, capacity - 1 do
+        self._free[i] = i
+    end
+    self._free_count = capacity
     
     return self
 end
 
-function ParticleSystem:spawn(x, y, vx, vy, life)
-    if self.count >= self.maxParticles then return end
+function Pool:alloc()
+    if self._free_count == 0 then
+        error("Pool exhausted!")
+    end
+    self._free_count = self._free_count - 1
+    local idx = self._free[self._free_count]
     self.count = self.count + 1
-    local i = self.count
-    self.x[i]    = x
-    self.y[i]    = y
-    self.vx[i]   = vx
-    self.vy[i]   = vy
-    self.life[i] = life
+    return self._data + idx * self.item_size, idx
 end
 
--- Hot path: update เรียกทุก frame สำหรับทุก particle
-function ParticleSystem:update(dt)
-    -- Cache fields เป็น locals เพื่อ JIT friendliness
-    local x    = self.x
-    local y    = self.y
-    local vx   = self.vx
-    local vy   = self.vy
-    local life = self.life
-    local count = self.count
-    local gravity = -9.8 * dt
-    
-    local newCount = 0
-    
-    -- การทำงาน O(n) ใน hot loop
-    for i = 1, count do
-        -- Update physics
-        vx[i] = vx[i] * 0.999
-        vy[i] = vy[i] + gravity
-        x[i]  = x[i] + vx[i] * dt
-        y[i]  = y[i] + vy[i] * dt
-        life[i] = life[i] - dt
-        
-        -- Remove dead particles (swap with last)
-        if life[i] > 0 then
-            newCount = newCount + 1
-            if newCount ~= i then
-                x[newCount]    = x[i]
-                y[newCount]    = y[i]
-                vx[newCount]   = vx[i]
-                vy[newCount]   = vy[i]
-                life[newCount] = life[i]
-            end
-        end
-    end
-    
-    self.count = newCount
+function Pool:free_item(idx)
+    self._free[self._free_count] = idx
+    self._free_count = self._free_count + 1
+    self.count = self.count - 1
 end
 
 -- ทดสอบ
-math.randomseed(42)
-local ps = ParticleSystem.new(10000)
+local ITEM_SIZE = 64  -- 64 bytes per item
+local pool = Pool.new(ITEM_SIZE, 1000)
 
--- Spawn particles
-for _ = 1, 5000 do
-    ps:spawn(
-        math.random(-100, 100),
-        math.random(0, 200),
-        math.random(-50, 50) * 0.1,
-        math.random(20, 100) * 0.1,
-        math.random(1, 5) + math.random()
+print("Pool created:", pool.capacity, "items of", ITEM_SIZE, "bytes")
+
+-- Allocate
+local ptr1, idx1 = pool:alloc()
+local ptr2, idx2 = pool:alloc()
+print(string.format("Allocated items at indices %d and %d", idx1, idx2))
+print("Pool usage:", pool.count, "/", pool.capacity)
+
+-- Free
+pool:free_item(idx1)
+print("After free, usage:", pool.count, "/", pool.capacity)
+
+-- Benchmark
+local t = os.clock()
+for _ = 1, 10000 do
+    local p, idx = pool:alloc()
+    pool:free_item(idx)
+end
+print(string.format("10K alloc/free cycles: %.4fs", os.clock() - t))
+```
+
+---
+
+## 45.13 LuaJIT Extensions
+
+### ตัวอย่างที่ 30: bit library (Bitwise Operations)
+
+```lua
+-- luajit_bit.lua
+-- LuaJIT มี bit library (ใน Lua 5.3+ มี ~ << >> &)
+
+-- LuaJIT ใช้ require("bit") หรือ bit.*
+local bit = require("bit")
+
+local function demo_bitops()
+    local a = 0xFF00
+    local b = 0x0F0F
+    
+    print(string.format("a = 0x%04X (%d)", a, a))
+    print(string.format("b = 0x%04X (%d)", b, b))
+    print()
+    
+    -- AND
+    print(string.format("a & b  = 0x%04X", bit.band(a, b)))   -- 0x0F00
+    -- OR
+    print(string.format("a | b  = 0x%04X", bit.bor(a, b)))    -- 0xFF0F
+    -- XOR
+    print(string.format("a ^ b  = 0x%04X", bit.bxor(a, b)))   -- 0xF00F
+    -- NOT
+    print(string.format("~a     = 0x%08X", bit.bnot(a)))
+    -- Left shift
+    print(string.format("a << 4 = 0x%05X", bit.lshift(a, 4))) -- 0xFF000
+    -- Right shift (logical)
+    print(string.format("a >> 4 = 0x%03X", bit.rshift(a, 4))) -- 0xFF0
+    -- Arithmetic right shift
+    print(string.format("a >>> 4 = 0x%03X", bit.arshift(a, 4)))
+    -- Rotate left/right
+    print(string.format("rol(a,8) = 0x%08X", bit.rol(a, 8)))
+    print(string.format("ror(a,8) = 0x%08X", bit.ror(a, 8)))
+end
+
+demo_bitops()
+
+-- ตัวอย่าง: pack/unpack integers
+local function pack_rgba(r, g, b, a)
+    return bit.bor(
+        bit.lshift(r, 24),
+        bit.lshift(g, 16),
+        bit.lshift(b, 8),
+        a
     )
 end
 
-print(string.format("Initial particles: %d", ps.count))
-
--- Simulate
-local FRAMES = 1000
-local DT = 0.016  -- 60 fps
-
-local start = os.clock()
-for _ = 1, FRAMES do
-    ps:update(DT)
-    
-    -- Respawn particles that die
-    while ps.count < 3000 do
-        ps:spawn(0, 0, math.random(-50, 50) * 0.1,
-            math.random(50, 150) * 0.1, 3 + math.random())
-    end
+local function unpack_rgba(packed)
+    return
+        bit.rshift(bit.band(packed, 0xFF000000), 24),
+        bit.rshift(bit.band(packed, 0x00FF0000), 16),
+        bit.rshift(bit.band(packed, 0x0000FF00), 8),
+        bit.band(packed, 0x000000FF)
 end
-local elapsed = os.clock() - start
 
-print(string.format("Simulated %d frames: %.4fs", FRAMES, elapsed))
-print(string.format("Average FPS: %.1f", FRAMES / elapsed))
-print(string.format("Final particles: %d", ps.count))
-print(string.format("Particles/sec: %.1fM",
-    ps.count * FRAMES / elapsed / 1e6))
+local packed = pack_rgba(255, 128, 64, 200)
+print(string.format("\nPacked RGBA: 0x%08X", bit.tobit(packed)))
+local r, g, b, a = unpack_rgba(bit.tobit(packed))
+print(string.format("Unpacked: R=%d G=%d B=%d A=%d", r, g, b, a))
 ```
 
-### ตัวอย่างที่ 20: LuaJIT và Garbage Collector
+---
+
+## 45.14 สรุป
+
+### ตัวอย่างที่ 31: เมื่อใดควรใช้ LuaJIT
 
 ```lua
--- luajit_gc.lua
+-- when_to_use.lua
+-- แนวทางเลือก LuaJIT vs standard Lua
 
-print("=== GC Tuning for LuaJIT ===\n")
+--[[
+ใช้ LuaJIT เมื่อ:
+1. ต้องการ performance สูงสำหรับ numeric computation
+2. ต้องการ FFI เพื่อเรียก C libraries
+3. ใช้ OpenResty (nginx + LuaJIT)
+4. ต้องการ bit operations (require "bit")
+5. ทำ game development หรือ real-time processing
 
--- ดู GC stats
-local function gcStats()
-    local mem = collectgarbage("count")  -- KB
-    print(string.format("Memory: %.2f KB", mem))
-end
+ใช้ Standard Lua 5.4 เมื่อ:
+1. ต้องการ integer type (Lua 5.3+)
+2. ต้องการ to-be-closed variables (<close>)
+3. Compatibility กับ Lua 5.4 features
+4. ใช้ rock packages ที่ต้อง Lua 5.4
 
-print("Initial:")
-gcStats()
+สิ่งที่ต้องระวังใน LuaJIT:
+- LuaJIT compatible กับ Lua 5.1 (ไม่ใช่ 5.4)
+- บาง LuaRocks packages อาจไม่รองรับ
+- NYI items ทำให้ fallback ไป interpreter
+- Memory limit 1-2GB (เพราะใช้ 32-bit pointers ใน 64-bit mode)
+]]
 
--- สร้าง objects
-local function createObjects(n)
-    local objs = {}
-    for i = 1, n do
-        objs[i] = {
-            id = i,
-            name = "object_" .. i,
-            data = string.rep("x", 100)
-        }
-    end
-    return objs
-end
-
-print("\nAfter creating 10000 objects:")
-local objects = createObjects(10000)
-gcStats()
-
-print("\nAfter GC collect:")
-objects = nil
-collectgarbage("collect")
-gcStats()
-
--- GC Tuning
-print("\n--- GC Settings ---")
-
--- ดู current settings
-local gcPause = 200     -- default: 200%
-local gcMultiplier = 200  -- default: 200%
-
--- collectgarbage("setpause"): กำหนด pause threshold
--- ค่าสูงขึ้น = GC ทำงานน้อยลง แต่ใช้ memory มากขึ้น
-collectgarbage("setpause", gcPause)
-print(string.format("GC pause: %d%%", gcPause))
-
--- collectgarbage("setstepmul"): กำหนด step multiplier
--- ค่าสูงขึ้น = GC เร็วขึ้นแต่ใช้ CPU มากขึ้น
-collectgarbage("setstepmul", gcMultiplier)
-print(string.format("GC step multiplier: %d%%", gcMultiplier))
-
--- สำหรับ game/realtime: ปิด auto GC, GC เองในช่วงที่เหมาะสม
-print("\n--- Manual GC Control ---")
-
--- หยุด automatic GC
-collectgarbage("stop")
-print("Automatic GC stopped")
-
--- สร้าง objects โดยไม่มี auto GC
-for i = 1, 1000 do
-    local _ = {data = string.rep("x", 1000)}
-end
-print("After creating objects (no auto GC):")
-gcStats()
-
--- GC manually
-collectgarbage("collect")
-print("After manual collect:")
-gcStats()
-
--- เปิด automatic GC กลับ
-collectgarbage("restart")
-print("\nAutomatic GC restarted")
-
--- incremental GC: ทำงานทีละนิด
-print("\n--- Incremental GC ---")
-for i = 1, 100 do
-    local _ = {string.rep("y", 100)}
-    if i % 10 == 0 then
-        collectgarbage("step", 100)  -- run GC for 100 steps
-    end
-end
-print("After incremental GC:")
-gcStats()
-
--- LuaJIT-specific GC info
+-- ตรวจสอบ compatibility
+local version_info = {}
+version_info.lua_version = _VERSION
+version_info.is_luajit = jit ~= nil
 if jit then
-    print("\n--- LuaJIT GC info ---")
-    -- LuaJIT ใช้ generational GC (different from Lua 5.4)
-    print("LuaJIT uses a non-generational, non-incremental GC")
-    print("GC is stop-the-world but very fast for small heaps")
-    
-    -- จำลอง GC pressure test
-    local gcTimes = {}
-    for trial = 1, 5 do
-        -- สร้าง garbage
-        for _ = 1, 10000 do
-            local _ = {string.rep("z", 50)}
-        end
-        
-        local start = os.clock()
-        collectgarbage("collect")
-        local gcTime = os.clock() - start
-        table.insert(gcTimes, gcTime)
-    end
-    
-    local totalGC = 0
-    for _, t in ipairs(gcTimes) do totalGC = totalGC + t end
-    print(string.format("Average GC time: %.4fs", totalGC / #gcTimes))
+    version_info.luajit_version = jit.version
+    version_info.luajit_arch = jit.arch
+    version_info.jit_on = jit.status()
+end
+
+for k, v in pairs(version_info) do
+    print(string.format("  %-20s = %s", k, tostring(v)))
 end
 ```
 
 ---
 
-## 45.11 Practical LuaJIT Examples
+## แบบฝึกหัด
 
-### ตัวอย่างที่ 21: LuaJIT Data Processing
+**ข้อ 1**: เขียนโปรแกรมใช้ FFI เรียก `clock_gettime` บน Linux เพื่อวัดเวลาแบบ nanosecond precision เปรียบเทียบกับ `os.clock()`
 
-```lua
--- data_processing.lua
+**ข้อ 2**: สร้าง FFI wrapper สำหรับ `zlib` ที่รองรับ `compress` และ `decompress` ข้อมูล ทดสอบกับ string ขนาดต่างๆ
 
-print("=== Data Processing Benchmark ===\n")
+**ข้อ 3**: เขียน matrix multiplication 100x100 สามวิธี: (1) pure Lua, (2) FFI arrays, (3) FFI + BLAS ถ้ามี แล้ว benchmark เปรียบเทียบ
 
--- สร้าง dataset
-local function generateData(n)
-    math.randomseed(42)
-    local data = {}
-    for i = 1, n do
-        data[i] = {
-            id = i,
-            value = math.random() * 1000,
-            category = math.random(1, 5),
-            active = math.random() > 0.3
-        }
-    end
-    return data
-end
+**ข้อ 4**: สร้าง `ffi.metatype` สำหรับ `Mat3x3` (3x3 float matrix) พร้อม methods: `mul`, `transpose`, `determinant`, `inverse`
 
-local N = 100000
-local data = generateData(N)
-print(string.format("Dataset: %d records\n", N))
-
--- Operation 1: Filter
-local function filterActive(data)
-    local result = {}
-    for _, item in ipairs(data) do
-        if item.active then
-            result[#result + 1] = item
-        end
-    end
-    return result
-end
-
--- Operation 2: Map
-local function mapValues(data, fn)
-    local result = {}
-    for i, item in ipairs(data) do
-        result[i] = fn(item)
-    end
-    return result
-end
-
--- Operation 3: Reduce
-local function reduce(data, fn, init)
-    local acc = init
-    for _, item in ipairs(data) do
-        acc = fn(acc, item)
-    end
-    return acc
-end
-
--- Operation 4: Group by
-local function groupBy(data, keyFn)
-    local groups = {}
-    for _, item in ipairs(data) do
-        local key = keyFn(item)
-        if not groups[key] then groups[key] = {} end
-        groups[key][#groups[key] + 1] = item
-    end
-    return groups
-end
-
--- Operation 5: Sort
-local function sortBy(data, compareFn)
-    local copy = {}
-    for i, v in ipairs(data) do copy[i] = v end
-    table.sort(copy, compareFn)
-    return copy
-end
-
--- Benchmark each operation
-local function bench(name, fn)
-    local start = os.clock()
-    local result = fn()
-    local elapsed = os.clock() - start
-    local count = type(result) == "table" and #result or result
-    print(string.format("  %-20s %.4fs  result=%s", name, elapsed, tostring(count)))
-    return result
-end
-
-print("Operations:")
-local active = bench("filter(active)", function()
-    return filterActive(data)
-end)
-
-local values = bench("map(value*2)", function()
-    return mapValues(data, function(item) return item.value * 2 end)
-end)
-
-local total = bench("reduce(sum)", function()
-    return reduce(data, function(acc, item) return acc + item.value end, 0)
-end)
-
-local groups = bench("groupBy(category)", function()
-    return groupBy(data, function(item) return item.category end)
-end)
-
-local sorted = bench("sort(value desc)", function()
-    return sortBy(data, function(a, b) return a.value > b.value end)
-end)
-
--- Pipeline
-print("\nPipeline (filter -> map -> reduce):")
-local start = os.clock()
-
-local filteredData = filterActive(data)
-local mappedData = mapValues(filteredData, function(item)
-    return item.value * (1 + item.category * 0.1)
-end)
-local pipelineResult = reduce(mappedData, function(acc, v) return acc + v end, 0)
-
-local pipelineTime = os.clock() - start
-print(string.format("  Pipeline: %.4fs, result=%.2f", pipelineTime, pipelineResult))
-print(string.format("  Active records: %d / %d", #filteredData, N))
-
--- Category statistics
-print("\nCategory statistics:")
-for cat = 1, 5 do
-    local g = groups[cat]
-    if g then
-        local catTotal = 0
-        for _, item in ipairs(g) do catTotal = catTotal + item.value end
-        print(string.format("  Category %d: %d records, avg=%.2f",
-            cat, #g, catTotal / #g))
-    end
-end
-
-print(string.format("\nTop 3 by value: %.2f, %.2f, %.2f",
-    sorted[1].value, sorted[2].value, sorted[3].value))
-```
+**ข้อ 5**: ใช้ LuaJIT FFI เพื่อสร้าง simple ring buffer สำหรับ audio samples (float array) ที่รองรับ `push`, `pop`, `size` และ lock-free thread safety ด้วย memory barriers
 
 ---
 
-## สรุป
-
-ในบทนี้เราได้เรียนรู้เกี่ยวกับ LuaJIT:
-
-1. **LuaJIT คืออะไร** - Just-In-Time compiler สำหรับ Lua
-2. **ความแตกต่างจาก Lua 5.4** - features, limitations, compatibility
-3. **Performance** - benchmarks และ performance characteristics
-4. **JIT Compilation Process** - tracing, recording, native code
-5. **NYI (Not Yet Implemented)** - สิ่งที่ LuaJIT ยังไม่ JIT compile
-6. **Tracing JIT** - how traces work, side exits, bailouts
-7. **Optimization Tips** - cache globals, type stability, avoid allocations
-8. **FFI Library** - call C without writing wrappers
-9. **FFI Structs** - C data structures in Lua
-10. **When to Use LuaJIT vs Lua 5.4** - decision guide
-11. **Benchmarks** - comprehensive performance comparison
-12. **GC Tuning** - garbage collector settings for LuaJIT
-13. **Data Processing** - practical performance patterns
-
-LuaJIT เป็นเครื่องมือที่ทรงพลังสำหรับงานที่ต้องการ performance สูง โดยเฉพาะงานคำนวณตัวเลขหนัก การเข้าถึง C libraries ผ่าน FFI และการประมวลผลข้อมูลขนาดใหญ่ อย่างไรก็ตาม ควรพิจารณา Lua 5.4 สำหรับโปรเจกต์ที่ต้องการ features ล่าสุดหรือ maximum compatibility
+> **บทถัดไป**: [บทที่ 46: FFI - Foreign Function Interface](part-46.md)
