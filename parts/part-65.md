@@ -1,2231 +1,2301 @@
-# บทที่ 65: Caching Strategies
+# บทที่ 65: CI/CD Pipeline สำหรับ Lua
 
 ## บทนำ
 
-Caching เป็นหนึ่งในเทคนิคที่สำคัญที่สุดในการเพิ่มประสิทธิภาพระบบ โดยการเก็บข้อมูลที่ใช้บ่อยไว้ใน storage ที่เร็วกว่า บทนี้ครอบคลุม cache types, patterns, algorithms และ implementation ใน Lua/OpenResty
+CI/CD (Continuous Integration / Continuous Deployment) คือแนวปฏิบัติที่ช่วยให้ทีม development สามารถ deliver code ได้รวดเร็ว มั่นคง และอัตโนมัติ ในบทนี้จะครอบคลุมการสร้าง CI/CD pipeline สำหรับ Lua projects โดยใช้ GitHub Actions ตั้งแต่การรัน tests, ตรวจสอบ code quality, สร้าง Docker images, ไปจนถึงการ deploy ไปยัง production
 
-## 1. Cache Types
+---
+
+## 65.1 GitHub Actions สำหรับ Lua Projects
+
+### 65.1.1 โครงสร้าง GitHub Actions
+
+GitHub Actions ใช้ YAML files ใน `.github/workflows/` directory โดยแต่ละ workflow ประกอบด้วย:
+
+- **Events**: สิ่งที่ trigger workflow (push, pull_request, schedule, etc.)
+- **Jobs**: กลุ่มของ steps ที่รันบน runner เดียว
+- **Steps**: คำสั่งแต่ละขั้นตอนใน job
+
+```yaml
+# ตัวอย่างที่ 1: .github/workflows/hello-world.yml - Workflow พื้นฐาน
+name: Hello World Workflow
+
+# กำหนด events ที่ trigger workflow
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:    # รันด้วยมือได้
+
+jobs:
+  greet:
+    name: Greet Job
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Lua
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: "5.4"
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Print Lua version
+      run: |
+        lua -v
+        luarocks --version
+    
+    - name: Run simple Lua script
+      run: |
+        lua -e "print('Hello from GitHub Actions!')"
+        lua -e "print('Lua version: ' .. _VERSION)"
+```
+
+### 65.1.2 Workflow สำหรับ Lua Library
+
+```yaml
+# ตัวอย่างที่ 2: .github/workflows/library-ci.yml - CI สำหรับ Lua library
+name: Lua Library CI
+
+on:
+  push:
+    branches: [main, develop, 'feature/**', 'hotfix/**']
+  pull_request:
+    branches: [main, develop]
+
+# ใช้ concurrency เพื่อยกเลิก runs เก่าเมื่อ push ใหม่
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LUA_VERSION: "5.4"
+  LUAROCKS_VERSION: "3.9.2"
+
+jobs:
+  # Job 1: ตรวจสอบ syntax และ style
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Lua
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: ${{ env.LUA_VERSION }}
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Install luacheck
+      run: luarocks install luacheck
+    
+    - name: Run luacheck
+      run: |
+        luacheck src/ --codes --ranges \
+          --globals ngx cjson redis \
+          --max-line-length 120 \
+          --ignore 212 213  # unused self/vararg
+    
+    - name: Check formatting (StyLua)
+      run: |
+        # Download StyLua
+        curl -sL https://github.com/JohnnyMorganz/StyLua/releases/latest/download/stylua-linux-x86_64.zip -o stylua.zip
+        unzip stylua.zip
+        chmod +x stylua
+        
+        # ตรวจสอบว่า code formatting ถูกต้อง
+        ./stylua --check src/ spec/
+```
+
+---
+
+## 65.2 Testing ด้วย Busted ใน CI
+
+### 65.2.1 Busted Test Runner
+
+Busted คือ test framework สำหรับ Lua ที่มีความสามารถสูง รองรับ BDD-style tests
+
+```yaml
+# ตัวอย่างที่ 3: .github/workflows/test.yml - Test workflow
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    name: Test on Lua ${{ matrix.lua-version }}
+    runs-on: ubuntu-latest
+    
+    # Matrix testing: ทดสอบกับ Lua versions หลาย version
+    strategy:
+      fail-fast: false
+      matrix:
+        lua-version: ["5.1", "5.2", "5.3", "5.4", "luajit-2.1"]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Lua ${{ matrix.lua-version }}
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: ${{ matrix.lua-version }}
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    # Cache LuaRocks dependencies เพื่อเพิ่มความเร็ว
+    - name: Cache LuaRocks
+      uses: actions/cache@v4
+      with:
+        path: ~/.luarocks
+        key: ${{ runner.os }}-lua${{ matrix.lua-version }}-${{ hashFiles('*.rockspec') }}
+        restore-keys: |
+          ${{ runner.os }}-lua${{ matrix.lua-version }}-
+    
+    - name: Install dependencies
+      run: |
+        luarocks install --only-deps myproject-dev-1.rockspec
+        luarocks install busted
+        luarocks install luacov
+        luarocks install busted-htest  # HTML test reporter
+    
+    - name: Run tests
+      run: |
+        busted spec/ \
+          --coverage \
+          --output=TAP \
+          --verbose \
+          2>&1 | tee test-results.txt
+      env:
+        LUA_PATH: "./src/?.lua;./src/?/init.lua;$LUA_PATH"
+    
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results-lua${{ matrix.lua-version }}
+        path: test-results.txt
+```
+
+### 65.2.2 Busted Test Files
 
 ```lua
--- Example 1: Understanding cache hierarchy
-local CacheTypes = {}
+-- ตัวอย่างที่ 4: spec/calculator_spec.lua - Busted test file
+-- BDD-style tests สำหรับ calculator module
 
--- L1 Cache: In-process memory (fastest, smallest)
--- - Lua table ใน single process
--- - ngx.ctx (per-request, OpenResty)
--- - เข้าถึงได้แค่ process เดียว
+local Calculator = require "myproject.calculator"
 
--- L2 Cache: Shared memory
--- - ngx.shared.DICT (OpenResty)
--- - shared memory ระหว่าง workers ใน same machine
+describe("Calculator", function()
+    local calc
+    
+    -- Setup ก่อนแต่ละ test
+    before_each(function()
+        calc = Calculator.new()
+    end)
+    
+    -- Teardown หลังจากแต่ละ test
+    after_each(function()
+        calc = nil
+    end)
+    
+    describe("add", function()
+        it("should add two positive numbers", function()
+            assert.equals(5, calc:add(2, 3))
+        end)
+        
+        it("should add negative numbers", function()
+            assert.equals(-1, calc:add(2, -3))
+        end)
+        
+        it("should handle zero", function()
+            assert.equals(0, calc:add(0, 0))
+        end)
+    end)
+    
+    describe("divide", function()
+        it("should divide correctly", function()
+            assert.equals(2, calc:divide(10, 5))
+        end)
+        
+        it("should raise error for division by zero", function()
+            assert.has_error(function()
+                calc:divide(10, 0)
+            end, "Division by zero")
+        end)
+        
+        it("should return float for non-integer division", function()
+            local result = calc:divide(7, 2)
+            assert.near(3.5, result, 0.001)
+        end)
+    end)
+    
+    describe("history", function()
+        it("should track operations", function()
+            calc:add(1, 2)
+            calc:add(3, 4)
+            
+            local history = calc:get_history()
+            assert.equals(2, #history)
+            assert.equals("add(1, 2) = 3", history[1])
+        end)
+        
+        it("should clear history", function()
+            calc:add(1, 2)
+            calc:clear_history()
+            
+            assert.equals(0, #calc:get_history())
+        end)
+    end)
+    
+    -- Async test (สำหรับ LuaJIT/OpenResty)
+    describe("async operations", function()
+        it("should handle async calculation", function(done)
+            calc:async_add(1, 2, function(result)
+                assert.equals(3, result)
+                done()
+            end)
+        end)
+    end)
+end)
+```
 
--- L3 Cache: Distributed cache
--- - Redis, Memcached
--- - ใช้งานร่วมกันได้ทุก process/machine
+### 65.2.3 Mock และ Stub ใน Tests
 
--- CDN Cache: Edge cache
--- - Cloudflare, CloudFront, Fastly
--- - Geographic distribution
+```lua
+-- ตัวอย่างที่ 5: spec/service_spec.lua - Testing with mocks
+local UserService = require "myproject.user_service"
 
--- Application Cache: Custom cache layer
--- - Database query cache
--- - Computed result cache
--- - API response cache
-
--- Performance comparison (approximate latency):
-local latency = {
-    l1_memory  = "< 1ns",     -- L1 CPU cache
-    l2_memory  = "< 5ns",     -- L2/L3 CPU cache
-    ram        = "~100ns",    -- RAM (Lua table)
-    ssd        = "~100μs",    -- SSD
-    redis_local = "< 1ms",   -- Redis local network
-    redis_remote = "< 5ms",  -- Redis remote
-    database   = "1-100ms",  -- Database query
-    http_api   = "10-500ms", -- External API
-    cdn_hit    = "< 10ms",   -- CDN cache hit
+-- Mock object
+local mock_db = {
+    find = function(self, id)
+        if id == 1 then
+            return {id = 1, name = "สมชาย", email = "somchai@test.com"}
+        end
+        return nil
+    end,
+    save = function(self, user)
+        user.id = math.random(1000)
+        return user
+    end,
+    call_count = {find = 0, save = 0}
 }
 
-print("=== Cache Hierarchy ===")
-print("Cache Type       | Latency       | Scope")
-print(string.rep("-", 50))
-print(string.format("%-16s | %-13s | %s", "L1 (Lua table)", "< 1μs", "Process"))
-print(string.format("%-16s | %-13s | %s", "L2 (ngx.shared)", "< 1μs", "Machine"))
-print(string.format("%-16s | %-13s | %s", "Redis (local)", "< 1ms", "Cluster"))
-print(string.format("%-16s | %-13s | %s", "Database", "1-100ms", "Datacenter"))
-print(string.format("%-16s | %-13s | %s", "CDN", "< 10ms", "Global"))
-
--- Simple L1 cache
-local L1Cache = {}
-L1Cache.__index = L1Cache
-
-function L1Cache.new(maxSize, defaultTTL)
-    return setmetatable({
-        data = {},
-        maxSize = maxSize or 1000,
-        defaultTTL = defaultTTL or 300,
-        hits = 0,
-        misses = 0,
-        evictions = 0,
-        order = {}  -- for LRU tracking
-    }, L1Cache)
+-- Spy บน mock
+local original_find = mock_db.find
+mock_db.find = function(self, id)
+    mock_db.call_count.find = mock_db.call_count.find + 1
+    return original_find(self, id)
 end
 
-function L1Cache:get(key)
-    local entry = self.data[key]
-    if not entry then
-        self.misses = self.misses + 1
-        return nil
-    end
+describe("UserService", function()
+    local service
     
-    -- Check TTL
-    if entry.expiresAt and os.time() > entry.expiresAt then
-        self.data[key] = nil
-        self.misses = self.misses + 1
-        return nil
-    end
-    
-    self.hits = self.hits + 1
-    entry.lastAccess = os.time()
-    return entry.value
-end
-
-function L1Cache:set(key, value, ttl)
-    -- Evict if full
-    local size = 0
-    for _ in pairs(self.data) do size = size + 1 end
-    
-    if size >= self.maxSize and not self.data[key] then
-        self:evictLRU()
-    end
-    
-    self.data[key] = {
-        value = value,
-        createdAt = os.time(),
-        lastAccess = os.time(),
-        expiresAt = ttl and (os.time() + ttl) or (os.time() + self.defaultTTL)
-    }
-end
-
-function L1Cache:evictLRU()
-    local oldestTime = math.huge
-    local oldestKey = nil
-    
-    for key, entry in pairs(self.data) do
-        if entry.lastAccess < oldestTime then
-            oldestTime = entry.lastAccess
-            oldestKey = key
-        end
-    end
-    
-    if oldestKey then
-        self.data[oldestKey] = nil
-        self.evictions = self.evictions + 1
-    end
-end
-
-function L1Cache:delete(key)
-    if self.data[key] then
-        self.data[key] = nil
-        return true
-    end
-    return false
-end
-
-function L1Cache:stats()
-    local size = 0
-    for _ in pairs(self.data) do size = size + 1 end
-    local total = self.hits + self.misses
-    return {
-        size = size,
-        maxSize = self.maxSize,
-        hits = self.hits,
-        misses = self.misses,
-        hitRate = total > 0 and (self.hits / total * 100) or 0,
-        evictions = self.evictions
-    }
-end
-
-local cache = L1Cache.new(100, 60)
-cache:set("user:1", {name = "Alice", email = "alice@example.com"})
-cache:set("user:2", {name = "Bob",   email = "bob@example.com"})
-
-local u1 = cache:get("user:1")
-local u2 = cache:get("user:3")  -- miss
-
-local stats = cache:stats()
-print(string.format("\nL1 Cache: hits=%d, misses=%d, hit rate=%.0f%%",
-    stats.hits, stats.misses, stats.hitRate))
-```
-
-## 2. Cache-Aside Pattern
-
-```lua
--- Example 2: Cache-Aside (Lazy Loading)
--- Application ควบคุมการโหลดข้อมูลเข้า cache เอง
--- 1. ตรวจ cache ก่อน
--- 2. Cache miss -> โหลดจาก database
--- 3. บันทึกลง cache
--- 4. Return data
-
-local CacheAside = {}
-CacheAside.__index = CacheAside
-
-function CacheAside.new(cache, dataSource)
-    return setmetatable({
-        cache = cache,
-        dataSource = dataSource,
-        loadTimes = {},
-        totalLoads = 0
-    }, CacheAside)
-end
-
-function CacheAside:get(key, ttl)
-    -- Step 1: Check cache
-    local cached = self.cache:get(key)
-    if cached ~= nil then
-        return cached, "hit"
-    end
-    
-    -- Step 2: Load from data source
-    self.totalLoads = self.totalLoads + 1
-    local start = os.clock()
-    
-    local data, err = self.dataSource:load(key)
-    
-    local elapsed = os.clock() - start
-    self.loadTimes[key] = elapsed
-    
-    if err then
-        return nil, "error", err
-    end
-    
-    if data == nil then
-        return nil, "not_found"
-    end
-    
-    -- Step 3: Store in cache
-    self.cache:set(key, data, ttl)
-    
-    return data, "miss"
-end
-
-function CacheAside:invalidate(key)
-    self.cache:delete(key)
-end
-
-function CacheAside:refresh(key, ttl)
-    -- Force reload from data source
-    self.cache:delete(key)
-    return self:get(key, ttl)
-end
-
--- Simulated database
-local Database = {}
-function Database.new()
-    return {
-        store = {
-            ["user:1"] = {id = 1, name = "Alice", email = "alice@example.com", role = "admin"},
-            ["user:2"] = {id = 2, name = "Bob",   email = "bob@example.com",   role = "user"},
-            ["user:3"] = {id = 3, name = "Carol", email = "carol@example.com", role = "user"},
-            ["product:100"] = {id = 100, name = "Laptop", price = 999.99, stock = 50},
-            ["product:101"] = {id = 101, name = "Phone",  price = 599.99, stock = 100},
-        },
-        queryCount = 0,
-        avgLatency = 0.05  -- 50ms simulated
-    }
-end
-
-function Database:load(key)
-    self.queryCount = self.queryCount + 1
-    -- Simulate latency
-    -- In real code: socket.sleep(self.avgLatency)
-    return self.store[key], nil
-end
-
-function Database:save(key, data)
-    self.store[key] = data
-end
-
--- Test Cache-Aside
-local db = Database.new()
-local l1 = L1Cache.new(100, 300)
-local cacheAside = CacheAside.new(l1, db)
-
-print("\n=== Cache-Aside Pattern ===")
-
--- First access (miss)
-local user, status = cacheAside:get("user:1", 60)
-print(string.format("get user:1 -> %s (%s)", user and user.name or "nil", status))
-
--- Second access (hit)
-user, status = cacheAside:get("user:1", 60)
-print(string.format("get user:1 -> %s (%s)", user and user.name or "nil", status))
-
--- Unknown key
-user, status = cacheAside:get("user:999")
-print(string.format("get user:999 -> %s (%s)", tostring(user), status))
-
--- Multiple keys
-for _, key in ipairs({"user:1", "user:2", "user:3", "user:1", "user:2"}) do
-    local data, s = cacheAside:get(key, 60)
-    print(string.format("  %s: %s (%s)", key, data and data.name or "nil", s))
-end
-
-print(string.format("\nDB queries: %d, Cache stats: hits=%d, misses=%d",
-    db.queryCount,
-    l1:stats().hits,
-    l1:stats().misses
-))
-```
-
-## 3. Write-Through Pattern
-
-```lua
--- Example 3: Write-Through Cache
--- เขียนข้อมูลพร้อมกันทั้ง cache และ database
--- ข้อดี: cache ไม่มี stale data
--- ข้อเสีย: write latency สูงขึ้น
-
-local WriteThrough = {}
-WriteThrough.__index = WriteThrough
-
-function WriteThrough.new(cache, dataStore)
-    return setmetatable({
-        cache = cache,
-        dataStore = dataStore,
-        writeCount = 0,
-        writeLatency = {}
-    }, WriteThrough)
-end
-
-function WriteThrough:write(key, data, ttl)
-    local start = os.clock()
-    
-    -- Write to database FIRST
-    local ok, err = pcall(function()
-        self.dataStore:save(key, data)
+    before_each(function()
+        -- reset call counts
+        mock_db.call_count = {find = 0, save = 0}
+        service = UserService.new(mock_db)
     end)
     
-    if not ok then
-        return false, "Database write failed: " .. tostring(err)
-    end
-    
-    -- Then write to cache
-    self.cache:set(key, data, ttl)
-    
-    self.writeCount = self.writeCount + 1
-    self.writeLatency[#self.writeLatency + 1] = os.clock() - start
-    
-    return true
-end
-
-function WriteThrough:read(key)
-    -- Read from cache first
-    local cached = self.cache:get(key)
-    if cached then return cached, "hit" end
-    
-    -- Load from DB on miss
-    local data = self.dataStore:load(key)
-    if data then
-        self.cache:set(key, data)
-    end
-    return data, "miss"
-end
-
-function WriteThrough:delete(key)
-    -- Delete from both
-    self.dataStore:store[key] = nil
-    self.cache:delete(key)
-end
-
-function WriteThrough:avgWriteLatency()
-    if #self.writeLatency == 0 then return 0 end
-    local sum = 0
-    for _, l in ipairs(self.writeLatency) do sum = sum + l end
-    return sum / #self.writeLatency * 1000  -- ms
-end
-
--- Test
-local db2 = Database.new()
-local l1_2 = L1Cache.new(100, 300)
-local wt = WriteThrough.new(l1_2, db2)
-
-print("\n=== Write-Through Pattern ===")
-
--- Write through
-local ok = wt:write("user:10", {id = 10, name = "Dave", email = "dave@test.com"}, 120)
-print("Write user:10:", ok)
-
--- Immediate read (should hit cache)
-local user, status = wt:read("user:10")
-print(string.format("Read user:10: %s (%s)", user and user.name or "nil", status))
-
--- Verify also in DB
-local inDb = db2:load("user:10")
-print("In DB:", inDb and inDb.name or "nil")
-print(string.format("Avg write latency: %.2fms", wt:avgWriteLatency()))
-```
-
-## 4. Write-Behind (Write-Back) Pattern
-
-```lua
--- Example 4: Write-Behind Cache
--- เขียนลง cache ก่อน แล้ว async flush ลง database ทีหลัง
--- ข้อดี: write performance สูงมาก
--- ข้อเสีย: risk of data loss ถ้า crash ก่อน flush
-
-local WriteBehind = {}
-WriteBehind.__index = WriteBehind
-
-function WriteBehind.new(cache, dataStore, options)
-    return setmetatable({
-        cache = cache,
-        dataStore = dataStore,
-        dirtyKeys = {},      -- keys ที่ยังไม่ได้ flush
-        writeQueue = {},     -- queue สำหรับ batch writes
-        flushInterval = options and options.flushInterval or 5,  -- seconds
-        maxQueueSize = options and options.maxQueueSize or 100,
-        lastFlush = os.time(),
-        flushedCount = 0,
-        lostOnCrash = 0  -- hypothetical
-    }, WriteBehind)
-end
-
-function WriteBehind:write(key, data, ttl)
-    -- Write to cache immediately
-    self.cache:set(key, data, ttl)
-    
-    -- Mark as dirty
-    self.dirtyKeys[key] = {
-        data = data,
-        writtenAt = os.time(),
-        attempts = 0
-    }
-    
-    -- Add to write queue
-    table.insert(self.writeQueue, {key = key, data = data, time = os.time()})
-    
-    -- Check if should flush (queue full)
-    if #self.writeQueue >= self.maxQueueSize then
-        print("[WriteBehind] Queue full, flushing...")
-        self:flush()
-    end
-    
-    return true
-end
-
-function WriteBehind:read(key)
-    -- Check cache first
-    local cached = self.cache:get(key)
-    if cached then return cached, "cache_hit" end
-    
-    -- Check dirty queue (not yet in DB)
-    if self.dirtyKeys[key] then
-        return self.dirtyKeys[key].data, "dirty_hit"
-    end
-    
-    -- Load from DB
-    local data = self.dataStore:load(key)
-    if data then self.cache:set(key, data) end
-    return data, "db_hit"
-end
-
-function WriteBehind:flush()
-    if #self.writeQueue == 0 then return 0 end
-    
-    local batch = {}
-    local count = #self.writeQueue
-    
-    -- Dequeue all
-    for _, item in ipairs(self.writeQueue) do
-        batch[item.key] = item.data
-    end
-    self.writeQueue = {}
-    
-    -- Batch write to database
-    local success = true
-    local ok, err = pcall(function()
-        for key, data in pairs(batch) do
-            self.dataStore:save(key, data)
-            self.dirtyKeys[key] = nil
-        end
-    end)
-    
-    if not ok then
-        print("[WriteBehind] Flush failed: " .. tostring(err))
-        -- Re-queue failed items
-        for key, data in pairs(batch) do
-            if self.dirtyKeys[key] then  -- still dirty
-                table.insert(self.writeQueue, {key = key, data = data})
-            end
-        end
-        success = false
-    else
-        self.flushedCount = self.flushedCount + count
-    end
-    
-    self.lastFlush = os.time()
-    return success and count or 0
-end
-
-function WriteBehind:update(dt)
-    -- Call in game loop or timer
-    if os.time() - self.lastFlush >= self.flushInterval then
-        local flushed = self:flush()
-        if flushed > 0 then
-            print(string.format("[WriteBehind] Flushed %d entries to database", flushed))
-        end
-    end
-end
-
-function WriteBehind:stats()
-    return {
-        dirtyKeys = (function() local c = 0; for _ in pairs(self.dirtyKeys) do c = c + 1 end; return c end)(),
-        queueSize = #self.writeQueue,
-        flushed = self.flushedCount,
-        timeSinceFlush = os.time() - self.lastFlush
-    }
-end
-
--- Test
-local db3 = Database.new()
-local l1_3 = L1Cache.new(100, 300)
-local wb = WriteBehind.new(l1_3, db3, {flushInterval = 2, maxQueueSize = 5})
-
-print("\n=== Write-Behind Pattern ===")
-
--- Write multiple items quickly
-for i = 1, 8 do
-    wb:write("item:" .. i, {id = i, value = math.random(100)})
-    print(string.format("  Wrote item:%d (dirty: %d, queue: %d)",
-        i, wb:stats().dirtyKeys, wb:stats().queueSize))
-end
-
--- Flush
-local flushed = wb:flush()
-print(string.format("Flushed: %d items", flushed))
-print("Stats:", wb:stats().dirtyKeys, "dirty keys remaining")
-```
-
-## 5. Read-Through Pattern
-
-```lua
--- Example 5: Read-Through Cache
--- Cache ตัวเองรับผิดชอบโหลดข้อมูลจาก DB
--- Application ไม่รู้จัก DB โดยตรง
-
-local ReadThrough = {}
-ReadThrough.__index = ReadThrough
-
-function ReadThrough.new(dataLoader, options)
-    return setmetatable({
-        data = {},              -- cache store
-        loader = dataLoader,   -- function to load data
-        ttl = options and options.ttl or 300,
-        maxSize = options and options.maxSize or 10000,
-        stats = {hits = 0, misses = 0, loads = 0, errors = 0}
-    }, ReadThrough)
-end
-
-function ReadThrough:get(key, options)
-    options = options or {}
-    local ttl = options.ttl or self.ttl
-    
-    -- Check cache
-    local entry = self.data[key]
-    local now = os.time()
-    
-    if entry and (not entry.expiresAt or now < entry.expiresAt) then
-        self.stats.hits = self.stats.hits + 1
-        return entry.value, nil
-    end
-    
-    -- Load through cache
-    self.stats.misses = self.stats.misses + 1
-    self.stats.loads = self.stats.loads + 1
-    
-    local ok, value = pcall(self.loader, key)
-    
-    if not ok then
-        self.stats.errors = self.stats.errors + 1
-        
-        -- Return stale data if available (stale-while-revalidate)
-        if entry and options.staleOnError then
-            print(string.format("[ReadThrough] Error loading %s, returning stale data", key))
-            return entry.value, "stale"
-        end
-        
-        return nil, value  -- value is error message
-    end
-    
-    if value ~= nil then
-        self:_store(key, value, ttl)
-    end
-    
-    return value, nil
-end
-
-function ReadThrough:_store(key, value, ttl)
-    -- Evict if needed (simple LRU)
-    local size = 0
-    for _ in pairs(self.data) do size = size + 1 end
-    
-    if size >= self.maxSize then
-        -- Remove oldest
-        local oldest, oldestKey = math.huge, nil
-        for k, e in pairs(self.data) do
-            if e.loadedAt < oldest then
-                oldest = e.loadedAt
-                oldestKey = k
-            end
-        end
-        if oldestKey then self.data[oldestKey] = nil end
-    end
-    
-    self.data[key] = {
-        value = value,
-        loadedAt = os.time(),
-        expiresAt = os.time() + ttl
-    }
-end
-
-function ReadThrough:invalidate(key)
-    self.data[key] = nil
-end
-
-function ReadThrough:invalidatePattern(pattern)
-    local removed = 0
-    for key in pairs(self.data) do
-        if key:match(pattern) then
-            self.data[key] = nil
-            removed = removed + 1
-        end
-    end
-    return removed
-end
-
-function ReadThrough:getStats()
-    local total = self.stats.hits + self.stats.misses
-    return {
-        hits = self.stats.hits,
-        misses = self.stats.misses,
-        hitRate = total > 0 and (self.stats.hits / total * 100) or 0,
-        loads = self.stats.loads,
-        errors = self.stats.errors,
-        size = (function() local c = 0; for _ in pairs(self.data) do c = c + 1 end; return c end)()
-    }
-end
-
--- ตัวอย่าง: User profile cache
-local db4 = Database.new()
-
-local userCache = ReadThrough.new(function(key)
-    -- This is the loader function - called on cache miss
-    print("  [DB] Loading: " .. key)
-    local data = db4:load(key)
-    if not data then error("Key not found: " .. key) end
-    return data
-end, {ttl = 120, maxSize = 1000})
-
-print("\n=== Read-Through Pattern ===")
-
--- Access data
-local keys = {"user:1", "user:2", "user:1", "user:3", "user:2", "user:1"}
-for _, key in ipairs(keys) do
-    local data, err = userCache:get(key)
-    if data then
-        print(string.format("  %s: %s (loaded: %s)", key, data.name, err or "fresh"))
-    else
-        print(string.format("  %s: ERROR - %s", key, tostring(err)))
-    end
-end
-
-local st = userCache:getStats()
-print(string.format("\nStats: hits=%d, misses=%d, hit rate=%.0f%%",
-    st.hits, st.misses, st.hitRate))
-```
-
-## 6. Cache Invalidation
-
-```lua
--- Example 6: Cache invalidation strategies
--- "There are only two hard things in Computer Science:
---  cache invalidation and naming things" - Phil Karlton
-
-local CacheInvalidator = {}
-CacheInvalidator.__index = CacheInvalidator
-
-function CacheInvalidator.new(cache)
-    return setmetatable({
-        cache = cache,
-        tags = {},          -- tag -> set of cache keys
-        keyTags = {},       -- key -> set of tags
-        versionCounters = {},  -- key prefix -> version
-    }, CacheInvalidator)
-end
-
--- Tag-based invalidation
-function CacheInvalidator:setWithTags(key, value, ttl, tags)
-    self.cache:set(key, value, ttl)
-    
-    for _, tag in ipairs(tags) do
-        if not self.tags[tag] then
-            self.tags[tag] = {}
-        end
-        self.tags[tag][key] = true
-    end
-    
-    self.keyTags[key] = tags
-end
-
-function CacheInvalidator:invalidateByTag(tag)
-    local keys = self.tags[tag]
-    if not keys then return 0 end
-    
-    local count = 0
-    for key in pairs(keys) do
-        self.cache:delete(key)
-        -- Remove from keyTags
-        if self.keyTags[key] then
-            for i, t in ipairs(self.keyTags[key]) do
-                if t == tag then
-                    -- Don't need to remove from other tag sets here
-                    break
-                end
-            end
-        end
-        count = count + 1
-    end
-    
-    self.tags[tag] = {}
-    return count
-end
-
--- Version-based invalidation (namespace versioning)
-function CacheInvalidator:getVersionedKey(prefix, id)
-    local version = self.versionCounters[prefix] or 1
-    return prefix .. ":" .. version .. ":" .. id
-end
-
-function CacheInvalidator:incrementVersion(prefix)
-    self.versionCounters[prefix] = (self.versionCounters[prefix] or 1) + 1
-    print(string.format("[Invalidation] Version bumped for '%s': v%d",
-        prefix, self.versionCounters[prefix]))
-    return self.versionCounters[prefix]
-end
-
-function CacheInvalidator:setVersioned(prefix, id, value, ttl)
-    local key = self:getVersionedKey(prefix, id)
-    self.cache:set(key, value, ttl)
-    return key
-end
-
-function CacheInvalidator:getVersioned(prefix, id)
-    local key = self:getVersionedKey(prefix, id)
-    return self.cache:get(key)
-end
-
--- Invalidate all keys with prefix (by incrementing version)
-function CacheInvalidator:invalidateNamespace(prefix)
-    return self:incrementVersion(prefix)
-end
-
--- Dependency-based invalidation
-local DependencyCache = {}
-DependencyCache.__index = DependencyCache
-
-function DependencyCache.new(cache)
-    return setmetatable({
-        cache = cache,
-        dependencies = {}  -- key -> list of dependent keys
-    }, DependencyCache)
-end
-
-function DependencyCache:set(key, value, ttl, dependsOn)
-    self.cache:set(key, value, ttl)
-    
-    if dependsOn then
-        for _, depKey in ipairs(dependsOn) do
-            if not self.dependencies[depKey] then
-                self.dependencies[depKey] = {}
-            end
-            self.dependencies[depKey][key] = true
-        end
-    end
-end
-
-function DependencyCache:invalidate(key)
-    self.cache:delete(key)
-    
-    -- Cascade invalidation
-    if self.dependencies[key] then
-        for depKey in pairs(self.dependencies[key]) do
-            print(string.format("  Cascade invalidating: %s (depends on %s)", depKey, key))
-            self:invalidate(depKey)  -- Recursive
-        end
-        self.dependencies[key] = nil
-    end
-end
-
--- ตัวอย่างการใช้งาน
-local baseCache = L1Cache.new(1000, 300)
-local invalidator = CacheInvalidator.new(baseCache)
-local depCache = DependencyCache.new(L1Cache.new(1000, 300))
-
-print("\n=== Cache Invalidation Strategies ===")
-
--- 1. Tag-based
-print("\n1. Tag-based invalidation:")
-invalidator:setWithTags("user:1:profile", {name = "Alice"}, 300, {"user:1", "users"})
-invalidator:setWithTags("user:1:orders", {orders = 5}, 300, {"user:1", "orders"})
-invalidator:setWithTags("user:2:profile", {name = "Bob"}, 300, {"user:2", "users"})
-
-print("Invalidating tag 'user:1':")
-local count = invalidator:invalidateByTag("user:1")
-print("  Invalidated", count, "keys")
-
--- 2. Version-based (namespace invalidation)
-print("\n2. Version-based invalidation:")
-invalidator:setVersioned("products", "100", {name = "Laptop", price = 999})
-invalidator:setVersioned("products", "101", {name = "Phone",  price = 599})
-
-local p = invalidator:getVersioned("products", "100")
-print("Get product:100:", p and p.name or "nil")
-
--- Invalidate ALL products at once (just bump version)
-invalidator:invalidateNamespace("products")
-local p2 = invalidator:getVersioned("products", "100")
-print("After namespace invalidation:", p2 and p2.name or "nil (gone)")
-
--- 3. Dependency-based
-print("\n3. Dependency-based invalidation:")
-depCache:set("user:1", {name = "Alice"}, 300)
-depCache:set("user:1:posts", {posts = 10}, 300, {"user:1"})
-depCache:set("user:1:summary", {total = 15}, 300, {"user:1", "user:1:posts"})
-
-print("Cache has user:1:", depCache.cache:get("user:1") ~= nil)
-print("Cache has user:1:summary:", depCache.cache:get("user:1:summary") ~= nil)
-
-print("Invalidating user:1 (cascade):")
-depCache:invalidate("user:1")
-print("Cache has user:1:summary after:", depCache.cache:get("user:1:summary") ~= nil)
-```
-
-## 7. TTL Strategies
-
-```lua
--- Example 7: TTL (Time-To-Live) strategies
-local TTLStrategy = {}
-
--- Static TTL: คงที่ ง่ายที่สุด
-function TTLStrategy.static(seconds)
-    return function(key, data) return seconds end
-end
-
--- Dynamic TTL: คำนวณจากข้อมูล
-function TTLStrategy.dynamic(fn)
-    return function(key, data) return fn(key, data) end
-end
-
--- Jittered TTL: สุ่ม offset เพื่อกระจาย expiration
--- ป้องกัน thundering herd เมื่อ cache expire พร้อมกัน
-function TTLStrategy.jittered(baseTTL, jitterPercent)
-    jitterPercent = jitterPercent or 0.1  -- 10% jitter
-    return function(key, data)
-        local jitter = baseTTL * jitterPercent
-        return baseTTL + (math.random() * jitter * 2 - jitter)
-    end
-end
-
--- Sliding TTL: ต่ออายุเมื่อมีการเข้าถึง
-local SlidingTTLCache = {}
-SlidingTTLCache.__index = SlidingTTLCache
-
-function SlidingTTLCache.new(maxIdleTime)
-    return setmetatable({
-        data = {},
-        maxIdleTime = maxIdleTime or 300,  -- reset TTL on access
-        absoluteTTL = maxIdleTime * 10     -- absolute max TTL
-    }, SlidingTTLCache)
-end
-
-function SlidingTTLCache:get(key)
-    local entry = self.data[key]
-    if not entry then return nil end
-    
-    local now = os.time()
-    
-    -- Check absolute TTL
-    if now > entry.createdAt + self.absoluteTTL then
-        self.data[key] = nil
-        return nil
-    end
-    
-    -- Check idle TTL
-    if now > entry.lastAccess + self.maxIdleTime then
-        self.data[key] = nil
-        return nil
-    end
-    
-    -- Extend TTL on access (sliding window)
-    entry.lastAccess = now
-    return entry.value
-end
-
-function SlidingTTLCache:set(key, value)
-    self.data[key] = {
-        value = value,
-        createdAt = os.time(),
-        lastAccess = os.time()
-    }
-end
-
--- Stale-While-Revalidate
-local StaleWhileRevalidate = {}
-StaleWhileRevalidate.__index = StaleWhileRevalidate
-
-function StaleWhileRevalidate.new(loader, freshTTL, staleTTL)
-    return setmetatable({
-        data = {},
-        loader = loader,
-        freshTTL = freshTTL or 60,    -- fresh for 60s
-        staleTTL = staleTTL or 3600,  -- stale ok for 1 hour
-        revalidating = {}              -- keys being revalidated
-    }, StaleWhileRevalidate)
-end
-
-function StaleWhileRevalidate:get(key)
-    local entry = self.data[key]
-    local now = os.time()
-    
-    if not entry then
-        -- No cache, load synchronously
-        local value = self.loader(key)
-        if value then
-            self.data[key] = {
-                value = value,
-                loadedAt = now
-            }
-        end
-        return value, "miss"
-    end
-    
-    local age = now - entry.loadedAt
-    
-    if age < self.freshTTL then
-        -- Fresh: return immediately
-        return entry.value, "fresh"
-    elseif age < self.staleTTL then
-        -- Stale: return stale data, revalidate in background
-        if not self.revalidating[key] then
-            self.revalidating[key] = true
-            print(string.format("[SWR] Returning stale data for '%s', revalidating async...", key))
+    describe("get_user", function()
+        it("should return user when found", function()
+            local user = service:get_user(1)
             
-            -- Async revalidation (simulate)
-            -- In real code: use coroutine, ngx.timer, or goroutine
-            local newValue = self.loader(key)
-            if newValue then
-                self.data[key] = {value = newValue, loadedAt = os.time()}
-                print(string.format("[SWR] '%s' revalidated", key))
-            end
-            self.revalidating[key] = nil
-        end
-        return entry.value, "stale"
+            assert.is_not_nil(user)
+            assert.equals("สมชาย", user.name)
+            assert.equals(1, mock_db.call_count.find)
+        end)
+        
+        it("should return nil when not found", function()
+            local user = service:get_user(999)
+            assert.is_nil(user)
+        end)
+        
+        it("should validate input", function()
+            assert.has_error(function()
+                service:get_user(-1)
+            end)
+            
+            assert.has_error(function()
+                service:get_user("not_a_number")
+            end)
+        end)
+    end)
+    
+    describe("create_user", function()
+        it("should create and return new user with id", function()
+            local new_user = service:create_user({
+                name = "สมหญิง",
+                email = "somying@test.com"
+            })
+            
+            assert.is_not_nil(new_user.id)
+            assert.equals("สมหญิง", new_user.name)
+        end)
+        
+        it("should validate required fields", function()
+            -- Missing name
+            assert.has_error(function()
+                service:create_user({email = "test@test.com"})
+            end, "name is required")
+            
+            -- Missing email
+            assert.has_error(function()
+                service:create_user({name = "Test"})
+            end, "email is required")
+            
+            -- Invalid email format
+            assert.has_error(function()
+                service:create_user({name = "Test", email = "not-an-email"})
+            end, "invalid email format")
+        end)
+    end)
+end)
+```
+
+---
+
+## 65.3 Luacheck ใน Pipeline
+
+### 65.3.1 Configuration ของ Luacheck
+
+```lua
+-- ตัวอย่างที่ 6: .luacheckrc - Luacheck configuration file
+-- Configuration สำหรับ luacheck static analyzer
+
+-- Standard globals ที่อนุญาต
+std = "lua54"
+
+-- Global variables ที่กำหนดเพิ่มเติม
+globals = {
+    -- OpenResty globals
+    "ngx",
+    "ndk",
+    -- Testing globals (Busted)
+    "describe",
+    "it",
+    "before_each",
+    "after_each",
+    "before_all",
+    "after_all",
+    "assert",
+    "spy",
+    "stub",
+    "mock",
+    "pending",
+    "done"
+}
+
+-- ปิด warnings บางอย่าง
+ignore = {
+    "212",  -- Unused argument self
+    "213",  -- Unused loop variable
+}
+
+-- ไม่ตรวจสอบ files เหล่านี้
+exclude_files = {
+    "spec/fixtures/**",
+    "vendor/**",
+    "*.min.lua"
+}
+
+-- กำหนด max line length
+max_line_length = 120
+max_string_line_length = 160
+
+-- ตั้งค่าตามแต่ละ file pattern
+files["spec/**"] = {
+    -- ใน test files อนุญาต globals เพิ่มเติม
+    globals = {"assert", "describe", "it", "before_each", "after_each"},
+    ignore = {"211"}  -- อนุญาต unused variables ใน test files
+}
+
+files["src/migrations/**"] = {
+    -- Migration files อาจมี unused globals
+    ignore = {"111", "112"}
+}
+```
+
+### 65.3.2 Luacheck ใน GitHub Actions
+
+```yaml
+# ตัวอย่างที่ 7: .github/workflows/quality.yml - Code quality checks
+name: Code Quality
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  luacheck:
+    name: Static Analysis (luacheck)
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Lua
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: "5.4"
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Install luacheck
+      run: luarocks install luacheck
+    
+    - name: Run luacheck
+      id: luacheck
+      run: |
+        luacheck src/ spec/ \
+          --formatter TAP \
+          --codes \
+          --ranges \
+          2>&1 | tee luacheck-results.txt
+        
+        # สร้าง summary
+        echo "## Luacheck Results" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        cat luacheck-results.txt >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+    
+    - name: Upload luacheck results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: luacheck-results
+        path: luacheck-results.txt
+    
+    - name: Check for critical issues
+      run: |
+        # Fail ถ้ามี errors (ไม่ใช่แค่ warnings)
+        luacheck src/ spec/ --quiet --no-warnings
+```
+
+---
+
+## 65.4 Code Coverage ด้วย LuaCov
+
+### 65.4.1 LuaCov Configuration
+
+```lua
+-- ตัวอย่างที่ 8: .luacov - LuaCov configuration
+-- LuaCov configuration file
+
+return {
+    -- ไฟล์ที่ต้องการ coverage
+    include = {
+        "src/.*",
+    },
+    
+    -- ไฟล์ที่ไม่ต้องการ coverage
+    exclude = {
+        "spec/.*",
+        "vendor/.*",
+        ".*/init%.lua$",  -- Skip init files
+    },
+    
+    -- Output file
+    statsfile = "luacov.stats.out",
+    
+    -- Report file
+    reportfile = "luacov.report.out",
+    
+    -- Threshold สำหรับ fail (%)
+    -- ถ้า coverage ต่ำกว่านี้จะถือว่า fail
+    -- (ใช้ใน CI script ไม่ใช่ config โดยตรง)
+    threshold = 80
+}
+```
+
+### 65.4.2 Coverage ใน GitHub Actions
+
+```yaml
+# ตัวอย่างที่ 9: coverage section ใน CI workflow
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: test   # รันหลังจาก test ผ่านแล้ว
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Lua
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: "5.4"
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Install dependencies
+      run: |
+        luarocks install busted
+        luarocks install luacov
+        luarocks install luacov-reporter-lcov  # LCOV format สำหรับ Codecov
+    
+    - name: Run tests with coverage
+      run: |
+        busted spec/ \
+          --coverage \
+          -c luacov.lua  # ใช้ custom coverage config
+      env:
+        LUA_PATH: "./src/?.lua;$LUA_PATH"
+    
+    - name: Generate coverage report
+      run: |
+        lua -e "require('luacov.reporter').report()"
+        
+        # แสดง summary
+        cat luacov.report.out
+        
+        # ตรวจสอบ coverage threshold
+        COVERAGE=$(grep -E "^Total" luacov.report.out | awk '{print $NF}' | tr -d '%')
+        echo "Coverage: ${COVERAGE}%"
+        
+        if [ $(echo "$COVERAGE < 80" | bc) -eq 1 ]; then
+          echo "Coverage ${COVERAGE}% is below threshold of 80%"
+          exit 1
+        fi
+    
+    - name: Convert to LCOV format
+      run: |
+        lua -e "require('luacov.reporter.lcov').report()"
+        mv luacov.report.lcov coverage.lcov
+    
+    - name: Upload to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: coverage.lcov
+        flags: lua
+        name: lua-coverage
+        token: ${{ secrets.CODECOV_TOKEN }}
+    
+    - name: Upload coverage artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: |
+          luacov.report.out
+          coverage.lcov
+```
+
+---
+
+## 65.5 Semantic Versioning
+
+### 65.5.1 Version Management
+
+```bash
+# ตัวอย่างที่ 10: scripts/version.sh - Version management script
+#!/bin/bash
+set -e
+
+# อ่าน current version จาก rockspec หรือ version file
+get_current_version() {
+    if [ -f "VERSION" ]; then
+        cat VERSION
+    elif ls *.rockspec 1> /dev/null 2>&1; then
+        grep -m1 'version = ' *.rockspec | sed "s/.*version = '\(.*\)'.*/\1/"
     else
-        -- Too stale: must reload
-        self.data[key] = nil
-        local value = self.loader(key)
-        if value then
-            self.data[key] = {value = value, loadedAt = now}
-        end
-        return value, "expired"
-    end
-end
+        echo "0.0.0"
+    fi
+}
 
--- ตัวอย่าง TTL strategies
-print("\n=== TTL Strategies Demo ===")
+# Parse version components
+parse_version() {
+    local version=$1
+    IFS='.' read -r MAJOR MINOR PATCH <<< "$version"
+    echo "$MAJOR $MINOR $PATCH"
+}
 
--- Jittered TTL
-local jitter = TTLStrategy.jittered(300, 0.2)
-print("Jittered TTL samples:")
-for i = 1, 5 do
-    local ttl = jitter("key", {})
-    print(string.format("  %.0fs", ttl))
-end
+# Bump version
+bump_version() {
+    local bump_type=$1  # major, minor, patch
+    local current=$(get_current_version)
+    read MAJOR MINOR PATCH <<< $(parse_version "$current")
+    
+    case $bump_type in
+        major)
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+            ;;
+        minor)
+            MINOR=$((MINOR + 1))
+            PATCH=0
+            ;;
+        patch)
+            PATCH=$((PATCH + 1))
+            ;;
+        *)
+            echo "Usage: $0 bump [major|minor|patch]"
+            exit 1
+            ;;
+    esac
+    
+    local new_version="${MAJOR}.${MINOR}.${PATCH}"
+    echo "$new_version"
+}
 
--- Sliding TTL cache
-local sliding = SlidingTTLCache.new(10)  -- 10s idle timeout
-sliding:set("session:abc123", {userId = 1, data = "..."})
-print("\nSliding TTL - get session:", sliding:get("session:abc123") ~= nil)
+# อัปเดต version ใน files ต่าง ๆ
+update_version_files() {
+    local new_version=$1
+    
+    # อัปเดต VERSION file
+    echo "$new_version" > VERSION
+    
+    # อัปเดต rockspec
+    for rockspec in *.rockspec; do
+        if [ -f "$rockspec" ]; then
+            sed -i "s/version = '[0-9]*\.[0-9]*\.[0-9]*'/version = '$new_version'/" "$rockspec"
+            
+            # Rename rockspec file
+            local name=$(echo "$rockspec" | sed 's/-[0-9].*\.rockspec//')
+            mv "$rockspec" "${name}-${new_version}-1.rockspec"
+        fi
+    done
+    
+    # อัปเดต version ใน main Lua file
+    if [ -f "src/init.lua" ]; then
+        sed -i "s/_VERSION = '[0-9]*\.[0-9]*\.[0-9]*'/_VERSION = '$new_version'/" src/init.lua
+    fi
+    
+    echo "Updated version to $new_version"
+}
 
--- SWR
-local counter = 0
-local swrCache = StaleWhileRevalidate.new(
-    function(key)
-        counter = counter + 1
-        print(string.format("  [Loader] Loading %s (call #%d)", key, counter))
-        return {value = counter, key = key}
-    end,
-    5,   -- fresh for 5 seconds
-    60   -- stale ok for 60 seconds
-)
-
-print("\nStale-While-Revalidate:")
-local v, status = swrCache:get("data:1")
-print("First get:", v and v.value, status)
-v, status = swrCache:get("data:1")
-print("Second get:", v and v.value, status)
+# Main
+case "$1" in
+    get)
+        get_current_version
+        ;;
+    bump)
+        new_version=$(bump_version "$2")
+        update_version_files "$new_version"
+        ;;
+    set)
+        update_version_files "$2"
+        ;;
+    *)
+        echo "Usage: $0 [get|bump|set] [major|minor|patch|version]"
+        exit 1
+        ;;
+esac
 ```
 
-## 8. Cache Stampede Prevention
+### 65.5.2 Conventional Commits สำหรับ Auto-versioning
+
+```yaml
+# ตัวอย่างที่ 11: .github/workflows/release.yml - Automatic release
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # ต้องการ full history สำหรับ changelog
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Setup Node.js (สำหรับ semantic-release)
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+    
+    - name: Install semantic-release
+      run: |
+        npm install -g \
+          semantic-release \
+          @semantic-release/changelog \
+          @semantic-release/git \
+          @semantic-release/github \
+          @semantic-release/exec
+    
+    - name: Setup Lua
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: "5.4"
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Run semantic-release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        LUAROCKS_API_KEY: ${{ secrets.LUAROCKS_API_KEY }}
+      run: npx semantic-release
+```
+
+### 65.5.3 .releaserc.json Configuration
+
+```json
+{
+  "branches": ["main"],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/changelog",
+      {
+        "changelogFile": "CHANGELOG.md"
+      }
+    ],
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "scripts/version.sh set ${nextRelease.version}",
+        "publishCmd": "luarocks upload *.rockspec --api-key=${LUAROCKS_API_KEY}"
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["CHANGELOG.md", "VERSION", "*.rockspec", "src/init.lua"],
+        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+      }
+    ],
+    "@semantic-release/github"
+  ]
+}
+```
+
+---
+
+## 65.6 Automatic Release ไปยัง LuaRocks
+
+### 65.6.1 Rockspec สำหรับ LuaRocks
 
 ```lua
--- Example 8: Cache stampede / thundering herd prevention
--- เกิดเมื่อ cache expire และ requests หลายตัวพยายาม rebuild พร้อมกัน
+-- ตัวอย่างที่ 12: myproject-1.0.0-1.rockspec - LuaRocks package spec
+package = "myproject"
+version = "1.0.0-1"
+source = {
+   url = "git+https://github.com/username/myproject.git",
+   tag = "v1.0.0"
+}
+description = {
+   summary = "A useful Lua library",
+   detailed = [[
+      myproject เป็น Lua library สำหรับ...
+      มีความสามารถในการ...
+   ]],
+   homepage = "https://github.com/username/myproject",
+   license = "MIT"
+}
+dependencies = {
+   "lua >= 5.1",
+   "lua-cjson >= 2.1.0",
+   "luasocket >= 3.0"
+}
+build = {
+   type = "builtin",
+   modules = {
+      ["myproject"] = "src/init.lua",
+      ["myproject.utils"] = "src/utils.lua",
+      ["myproject.config"] = "src/config.lua",
+      ["myproject.validator"] = "src/validator.lua"
+   },
+   copy_directories = {
+      "docs"
+   }
+}
+```
 
-local StampedeProtection = {}
-StampedeProtection.__index = StampedeProtection
+### 65.6.2 LuaRocks Upload Workflow
 
--- Probabilistic early expiration (XFetch algorithm)
--- Cache entry "pretends" to expire early with increasing probability
--- เพื่อให้ refresh เกิดก่อน expire จริง
-function StampedeProtection.xFetch(entry, beta)
-    if not entry then return true end  -- definitely expired
-    
-    beta = beta or 1.0  -- higher = earlier refresh
-    
-    local now = os.time()
-    local ttl = entry.expiresAt - now
-    
-    if ttl <= 0 then return true end
-    
-    -- Simulate recomputation time (use actual time in prod)
-    local delta = entry.computeTime or 0.1
-    
-    -- XFetch formula: expire early with probability
-    local shouldRefresh = -delta * beta * math.log(math.random()) > ttl
-    return shouldRefresh
-end
+```yaml
+# ตัวอย่างที่ 13: .github/workflows/publish-luarocks.yml
+name: Publish to LuaRocks
 
--- Mutex-based protection (single reload)
-local MutexCache = {}
-MutexCache.__index = MutexCache
+on:
+  release:
+    types: [published]  # trigger เมื่อ create release
 
-function MutexCache.new(loader, ttl)
-    return setmetatable({
-        cache = {},
-        loader = loader,
-        ttl = ttl or 300,
-        loading = {},   -- keys currently being loaded
-        waiters = {}    -- waiters per key
-    }, MutexCache)
-end
+jobs:
+  publish:
+    name: Publish to LuaRocks
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.release.tag_name }}
+    
+    - name: Setup Lua
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: "5.4"
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Extract version from tag
+      id: version
+      run: |
+        TAG="${{ github.event.release.tag_name }}"
+        VERSION="${TAG#v}"  # ลบ 'v' prefix
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        echo "rockspec=myproject-${VERSION}-1.rockspec" >> $GITHUB_OUTPUT
+    
+    - name: Validate rockspec
+      run: |
+        luarocks lint ${{ steps.version.outputs.rockspec }}
+    
+    - name: Upload to LuaRocks
+      run: |
+        luarocks upload \
+          ${{ steps.version.outputs.rockspec }} \
+          --api-key=${{ secrets.LUAROCKS_API_KEY }}
+    
+    - name: Verify upload
+      run: |
+        sleep 30  # รอให้ LuaRocks อัปเดต
+        luarocks search myproject ${{ steps.version.outputs.version }}
+```
 
-function MutexCache:get(key)
-    local entry = self.cache[key]
-    local now = os.time()
+---
+
+## 65.7 Docker Image Building และ Pushing
+
+### 65.7.1 Docker Build และ Push Workflow
+
+```yaml
+# ตัวอย่างที่ 14: .github/workflows/docker.yml - Docker build and push
+name: Docker Build & Push
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
     
-    if entry and now < entry.expiresAt then
-        return entry.value, "hit"
-    end
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
     
-    -- Check if already loading (prevent stampede)
-    if self.loading[key] then
-        -- Wait for the loading to complete (simplified)
-        print(string.format("  [MutexCache] %s: another thread is loading, waiting...", key))
-        -- In real code: use semaphore, channel, or condition variable
-        -- Here we just return stale or nil
-        if entry then
-            return entry.value, "stale_wait"
-        end
-        return nil, "loading"
-    end
+    steps:
+    - uses: actions/checkout@v4
     
-    -- Start loading
-    self.loading[key] = true
-    local start = os.clock()
+    # Setup Docker Buildx สำหรับ multi-platform builds
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
     
-    local ok, value = pcall(self.loader, key)
+    - name: Set up QEMU (สำหรับ multi-platform)
+      uses: docker/setup-qemu-action@v3
     
-    local computeTime = os.clock() - start
-    self.loading[key] = nil
+    # Login ไปยัง registries
+    - name: Login to GitHub Container Registry
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     
-    if ok and value ~= nil then
-        self.cache[key] = {
-            value = value,
-            expiresAt = now + self.ttl,
-            computeTime = computeTime
-        }
-        return value, "loaded"
+    - name: Login to Docker Hub
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    
+    # สร้าง metadata สำหรับ Docker tags
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          ${{ secrets.DOCKERHUB_USERNAME }}/lua-app
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=semver,pattern={{major}}
+          type=sha,prefix=sha-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    # Build image เพื่อรัน tests ก่อน
+    - name: Build test image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        target: tester
+        load: true  # load ลง local Docker
+        tags: lua-app:test
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Run tests in Docker
+      run: |
+        docker run --rm lua-app:test \
+          busted spec/ --output=TAP
+    
+    # Security scan
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: lua-app:test
+        format: sarif
+        output: trivy-results.sarif
+        severity: HIGH,CRITICAL
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: trivy-results.sarif
+    
+    # Build และ Push production image
+    - name: Build and push production image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        target: production
+        platforms: linux/amd64,linux/arm64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          APP_VERSION=${{ github.ref_name }}
+          BUILD_DATE=${{ github.event.repository.updated_at }}
+          GIT_COMMIT=${{ github.sha }}
+    
+    - name: Inspect image
+      if: github.event_name != 'pull_request'
+      run: |
+        docker buildx imagetools inspect \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+```
+
+---
+
+## 65.8 Integration Testing
+
+### 65.8.1 Integration Test Setup
+
+```yaml
+# ตัวอย่างที่ 15: .github/workflows/integration-tests.yml
+name: Integration Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    
+    services:
+      # Redis service
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      # PostgreSQL service
+      postgres:
+        image: postgres:15-alpine
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Lua
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: "5.4"
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Install dependencies
+      run: |
+        luarocks install busted
+        luarocks install lua-resty-redis  
+        luarocks install luasql-postgres
+        luarocks install http  # Pure Lua HTTP client
+    
+    - name: Run database migrations
+      env:
+        DB_HOST: localhost
+        DB_PORT: 5432
+        DB_NAME: testdb
+        DB_USER: testuser
+        DB_PASSWORD: testpass
+      run: |
+        lua scripts/migrate.lua up
+    
+    - name: Run integration tests
+      env:
+        APP_ENV: test
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
+        DB_HOST: localhost
+        DB_PORT: 5432
+        DB_NAME: testdb
+        DB_USER: testuser
+        DB_PASSWORD: testpass
+      run: |
+        busted spec/integration/ \
+          --output=TAP \
+          --verbose \
+          --tags=integration
+    
+    - name: Run API tests with curl
+      run: |
+        # Start the application
+        nginx -c $(pwd)/nginx.conf -p $(pwd) &
+        sleep 3
+        
+        # Test health endpoint
+        curl -f http://localhost:8080/health || exit 1
+        
+        # Test API endpoints
+        bash spec/api/test_users_api.sh
+        bash spec/api/test_auth_api.sh
+        
+        # Cleanup
+        nginx -s stop
+```
+
+### 65.8.2 API Integration Test Script
+
+```bash
+# ตัวอย่างที่ 16: spec/api/test_users_api.sh - API integration tests
+#!/bin/bash
+set -e
+
+BASE_URL="${API_URL:-http://localhost:8080}"
+PASS=0
+FAIL=0
+
+# Helper functions
+assert_status() {
+    local expected=$1
+    local actual=$2
+    local test_name=$3
+    
+    if [ "$expected" == "$actual" ]; then
+        echo "  [PASS] $test_name (status: $actual)"
+        ((PASS++))
     else
-        return nil, "error"
-    end
-end
+        echo "  [FAIL] $test_name (expected: $expected, got: $actual)"
+        ((FAIL++))
+    fi
+}
 
--- Staggered invalidation (distribute expiration times)
-local function staggeredCache(items, baseTTL, spreadFactor)
-    local cache = {}
-    spreadFactor = spreadFactor or 0.3
+assert_json_field() {
+    local json=$1
+    local field=$2
+    local expected=$3
+    local test_name=$4
     
-    for i, item in ipairs(items) do
-        -- Spread expiration over a range
-        local ttlSpread = baseTTL * spreadFactor
-        local ttl = baseTTL + (i / #items * ttlSpread)
-        cache[item.key] = {
-            value = item.value,
-            expiresAt = os.time() + ttl
-        }
-    end
+    local actual=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$field',''))")
     
-    return cache
-end
+    if [ "$expected" == "$actual" ]; then
+        echo "  [PASS] $test_name (field '$field': $actual)"
+        ((PASS++))
+    else
+        echo "  [FAIL] $test_name (expected '$field'='$expected', got '$actual')"
+        ((FAIL++))
+    fi
+}
 
--- Test stampede protection
-print("\n=== Cache Stampede Prevention ===")
+echo "=== API Integration Tests: Users ==="
+echo ""
 
--- XFetch early expiration
-print("XFetch early expiration (beta=1.5, 100 simulations):")
-local refreshCount = 0
-for i = 1, 100 do
-    local entry = {
-        value = "data",
-        expiresAt = os.time() + 5,  -- 5 seconds left
-        computeTime = 0.5  -- 500ms to recompute
-    }
-    if StampedeProtection.xFetch(entry, 1.5) then
-        refreshCount = refreshCount + 1
-    end
-end
-print(string.format("  Would refresh early: %d/100 times", refreshCount))
+# Test 1: Health check
+echo "Test: Health check"
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/health")
+assert_status "200" "$STATUS" "GET /health returns 200"
 
--- Mutex cache
-local loads = 0
-local mutex = MutexCache.new(function(key)
-    loads = loads + 1
-    return {data = key, loadedAt = os.time()}
-end, 30)
+# Test 2: Get all users (empty)
+echo ""
+echo "Test: Get all users"
+RESPONSE=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/users")
+STATUS=$(echo "$RESPONSE" | tail -1)
+BODY=$(echo "$RESPONSE" | head -1)
+assert_status "200" "$STATUS" "GET /api/users returns 200"
 
--- Simulate multiple requests
-print("\nMutex cache:")
-for i = 1, 5 do
-    local val, status = mutex:get("product:100")
-    print(string.format("  Request %d: %s [%s]", i, val and "got data" or "nil", status))
-end
-print("  Total DB loads:", loads)
+# Test 3: Create user
+echo ""
+echo "Test: Create user"
+RESPONSE=$(curl -s -w "\n%{http_code}" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"name":"สมชาย","email":"somchai@test.com"}' \
+    "$BASE_URL/api/users")
+STATUS=$(echo "$RESPONSE" | tail -1)
+BODY=$(echo "$RESPONSE" | head -1)
+assert_status "201" "$STATUS" "POST /api/users returns 201"
+assert_json_field "$BODY" "name" "สมชาย" "Response contains user name"
 
--- Staggered cache
-print("\nStaggered expiration (to prevent mass expiry):")
-local items = {}
-for i = 1, 10 do
-    table.insert(items, {key = "item:" .. i, value = "data " .. i})
-end
-local staggered = staggeredCache(items, 300, 0.2)
-local minTTL, maxTTL = math.huge, 0
-local now = os.time()
-for key, entry in pairs(staggered) do
-    local ttl = entry.expiresAt - now
-    minTTL = math.min(minTTL, ttl)
-    maxTTL = math.max(maxTTL, ttl)
-end
-print(string.format("  TTL spread: %ds - %ds (spread: %ds)",
-    math.floor(minTTL), math.floor(maxTTL), math.floor(maxTTL - minTTL)))
+# Test 4: Validation error
+echo ""
+echo "Test: Validation error"
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"name":"NoEmail"}' \
+    "$BASE_URL/api/users")
+assert_status "422" "$STATUS" "POST /api/users without email returns 422"
+
+# Test 5: Rate limiting
+echo ""
+echo "Test: Rate limiting"
+for i in {1..110}; do
+    curl -s -o /dev/null "$BASE_URL/api/users"
+done
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/users")
+assert_status "429" "$STATUS" "Rate limit returns 429 after threshold"
+
+echo ""
+echo "=== Summary ==="
+echo "Passed: $PASS"
+echo "Failed: $FAIL"
+
+if [ $FAIL -gt 0 ]; then
+    exit 1
+fi
 ```
 
-## 9. Consistent Hashing สำหรับ Distributed Cache
+---
 
-```lua
--- Example 9: Consistent hashing for distributed cache
--- ใช้เมื่อมี cache nodes หลายตัว และต้องการกระจาย keys อย่างสม่ำเสมอ
--- ข้อดี: เมื่อเพิ่ม/ลบ node, กระทบแค่ส่วนหนึ่งของ keys
+## 65.9 Environment Promotion (dev→staging→prod)
 
-local ConsistentHash = {}
-ConsistentHash.__index = ConsistentHash
+### 65.9.1 Multi-Environment Deployment Workflow
 
--- Simple hash function (djb2)
-local function hash(str)
-    local h = 5381
-    for i = 1, #str do
-        h = ((h * 33) ~ string.byte(str, i)) & 0x7FFFFFFF
-    end
-    return h
-end
+```yaml
+# ตัวอย่างที่ 17: .github/workflows/deploy.yml - Multi-environment deployment
+name: Deploy
 
-function ConsistentHash.new(virtualNodes)
-    return setmetatable({
-        ring = {},           -- sorted list of {hash, node}
-        nodes = {},          -- active nodes
-        virtualNodes = virtualNodes or 150  -- virtual replicas per node
-    }, ConsistentHash)
-end
+on:
+  push:
+    branches:
+      - develop    # → staging
+      - main       # → production
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
 
-function ConsistentHash:addNode(node)
-    self.nodes[node] = true
+jobs:
+  # กำหนด environment ที่จะ deploy
+  set-environment:
+    name: Set Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
     
-    -- Add virtual nodes
-    for i = 1, self.virtualNodes do
-        local virtualKey = node .. "#" .. i
-        local h = hash(virtualKey)
-        table.insert(self.ring, {hash = h, node = node})
-    end
-    
-    -- Keep ring sorted
-    table.sort(self.ring, function(a, b) return a.hash < b.hash end)
-    
-    print(string.format("[CH] Added node '%s' (%d virtual nodes, ring size: %d)",
-        node, self.virtualNodes, #self.ring))
-end
-
-function ConsistentHash:removeNode(node)
-    self.nodes[node] = nil
-    
-    -- Remove all virtual nodes for this physical node
-    local newRing = {}
-    for _, entry in ipairs(self.ring) do
-        if entry.node ~= node then
-            table.insert(newRing, entry)
-        end
-    end
-    self.ring = newRing
-    
-    print(string.format("[CH] Removed node '%s' (ring size: %d)", node, #self.ring))
-end
-
-function ConsistentHash:getNode(key)
-    if #self.ring == 0 then return nil end
-    
-    local h = hash(key)
-    
-    -- Binary search for first node >= h
-    local lo, hi = 1, #self.ring
-    while lo < hi do
-        local mid = math.floor((lo + hi) / 2)
-        if self.ring[mid].hash < h then
-            lo = mid + 1
+    steps:
+    - name: Determine environment
+      id: set-env
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+        elif [ "${{ github.ref_name }}" == "main" ]; then
+          echo "environment=production" >> $GITHUB_OUTPUT
         else
-            hi = mid
-        end
-    end
+          echo "environment=staging" >> $GITHUB_OUTPUT
+        fi
+
+  # Deploy ไปยัง Development (auto)
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'develop' || github.event_name == 'pull_request'
+    environment: development
     
-    -- Wrap around
-    if lo > #self.ring then lo = 1 end
+    steps:
+    - uses: actions/checkout@v4
     
-    return self.ring[lo].node
-end
-
-function ConsistentHash:getNodes(key, count)
-    -- Get multiple nodes (for replication)
-    local nodes = {}
-    local seen = {}
+    - name: Deploy to dev cluster
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.DEV_HOST }}
+        username: deploy
+        key: ${{ secrets.DEV_SSH_KEY }}
+        script: |
+          cd /srv/lua-app
+          git pull origin develop
+          docker-compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+          docker-compose exec app nginx -s reload
     
-    local h = hash(key)
-    local lo = 1
+    - name: Run smoke tests on dev
+      run: |
+        sleep 15  # รอให้ deploy เสร็จ
+        curl -f https://dev.example.com/health
+
+  # Deploy ไปยัง Staging (auto after tests)
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'develop'
+    needs: [deploy-dev]
+    environment:
+      name: staging
+      url: https://staging.example.com
     
-    -- Find start position
-    for i, entry in ipairs(self.ring) do
-        if entry.hash >= h then
-            lo = i
-            break
-        end
-    end
+    steps:
+    - uses: actions/checkout@v4
     
-    local pos = lo
-    while #nodes < count do
-        local entry = self.ring[pos]
-        if not seen[entry.node] then
-            table.insert(nodes, entry.node)
-            seen[entry.node] = true
-        end
-        pos = (pos % #self.ring) + 1
-        if pos == lo then break end
-    end
+    - name: Login to registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     
-    return nodes
-end
-
-function ConsistentHash:getDistribution(keys)
-    local dist = {}
-    for node in pairs(self.nodes) do
-        dist[node] = 0
-    end
+    - name: Deploy to staging
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.STAGING_HOST }}
+        username: deploy
+        key: ${{ secrets.STAGING_SSH_KEY }}
+        envs: GITHUB_SHA,GITHUB_REPOSITORY
+        script: |
+          export IMAGE="ghcr.io/${GITHUB_REPOSITORY}:sha-${GITHUB_SHA:0:7}"
+          
+          # Update image ใน docker-compose
+          sed -i "s|image:.*lua-app.*|image: ${IMAGE}|g" /srv/lua-app/docker-compose.yml
+          
+          cd /srv/lua-app
+          docker-compose pull app
+          docker-compose up -d --no-build app
+          
+          # Wait for health check
+          for i in {1..30}; do
+            if curl -sf https://staging.example.com/health; then
+              echo "Deployment successful"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 5
+          done
     
-    for _, key in ipairs(keys) do
-        local node = self:getNode(key)
-        if node then
-            dist[node] = (dist[node] or 0) + 1
-        end
-    end
+    - name: Run staging acceptance tests
+      run: |
+        npm install -g newman
+        newman run spec/postman/acceptance_tests.json \
+          --environment spec/postman/staging_env.json \
+          --reporters cli,junit \
+          --reporter-junit-export staging-test-results.xml
     
-    return dist
-end
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: staging-acceptance-tests
+        path: staging-test-results.xml
 
--- ตัวอย่าง
-local ch = ConsistentHash.new(150)
-
-ch:addNode("cache-1:6379")
-ch:addNode("cache-2:6379")
-ch:addNode("cache-3:6379")
-
-print("\n=== Consistent Hashing ===")
-
--- Distribute 1000 test keys
-local testKeys = {}
-for i = 1, 1000 do
-    table.insert(testKeys, "user:" .. i)
-end
-
-local dist = ch:getDistribution(testKeys)
-print("\nKey distribution (3 nodes, 1000 keys):")
-for node, count in pairs(dist) do
-    print(string.format("  %s: %d keys (%.1f%%)", node, count, count/10))
-end
-
--- Add a node
-print("\nAdding cache-4:")
-ch:addNode("cache-4:6379")
-
--- Check redistribution
-local dist2 = ch:getDistribution(testKeys)
-local moved = 0
-for i, key in ipairs(testKeys) do
-    local newNode = ch:getNode(key)
-    if newNode ~= ch:getNode(key) then  -- simplified
-        -- In real comparison would track original assignment
-    end
-end
-
-print("Distribution after adding node:")
-for node, count in pairs(dist2) do
-    print(string.format("  %s: %d keys (%.1f%%)", node, count, count/10))
-end
-
--- Test replication (get 2 nodes for each key)
-local key = "user:12345"
-local replicas = ch:getNodes(key, 2)
-print(string.format("\nKey '%s' -> nodes: %s", key, table.concat(replicas, ", ")))
+  # Deploy ไปยัง Production (manual approval required)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'main'
+    needs: []
+    environment:
+      name: production
+      url: https://api.example.com
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Notify deployment start
+      uses: slackapi/slack-github-action@v1
+      with:
+        payload: |
+          {
+            "text": "🚀 Starting production deployment for ${{ github.repository }}",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Production Deployment Started*\n• Repo: ${{ github.repository }}\n• Commit: `${{ github.sha }}`\n• By: ${{ github.actor }}"
+                }
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    
+    - name: Deploy to production (Blue/Green)
+      run: |
+        # Deploy to green environment
+        ssh deploy@${{ secrets.PROD_HOST }} << 'EOF'
+          cd /srv/lua-app
+          
+          # Pull new image
+          docker pull ghcr.io/${{ github.repository }}:${{ github.sha }}
+          
+          # Scale up green deployment
+          docker-compose -f docker-compose.green.yml up -d
+          
+          # Wait for green to be healthy
+          for i in {1..60}; do
+            if docker-compose -f docker-compose.green.yml exec app curl -sf http://localhost/health; then
+              echo "Green deployment healthy"
+              break
+            fi
+            sleep 5
+          done
+          
+          # Switch traffic to green
+          nginx -s reload
+          
+          # Scale down blue
+          sleep 30  # drain existing connections
+          docker-compose -f docker-compose.blue.yml down
+        EOF
+    
+    - name: Notify deployment success
+      if: success()
+      uses: slackapi/slack-github-action@v1
+      with:
+        payload: '{"text": "Production deployment successful!"}'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        ssh deploy@${{ secrets.PROD_HOST }} "cd /srv/lua-app && docker-compose -f docker-compose.blue.yml up -d && nginx -s reload"
+        
+        # Notify failure
+        curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+          -d '{"text": "Production deployment FAILED - rolled back!"}'
 ```
 
-## 10. ngx.shared สำหรับ OpenResty Caching
+---
 
-```lua
--- Example 10: OpenResty shared memory cache
--- nginx.conf:
--- lua_shared_dict my_cache 10m;
--- lua_shared_dict cache_locks 1m;
+## 65.10 Complete CI/CD Pipeline
 
-local SharedCache = {}
-SharedCache._VERSION = "1.0"
+### 65.10.1 Full .github/workflows/ci.yml
 
--- ใน OpenResty จริง:
--- local dict = ngx.shared.my_cache
+```yaml
+# ตัวอย่างที่ 18: .github/workflows/ci.yml - Complete CI/CD pipeline
+name: CI/CD Pipeline
 
--- Simulate ngx.shared.DICT for testing
-local function makeSharedDict()
-    local d = {
-        _data = {},
-        _expiry = {},
-        capacity = function(self) return 10 * 1024 * 1024 end,  -- 10MB
-        free_space = function(self)
-            local used = 0
-            for k, v in pairs(self._data) do
-                used = used + #k + #tostring(v)
-            end
-            return 10 * 1024 * 1024 - used
-        end
-    }
+on:
+  push:
+    branches: [main, develop, 'feature/**', 'hotfix/**', 'release/**']
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # รัน full test suite ทุกวันจันทร์เวลา 2:00 (UTC)
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests (emergency deploy)'
+        required: false
+        default: 'false'
+        type: boolean
+      deploy_env:
+        description: 'Force deploy to environment'
+        required: false
+        type: choice
+        options: ['', 'staging', 'production']
+
+# Concurrency: ยกเลิก run เก่าสำหรับ branch เดียวกัน
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Default permissions (principle of least privilege)
+permissions:
+  contents: read
+
+env:
+  LUA_VERSION: "5.4"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================================
+  # STAGE 1: Code Quality
+  # ============================================================
+  
+  lint:
+    name: Lint & Style Check
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_tests }}
     
-    function d:get(key)
-        if self._expiry[key] and os.time() > self._expiry[key] then
-            self._data[key] = nil
-            self._expiry[key] = nil
-            return nil, nil  -- (value, flags)
-        end
-        return self._data[key], 0
-    end
+    steps:
+    - uses: actions/checkout@v4
     
-    function d:set(key, value, exptime, flags)
-        self._data[key] = value
-        if exptime and exptime > 0 then
-            self._expiry[key] = os.time() + exptime
+    - name: Setup Lua
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: ${{ env.LUA_VERSION }}
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Cache LuaRocks
+      uses: actions/cache@v4
+      with:
+        path: ~/.luarocks
+        key: ${{ runner.os }}-luarocks-${{ hashFiles('*.rockspec') }}
+    
+    - name: Install luacheck
+      run: luarocks install luacheck
+    
+    - name: Run luacheck
+      run: |
+        luacheck src/ spec/ \
+          --codes --ranges \
+          --formatter TAP \
+          --max-line-length 120
+    
+    - name: Check YAML syntax
+      uses: ibiqlik/action-yamllint@v3
+      with:
+        file_or_dir: .github/
+        config_data: |
+          extends: default
+          rules:
+            line-length:
+              max: 160
+    
+    - name: Lint Dockerfile
+      uses: hadolint/hadolint-action@v3.1.0
+      with:
+        dockerfile: Dockerfile
+        failure-threshold: warning
+  
+  # ============================================================
+  # STAGE 2: Tests
+  # ============================================================
+  
+  unit-tests:
+    name: Unit Tests (Lua ${{ matrix.lua-version }})
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_tests }}
+    needs: lint
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        lua-version: ["5.1", "5.4", "luajit-2.1"]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Lua ${{ matrix.lua-version }}
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: ${{ matrix.lua-version }}
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Cache LuaRocks
+      uses: actions/cache@v4
+      with:
+        path: ~/.luarocks
+        key: ${{ runner.os }}-lua${{ matrix.lua-version }}-${{ hashFiles('*.rockspec') }}
+    
+    - name: Install dependencies
+      run: |
+        luarocks install --only-deps *.rockspec
+        luarocks install busted
+        luarocks install luacov
+    
+    - name: Run unit tests
+      run: |
+        busted spec/unit/ \
+          --coverage \
+          --output=TAP \
+          --verbose \
+          2>&1 | tee unit-test-results.txt
+      env:
+        LUA_PATH: "./src/?.lua;./src/?/init.lua;$LUA_PATH"
+    
+    - name: Generate coverage report
+      run: |
+        lua -e "require('luacov.reporter').report()"
+        cat luacov.report.out
+    
+    - name: Check coverage threshold
+      run: |
+        COVERAGE=$(grep "^Total" luacov.report.out | grep -oP '\d+\.\d+(?=%)' | tail -1)
+        echo "Coverage: ${COVERAGE}%"
+        if awk "BEGIN {exit !($COVERAGE < 75)}"; then
+          echo "::error::Coverage ${COVERAGE}% is below threshold of 75%"
+          exit 1
+        fi
+    
+    - name: Upload test artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: unit-test-results-lua${{ matrix.lua-version }}
+        path: |
+          unit-test-results.txt
+          luacov.report.out
+  
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_tests }}
+    needs: lint
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+      
+      postgres:
+        image: postgres:15-alpine
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Lua
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: ${{ env.LUA_VERSION }}
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Install dependencies
+      run: |
+        luarocks install --only-deps *.rockspec
+        luarocks install busted
+    
+    - name: Run integration tests
+      env:
+        APP_ENV: test
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
+        DB_HOST: localhost
+        DB_PORT: 5432
+        DB_NAME: testdb
+        DB_USER: testuser
+        DB_PASSWORD: testpass
+      run: |
+        busted spec/integration/ --tags=integration --output=TAP
+    
+    - name: Upload integration test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: integration-test-results
+        path: integration-test-results.txt
+  
+  # ============================================================
+  # STAGE 3: Security Scan
+  # ============================================================
+  
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    permissions:
+      security-events: write
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run Semgrep
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: >-
+          p/lua
+          p/owasp-top-ten
+    
+    - name: Scan secrets
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: ${{ github.event.repository.default_branch }}
+  
+  # ============================================================
+  # STAGE 4: Build Docker Image
+  # ============================================================
+  
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    permissions:
+      contents: read
+      packages: write
+    
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_tag: ${{ steps.meta.outputs.version }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to GHCR
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+          type=sha,prefix=sha-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        target: production
+        platforms: linux/amd64,linux/arm64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+  
+  # ============================================================
+  # STAGE 5: Deploy
+  # ============================================================
+  
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, security]
+    if: github.ref_name == 'develop' || (github.event_name == 'workflow_dispatch' && inputs.deploy_env == 'staging')
+    environment:
+      name: staging
+      url: https://staging.example.com
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to staging
+      uses: appleboy/ssh-action@v1
+      env:
+        IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+      with:
+        host: ${{ secrets.STAGING_HOST }}
+        username: deploy
+        key: ${{ secrets.STAGING_SSH_KEY }}
+        envs: IMAGE_TAG,REGISTRY,IMAGE_NAME
+        script: |
+          export IMAGE="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+          cd /srv/lua-app
+          docker pull "$IMAGE"
+          docker-compose up -d --no-build
+    
+    - name: Run smoke tests
+      run: |
+        sleep 20
+        curl -f https://staging.example.com/health
+    
+    - name: Run acceptance tests
+      run: |
+        curl -sf https://staging.example.com/api/users
+  
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, security, deploy-staging]
+    if: |
+      github.ref_name == 'main' || 
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy_env == 'production')
+    environment:
+      name: production
+      url: https://api.example.com
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to production
+      uses: appleboy/ssh-action@v1
+      env:
+        IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+      with:
+        host: ${{ secrets.PROD_HOST }}
+        username: deploy
+        key: ${{ secrets.PROD_SSH_KEY }}
+        envs: IMAGE_TAG,REGISTRY,IMAGE_NAME
+        script: |
+          export IMAGE="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+          cd /srv/lua-app
+          docker pull "$IMAGE"
+          docker-compose up -d --no-build
+    
+    - name: Verify production health
+      run: |
+        for i in {1..12}; do
+          if curl -sf https://api.example.com/health; then
+            echo "Production is healthy"
+            exit 0
+          fi
+          echo "Waiting for production... ($i/12)"
+          sleep 10
+        done
+        echo "Production health check failed!"
+        exit 1
+```
+
+---
+
+## 65.11 Advanced CI/CD Patterns
+
+### 65.11.1 Reusable Workflows
+
+```yaml
+# ตัวอย่างที่ 19: .github/workflows/reusable-test.yml - Reusable workflow
+name: Reusable Test Workflow
+
+on:
+  workflow_call:
+    inputs:
+      lua-version:
+        required: true
+        type: string
+      run-coverage:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      codecov-token:
+        required: false
+    outputs:
+      coverage:
+        description: "Coverage percentage"
+        value: ${{ jobs.test.outputs.coverage }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      coverage: ${{ steps.coverage.outputs.percent }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Lua ${{ inputs.lua-version }}
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: ${{ inputs.lua-version }}
+    
+    - name: Setup LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+    
+    - name: Install and run tests
+      run: |
+        luarocks install busted
+        luarocks install luacov
+        busted spec/ --coverage
+    
+    - name: Get coverage
+      id: coverage
+      if: ${{ inputs.run-coverage }}
+      run: |
+        lua -e "require('luacov.reporter').report()"
+        COVERAGE=$(grep "^Total" luacov.report.out | grep -oP '\d+\.\d+(?=%)' | tail -1)
+        echo "percent=${COVERAGE}" >> $GITHUB_OUTPUT
+```
+
+### 65.11.2 Composite Actions
+
+```yaml
+# ตัวอย่างที่ 20: .github/actions/setup-lua/action.yml - Composite action
+name: Setup Lua Environment
+description: Sets up Lua with LuaRocks and common packages
+
+inputs:
+  lua-version:
+    description: Lua version to install
+    required: false
+    default: '5.4'
+  install-busted:
+    description: Install Busted test framework
+    required: false
+    default: 'true'
+  install-luacheck:
+    description: Install luacheck
+    required: false
+    default: 'true'
+
+outputs:
+  lua-path:
+    description: LUA_PATH for installed packages
+    value: ${{ steps.setup.outputs.lua-path }}
+
+runs:
+  using: composite
+  steps:
+  - name: Setup Lua
+    uses: leafo/gh-actions-lua@v10
+    with:
+      luaVersion: ${{ inputs.lua-version }}
+  
+  - name: Setup LuaRocks
+    uses: leafo/gh-actions-luarocks@v4
+  
+  - name: Cache LuaRocks packages
+    uses: actions/cache@v4
+    with:
+      path: ~/.luarocks
+      key: ${{ runner.os }}-lua${{ inputs.lua-version }}-${{ hashFiles('*.rockspec') }}
+  
+  - name: Install test tools
+    shell: bash
+    run: |
+      if [ "${{ inputs.install-busted }}" == "true" ]; then
+        luarocks install busted || true
+        luarocks install luacov || true
+      fi
+      
+      if [ "${{ inputs.install-luacheck }}" == "true" ]; then
+        luarocks install luacheck || true
+      fi
+  
+  - name: Set LUA_PATH
+    id: setup
+    shell: bash
+    run: |
+      LUA_PATH="./src/?.lua;./src/?/init.lua;$(luarocks path --lr-path)"
+      echo "lua-path=${LUA_PATH}" >> $GITHUB_OUTPUT
+      echo "LUA_PATH=${LUA_PATH}" >> $GITHUB_ENV
+```
+
+### 65.11.3 Dependabot Configuration
+
+```yaml
+# ตัวอย่างที่ 21: .github/dependabot.yml - Automated dependency updates
+version: 2
+
+updates:
+  # GitHub Actions updates
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "Asia/Bangkok"
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    reviewers:
+      - "your-github-username"
+  
+  # Docker base image updates
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(docker)"
+    labels:
+      - "dependencies"
+      - "docker"
+  
+  # npm dependencies (สำหรับ semantic-release)
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]
+```
+
+---
+
+## 65.12 Monitoring และ Alerting ใน CI/CD
+
+### 65.12.1 GitHub Actions Notifications
+
+```yaml
+# ตัวอย่างที่ 22: .github/workflows/notify.yml - Notifications workflow
+name: Notifications
+
+on:
+  workflow_run:
+    workflows: ["CI/CD Pipeline"]
+    types: [completed]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Check workflow status
+      id: status
+      run: |
+        if [ "${{ github.event.workflow_run.conclusion }}" == "success" ]; then
+          echo "emoji=✅" >> $GITHUB_OUTPUT
+          echo "color=#36a64f" >> $GITHUB_OUTPUT
         else
-            self._expiry[key] = nil
-        end
-        return true, nil, false
-    end
+          echo "emoji=❌" >> $GITHUB_OUTPUT
+          echo "color=#ff0000" >> $GITHUB_OUTPUT
+        fi
     
-    function d:add(key, value, exptime)
-        if self._data[key] then return false, "exists", false end
-        return self:set(key, value, exptime)
-    end
-    
-    function d:incr(key, value, init, init_ttl)
-        local current = tonumber(self._data[key])
-        if not current then
-            if init then
-                self._data[key] = init + value
-                if init_ttl then self._expiry[key] = os.time() + init_ttl end
-                return init + value
-            end
-            return nil, "not found"
-        end
-        self._data[key] = current + value
-        return current + value
-    end
-    
-    function d:delete(key)
-        self._data[key] = nil
-        self._expiry[key] = nil
-    end
-    
-    function d:flush_expired()
-        local count = 0
-        for k in pairs(self._expiry) do
-            if os.time() > self._expiry[k] then
-                self._data[k] = nil
-                self._expiry[k] = nil
-                count = count + 1
-            end
-        end
-        return count
-    end
-    
-    function d:get_keys(max)
-        local keys = {}
-        for k in pairs(self._data) do
-            table.insert(keys, k)
-            if max and #keys >= max then break end
-        end
-        return keys
-    end
-    
-    return d
-end
-
-local ngx_shared = {my_cache = makeSharedDict()}
-
--- Cache wrapper
-local function createSharedCache(dictName)
-    local dict = ngx_shared[dictName]
-    
-    return {
-        get = function(key)
-            local value, flags = dict:get(key)
-            if value then
-                -- Deserialize if JSON
-                if type(value) == "string" and value:sub(1,1) == "{" then
-                    local ok, decoded = pcall(function()
-                        -- Simple JSON decode simulation
-                        return value  -- In real: require("cjson").decode(value)
-                    end)
-                    if ok then return decoded end
-                end
-            end
-            return value
-        end,
-        
-        set = function(key, value, ttl)
-            local encoded = value
-            if type(value) == "table" then
-                -- Serialize: encoded = cjson.encode(value)
-                encoded = tostring(value)
-            end
-            return dict:set(key, encoded, ttl or 300)
-        end,
-        
-        delete = function(key)
-            dict:delete(key)
-        end,
-        
-        incr = function(key, step, init, ttl)
-            return dict:incr(key, step or 1, init or 0, ttl)
-        end,
-        
-        exists = function(key)
-            local v = dict:get(key)
-            return v ~= nil
-        end,
-        
-        stats = function()
-            return {
-                free = dict:free_space(),
-                total = dict:capacity()
-            }
-        end
-    }
-end
-
-local sharedCache = createSharedCache("my_cache")
-
-print("\n=== ngx.shared Cache Demo ===")
-
--- Basic operations
-sharedCache.set("config:app_version", "2.1.0", 3600)
-sharedCache.set("config:feature_flags", {darkMode = true, betaUI = false}, 600)
-sharedCache.set("counter:page_views", 0)
-
-print("App version:", sharedCache.get("config:app_version"))
-
--- Counter
-for i = 1, 5 do
-    local val = ngx_shared.my_cache:incr("counter:page_views", 1, 0)
-    print(string.format("  Page views: %d", val))
-end
-
--- Cache miss
-local missing = sharedCache.get("nonexistent:key")
-print("Missing key:", missing)
-
-local stats = sharedCache.stats()
-print(string.format("Cache stats: %.1fKB free / %.1fKB total",
-    stats.free / 1024, stats.total / 1024))
-
--- Distributed lock using shared dict
-local function acquireLock(key, timeout)
-    local lockKey = "lock:" .. key
-    local ok = ngx_shared.my_cache:add(lockKey, 1, timeout or 5)
-    return ok
-end
-
-local function releaseLock(key)
-    ngx_shared.my_cache:delete("lock:" .. key)
-end
-
-print("\nDistributed lock test:")
-local locked = acquireLock("resource:1", 10)
-print("Lock acquired:", locked)
-local locked2 = acquireLock("resource:1", 10)
-print("Second lock attempt:", locked2)
-releaseLock("resource:1")
-local locked3 = acquireLock("resource:1", 10)
-print("After release:", locked3)
+    - name: Send Slack notification
+      uses: slackapi/slack-github-action@v1
+      if: github.event.workflow_run.head_branch == 'main'
+      with:
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "${{ steps.status.outputs.color }}",
+                "title": "${{ steps.status.outputs.emoji }} CI/CD Pipeline: ${{ github.event.workflow_run.conclusion }}",
+                "fields": [
+                  {
+                    "title": "Repository",
+                    "value": "${{ github.repository }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Branch",
+                    "value": "${{ github.event.workflow_run.head_branch }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Commit",
+                    "value": "${{ github.event.workflow_run.head_sha }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Run URL",
+                    "value": "${{ github.event.workflow_run.html_url }}",
+                    "short": false
+                  }
+                ]
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 ```
 
-## 11. Redis Caching Layer
+### 65.12.2 Pipeline Performance Monitoring
 
 ```lua
--- Example 11: Redis as caching layer
-local RedisCache = {}
-RedisCache.__index = RedisCache
+-- ตัวอย่างที่ 23: scripts/ci-metrics.lua - CI/CD metrics collection
+-- Script สำหรับ collect metrics จาก CI pipeline
 
-function RedisCache.new(host, port, password, db)
-    return setmetatable({
-        host = host or "127.0.0.1",
-        port = port or 6379,
-        password = password,
-        db = db or 0,
-        connected = false,
-        ops = 0,
-        hitCount = 0,
-        missCount = 0
-    }, RedisCache)
-end
+local cjson = require "cjson"
 
--- Mock Redis operations (replace with actual redis library)
-local mockRedisData = {}
-local mockRedisExpiry = {}
-
-function RedisCache:get(key)
-    self.ops = self.ops + 1
-    -- Check expiry
-    if mockRedisExpiry[key] and os.time() > mockRedisExpiry[key] then
-        mockRedisData[key] = nil
-        mockRedisExpiry[key] = nil
-        self.missCount = self.missCount + 1
-        return nil
-    end
-    local v = mockRedisData[key]
-    if v then self.hitCount = self.hitCount + 1 else self.missCount = self.missCount + 1 end
-    return v
-end
-
-function RedisCache:set(key, value, ttl)
-    self.ops = self.ops + 1
-    mockRedisData[key] = value
-    if ttl then mockRedisExpiry[key] = os.time() + ttl end
-    return "OK"
-end
-
-function RedisCache:del(key)
-    mockRedisData[key] = nil
-    mockRedisExpiry[key] = nil
-    return 1
-end
-
-function RedisCache:expire(key, ttl)
-    if mockRedisData[key] then
-        mockRedisExpiry[key] = os.time() + ttl
-        return 1
+local function parse_time(time_str)
+    -- Parse ISO8601 duration หรือ seconds
+    if type(time_str) == "number" then return time_str end
+    local h, m, s = time_str:match("(%d+):(%d+):(%d+)")
+    if h then
+        return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
     end
     return 0
 end
 
-function RedisCache:incr(key)
-    mockRedisData[key] = (tonumber(mockRedisData[key]) or 0) + 1
-    return mockRedisData[key]
+local function read_github_event()
+    local event_file = os.getenv("GITHUB_EVENT_PATH")
+    if not event_file then return {} end
+    
+    local f = io.open(event_file, "r")
+    if not f then return {} end
+    
+    local content = f:read("*all")
+    f:close()
+    
+    local ok, data = pcall(cjson.decode, content)
+    return ok and data or {}
 end
 
-function RedisCache:hset(key, field, value)
-    if not mockRedisData[key] then mockRedisData[key] = {} end
-    mockRedisData[key][field] = value
-    return 1
-end
-
-function RedisCache:hget(key, field)
-    if not mockRedisData[key] then return nil end
-    return mockRedisData[key][field]
-end
-
-function RedisCache:hgetall(key)
-    return mockRedisData[key]
-end
-
-function RedisCache:zadd(key, score, member)
-    if not mockRedisData[key] then mockRedisData[key] = {} end
-    table.insert(mockRedisData[key], {score = score, member = member})
-    table.sort(mockRedisData[key], function(a, b) return a.score < b.score end)
-    return 1
-end
-
-function RedisCache:zrangebyscore(key, min, max)
-    local result = {}
-    for _, entry in ipairs(mockRedisData[key] or {}) do
-        if entry.score >= min and entry.score <= max then
-            table.insert(result, entry.member)
-        end
-    end
-    return result
-end
-
-function RedisCache:pipeline(fn)
-    -- Simplified pipeline
-    local cmds = {}
-    local pipe = {
-        get = function(p, k) table.insert(cmds, {"get", k}) end,
-        set = function(p, k, v, t) table.insert(cmds, {"set", k, v, t}) end,
-        del = function(p, k) table.insert(cmds, {"del", k}) end,
-        execute = function(p)
-            local results = {}
-            for _, cmd in ipairs(cmds) do
-                if cmd[1] == "get" then table.insert(results, self:get(cmd[2]))
-                elseif cmd[1] == "set" then table.insert(results, self:set(cmd[2], cmd[3], cmd[4]))
-                elseif cmd[1] == "del" then table.insert(results, self:del(cmd[2]))
-                end
-            end
-            return results
-        end
-    }
-    if fn then fn(pipe) end
-    return pipe
-end
-
-function RedisCache:stats()
-    local total = self.hitCount + self.missCount
+local function collect_metrics()
+    local event = read_github_event()
+    
     return {
-        hits = self.hitCount,
-        misses = self.missCount,
-        hitRate = total > 0 and (self.hitCount / total * 100) or 0,
-        totalOps = self.ops
+        workflow = os.getenv("GITHUB_WORKFLOW") or "",
+        run_id = os.getenv("GITHUB_RUN_ID") or "",
+        run_number = tonumber(os.getenv("GITHUB_RUN_NUMBER")) or 0,
+        repository = os.getenv("GITHUB_REPOSITORY") or "",
+        branch = os.getenv("GITHUB_REF_NAME") or "",
+        sha = os.getenv("GITHUB_SHA") or "",
+        actor = os.getenv("GITHUB_ACTOR") or "",
+        event_name = os.getenv("GITHUB_EVENT_NAME") or "",
+        timestamp = os.time()
     }
 end
 
--- High-level cache service using Redis
-local CacheService = {}
-CacheService.__index = CacheService
+-- Main
+local metrics = collect_metrics()
+print(cjson.encode(metrics))
 
-function CacheService.new(redis)
-    return setmetatable({redis = redis}, CacheService)
-end
-
--- Cache user session
-function CacheService:setSession(sessionId, data, ttl)
-    local key = "session:" .. sessionId
-    -- Store as hash
-    for field, value in pairs(data) do
-        self.redis:hset(key, field, tostring(value))
-    end
-    self.redis:expire(key, ttl or 3600)
-end
-
-function CacheService:getSession(sessionId)
-    return self.redis:hgetall("session:" .. sessionId)
-end
-
--- Cache product with TTL
-function CacheService:cacheProduct(productId, data, ttl)
-    self.redis:set("product:" .. productId, data, ttl or 300)
-end
-
-function CacheService:getProduct(productId)
-    return self.redis:get("product:" .. productId)
-end
-
--- Leaderboard (sorted set)
-function CacheService:updateScore(userId, score)
-    self.redis:zadd("leaderboard", score, userId)
-end
-
-function CacheService:getTopScores(min, max)
-    return self.redis:zrangebyscore("leaderboard", min, max)
-end
-
--- Cache counter
-function CacheService:incrementPageView(page)
-    return self.redis:incr("pageview:" .. page)
-end
-
--- ตัวอย่าง
-local redis = RedisCache.new()
-local cacheService = CacheService.new(redis)
-
-print("\n=== Redis Cache Layer Demo ===")
-
--- Session caching
-cacheService:setSession("sess_abc123", {
-    userId = "user_001",
-    role = "admin",
-    loginAt = os.time()
-}, 3600)
-
-local session = cacheService:getSession("sess_abc123")
-print("Session user:", session and session.userId or "nil")
-
--- Product cache
-cacheService:cacheProduct("prod_100", "Laptop Pro - $999", 300)
-local product = cacheService:getProduct("prod_100")
-print("Product:", product or "nil")
-
--- Leaderboard
-for i = 1, 5 do
-    cacheService:updateScore("user_" .. i, math.random(1000, 9999))
-end
-
-local top = cacheService:getTopScores(0, math.huge)
-print("\nLeaderboard entries:", #top)
-
--- Page views
-for i = 1, 10 do
-    cacheService:incrementPageView("/home")
-end
-local views = redis:get("pageview:/home")
-print("Page views /home:", views)
-
--- Stats
-local st = redis:stats()
-print(string.format("\nRedis stats: %d hits, %d misses (%.0f%% hit rate)",
-    st.hits, st.misses, st.hitRate))
+-- ส่ง metrics ไปยัง monitoring service
+local http_cmd = string.format(
+    "curl -s -X POST '%s/metrics' -H 'Content-Type: application/json' -d '%s'",
+    os.getenv("METRICS_ENDPOINT") or "http://metrics.internal",
+    cjson.encode(metrics)
+)
+os.execute(http_cmd)
 ```
 
-## 12. HTTP Caching Headers
+---
 
-```lua
--- Example 12: HTTP cache control headers
-local HTTPCache = {}
+## 65.13 Best Practices และ Optimization
 
--- Generate Cache-Control header
-function HTTPCache.cacheControl(options)
-    local directives = {}
-    
-    if options.noStore then
-        return "no-store"
-    end
-    
-    if options.noCache then
-        table.insert(directives, "no-cache")
-    end
-    
-    if options.private then
-        table.insert(directives, "private")
-    elseif options.public then
-        table.insert(directives, "public")
-    end
-    
-    if options.maxAge then
-        table.insert(directives, "max-age=" .. options.maxAge)
-    end
-    
-    if options.sMaxAge then
-        table.insert(directives, "s-maxage=" .. options.sMaxAge)
-    end
-    
-    if options.mustRevalidate then
-        table.insert(directives, "must-revalidate")
-    end
-    
-    if options.proxyRevalidate then
-        table.insert(directives, "proxy-revalidate")
-    end
-    
-    if options.immutable then
-        table.insert(directives, "immutable")
-    end
-    
-    if options.staleWhileRevalidate then
-        table.insert(directives, "stale-while-revalidate=" .. options.staleWhileRevalidate)
-    end
-    
-    if options.staleIfError then
-        table.insert(directives, "stale-if-error=" .. options.staleIfError)
-    end
-    
-    return table.concat(directives, ", ")
-end
+### 65.13.1 Caching Strategy
 
--- ETag generation
-function HTTPCache.generateETag(content, weak)
-    local hash = 0
-    for i = 1, #content do
-        hash = ((hash * 31) + string.byte(content, i)) & 0xFFFFFFFF
-    end
-    local etag = string.format('"%x"', hash)
-    return weak and 'W/' .. etag or etag
-end
+```yaml
+# ตัวอย่างที่ 24: Caching strategy สำหรับ Lua CI
+# ใน job steps:
 
--- Last-Modified header
-function HTTPCache.lastModified(timestamp)
-    -- RFC 7231 date format
-    local days = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
-    local months = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+    - name: Cache LuaRocks packages
+      id: cache-luarocks
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.luarocks
+          /usr/local/lib/lua
+          /usr/local/share/lua
+        # Cache key ที่ดี: combine OS + Lua version + lockfile hash
+        key: luarocks-${{ runner.os }}-lua${{ env.LUA_VERSION }}-${{ hashFiles('**/*.rockspec', '**/luarocks.lock') }}
+        restore-keys: |
+          luarocks-${{ runner.os }}-lua${{ env.LUA_VERSION }}-
+          luarocks-${{ runner.os }}-
     
-    local t = os.date("*t", timestamp)
-    return string.format("%s, %02d %s %04d %02d:%02d:%02d GMT",
-        days[t.wday], t.day, months[t.month], t.year,
-        t.hour, t.min, t.sec
-    )
-end
-
--- Check conditional request
-function HTTPCache.checkConditional(request, response)
-    -- If-None-Match: ETag comparison
-    local ifNoneMatch = request.headers and request.headers["if-none-match"]
-    if ifNoneMatch and response.etag then
-        if ifNoneMatch == response.etag or ifNoneMatch == "*" then
-            return 304, nil  -- Not Modified
-        end
-    end
+    - name: Cache Docker layers
+      uses: actions/cache@v4
+      with:
+        path: /tmp/.buildx-cache
+        key: docker-${{ runner.os }}-${{ hashFiles('**/Dockerfile', '*.rockspec') }}
+        restore-keys: |
+          docker-${{ runner.os }}-
     
-    -- If-Modified-Since comparison
-    local ifModifiedSince = request.headers and request.headers["if-modified-since"]
-    if ifModifiedSince and response.lastModifiedTimestamp then
-        -- Parse the date (simplified)
-        local reqTime = 0  -- Would parse HTTP date
-        if response.lastModifiedTimestamp <= reqTime then
-            return 304, nil
-        end
-    end
-    
-    return 200, response
-end
-
--- Vary header for content negotiation
-function HTTPCache.varyHeader(fields)
-    return table.concat(fields, ", ")
-end
-
--- Cache rules for different resource types
-local cacheRules = {
-    -- Static assets (immutable with hash in filename)
-    static_immutable = function()
-        return HTTPCache.cacheControl({
-            public = true,
-            maxAge = 31536000,  -- 1 year
-            immutable = true
-        })
-    end,
-    
-    -- Static assets (no hash, can change)
-    static_versioned = function()
-        return HTTPCache.cacheControl({
-            public = true,
-            maxAge = 86400,  -- 1 day
-            mustRevalidate = true
-        })
-    end,
-    
-    -- API responses (cacheable)
-    api_cacheable = function(ttl)
-        return HTTPCache.cacheControl({
-            public = true,
-            maxAge = ttl or 60,
-            sMaxAge = ttl and ttl * 2 or 120,
-            staleWhileRevalidate = 30,
-            staleIfError = 3600
-        })
-    end,
-    
-    -- API responses (private user data)
-    api_private = function(ttl)
-        return HTTPCache.cacheControl({
-            private = true,
-            maxAge = ttl or 300
-        })
-    end,
-    
-    -- No caching
-    no_cache = function()
-        return HTTPCache.cacheControl({noStore = true})
-    end,
-    
-    -- Always validate
-    always_validate = function()
-        return HTTPCache.cacheControl({noCache = true})
-    end
-}
-
--- Test
-print("\n=== HTTP Cache Headers Demo ===")
-
-print("Cache-Control values:")
-for name, fn in pairs(cacheRules) do
-    print(string.format("  %-20s: %s", name, fn()))
-end
-
-print("\nETag examples:")
-local content = '{"id":1,"name":"Alice","email":"alice@example.com"}'
-local etag = HTTPCache.generateETag(content)
-local weakEtag = HTTPCache.generateETag(content, true)
-print("  Strong ETag:", etag)
-print("  Weak ETag:", weakEtag)
-
-print("\nLast-Modified:")
-print("  " .. HTTPCache.lastModified(os.time() - 3600))
-
-print("\nVary headers:")
-print("  API (Accept):", HTTPCache.varyHeader({"Accept"}))
-print("  CDN (encoding+lang):", HTTPCache.varyHeader({"Accept-Encoding", "Accept-Language"}))
+    - name: Install dependencies (use cache if available)
+      if: steps.cache-luarocks.outputs.cache-hit != 'true'
+      run: |
+        luarocks install --only-deps *.rockspec
+        luarocks install busted
+        luarocks install luacheck
+        luarocks install luacov
 ```
 
-## 13. Cache Penetration, Breakdown, Avalanche
+### 65.13.2 Parallel Test Execution
 
-```lua
--- Example 13: Cache failure modes and solutions
-
--- 1. Cache Penetration (cache miss + DB miss)
--- เกิดเมื่อ query keys ที่ไม่มีใน DB ทำให้ทุก request ผ่าน cache ไปถึง DB
-
-local BloomFilter = {}
-BloomFilter.__index = BloomFilter
-
-function BloomFilter.new(size, hashCount)
-    local self = setmetatable({}, BloomFilter)
-    self.size = size or 1000
-    self.hashCount = hashCount or 3
-    self.bits = {}
-    for i = 1, self.size do self.bits[i] = false end
-    self.count = 0
-    return self
-end
-
-function BloomFilter:_hashes(key)
-    local hashes = {}
-    local h = 5381
-    for i = 1, self.hashCount do
-        for j = 1, #key do
-            h = ((h * 33) ~ string.byte(key, j)) & 0x7FFFFFFF
-        end
-        h = h ~ (i * 0x9e3779b9)
-        table.insert(hashes, (h % self.size) + 1)
-    end
-    return hashes
-end
-
-function BloomFilter:add(key)
-    for _, pos in ipairs(self:_hashes(key)) do
-        self.bits[pos] = true
-    end
-    self.count = self.count + 1
-end
-
-function BloomFilter:mightContain(key)
-    for _, pos in ipairs(self:_hashes(key)) do
-        if not self.bits[pos] then return false end
-    end
-    return true  -- might be true (false positives possible)
-end
-
-function BloomFilter:falsePositiveRate()
-    local setBits = 0
-    for _, b in ipairs(self.bits) do
-        if b then setBits = setBits + 1 end
-    end
-    -- Approximation
-    return (setBits / self.size) ^ self.hashCount
-end
-
--- Null cache (cache miss results)
-local NullCache = {}
-NullCache.__index = NullCache
-
-function NullCache.new(ttl)
-    return setmetatable({
-        data = {},
-        ttl = ttl or 60  -- short TTL for null values
-    }, NullCache)
-end
-
-function NullCache:setNull(key)
-    self.data[key] = {isNull = true, expiresAt = os.time() + self.ttl}
-end
-
-function NullCache:isNull(key)
-    local entry = self.data[key]
-    if not entry then return false end
-    if os.time() > entry.expiresAt then
-        self.data[key] = nil
-        return false
-    end
-    return entry.isNull
-end
-
--- 2. Cache Breakdown (hot key expires)
--- Hot key expire ทำให้ requests จำนวนมากตีไป DB พร้อมกัน
--- Solution: Mutex lock, warm cache before expiry
-
-local HotKeyProtection = {}
-
-function HotKeyProtection.warmBeforeExpiry(cache, key, loader, renewThreshold)
-    renewThreshold = renewThreshold or 30  -- seconds before expiry
+```yaml
+# ตัวอย่างที่ 25: Parallel test execution
+  parallel-tests:
+    name: Test Suite ${{ matrix.suite }}
+    runs-on: ubuntu-latest
     
-    local entry = cache.data[key]
-    if not entry then return end
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - unit/models
+          - unit/services
+          - unit/utils
+          - integration/api
+          - integration/database
     
-    local timeLeft = entry.expiresAt - os.time()
+    steps:
+    - uses: actions/checkout@v4
     
-    if timeLeft <= renewThreshold then
-        -- Schedule background renewal
-        print(string.format("[HotKey] Key '%s' expiring in %ds, renewing...", key, timeLeft))
-        local newValue = loader(key)
-        if newValue then
-            cache:set(key, newValue, cache.defaultTTL)
-        end
-    end
-end
-
--- 3. Cache Avalanche (many keys expire at same time)
--- Solution: Jitter TTL, multi-level cache, circuit breaker
-
-local AvalancheProtection = {}
-
-function AvalancheProtection.jitterTTL(baseTTL, jitterRange)
-    jitterRange = jitterRange or math.floor(baseTTL * 0.1)
-    return baseTTL + math.random(-jitterRange, jitterRange)
-end
-
-function AvalancheProtection.multiLevelCache(l1, l2, key)
-    -- Check L1 (fast, in-process)
-    local v = l1:get(key)
-    if v then return v, "l1" end
+    - name: Setup environment
+      uses: ./.github/actions/setup-lua
+      with:
+        lua-version: "5.4"
     
-    -- Check L2 (shared/Redis)
-    v = l2:get(key)
-    if v then
-        l1:set(key, v, 30)  -- Short TTL in L1
-        return v, "l2"
-    end
+    - name: Run test suite
+      run: |
+        busted spec/${{ matrix.suite }}/ \
+          --output=TAP \
+          2>&1 | tee test-${{ matrix.suite }}-results.txt
     
-    return nil, "miss"
-end
-
--- 综合 demonstration
-print("\n=== Cache Failure Modes ===")
-
--- 1. Cache Penetration Prevention
-print("\n1. Bloom Filter (Penetration Prevention):")
-local bf = BloomFilter.new(1000, 4)
-
--- Pre-populate with valid IDs
-for i = 1, 100 do
-    bf:add("user:" .. i)
-end
-
-local testIds = {"user:50", "user:101", "user:999", "user:1"}
-for _, id in ipairs(testIds) do
-    local exists = bf:mightContain(id)
-    print(string.format("  %s: %s", id, exists and "might exist (check DB)" or "definitely not in DB"))
-end
-print(string.format("  Bloom filter false positive rate: ~%.1f%%", bf:falsePositiveRate() * 100))
-
--- Null cache
-print("\n  Null Cache (cache miss results):")
-local nullCache = NullCache.new(60)
-nullCache:setNull("user:99999")
-print("  user:99999 is null:", nullCache:isNull("user:99999"))
-print("  user:1 is null:", nullCache:isNull("user:1"))
-
--- 2. Cache Breakdown
-print("\n2. Cache Breakdown Prevention:")
-print("  Solution: Distributed lock + XFetch early renewal")
-print("  XFetch: refresh cache before expiry with probability")
-print("  Lock: only one request reloads, others wait for result")
-
--- 3. Cache Avalanche
-print("\n3. Cache Avalanche Prevention:")
-local baseCache = L1Cache.new(1000, 0)
-print("  Loading 10 items with jittered TTL (base=300s, jitter=±30s):")
-for i = 1, 10 do
-    local ttl = AvalancheProtection.jitterTTL(300, 30)
-    baseCache:set("item:" .. i, {id = i}, ttl)
-    print(string.format("    item:%d TTL: %ds", i, ttl))
-end
-
--- Multi-level cache
-print("\n  Multi-level cache:")
-local l1_test = L1Cache.new(100, 30)
-local l2_test = L1Cache.new(10000, 300)
-
-l2_test:set("config:theme", "dark", 300)
-local v, level = AvalancheProtection.multiLevelCache(l1_test, l2_test, "config:theme")
-print(string.format("    First get from level: %s, value: %s", level, tostring(v)))
-v, level = AvalancheProtection.multiLevelCache(l1_test, l2_test, "config:theme")
-print(string.format("    Second get from level: %s, value: %s", level, tostring(v)))
+    - name: Upload results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-${{ matrix.suite }}-results
+        path: test-${{ matrix.suite }}-results.txt
+  
+  # รวม results จาก parallel tests
+  aggregate-results:
+    name: Aggregate Test Results
+    runs-on: ubuntu-latest
+    needs: parallel-tests
+    if: always()
+    
+    steps:
+    - name: Download all results
+      uses: actions/download-artifact@v4
+      with:
+        pattern: test-*-results
+        merge-multiple: true
+    
+    - name: Summarize results
+      run: |
+        echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        TOTAL_PASS=0
+        TOTAL_FAIL=0
+        
+        for file in *.txt; do
+          PASS=$(grep -c "^ok" "$file" || true)
+          FAIL=$(grep -c "^not ok" "$file" || true)
+          TOTAL_PASS=$((TOTAL_PASS + PASS))
+          TOTAL_FAIL=$((TOTAL_FAIL + FAIL))
+          
+          echo "### $file" >> $GITHUB_STEP_SUMMARY
+          echo "- Passed: $PASS" >> $GITHUB_STEP_SUMMARY
+          echo "- Failed: $FAIL" >> $GITHUB_STEP_SUMMARY
+        done
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Total: $TOTAL_PASS passed, $TOTAL_FAIL failed**" >> $GITHUB_STEP_SUMMARY
+        
+        if [ $TOTAL_FAIL -gt 0 ]; then
+          exit 1
+        fi
 ```
 
-## 14. Cache Keys Design
+---
 
-```lua
--- Example 14: Cache key design best practices
-local CacheKeyBuilder = {}
-CacheKeyBuilder.__index = CacheKeyBuilder
+## 65.14 แบบฝึกหัด
 
-function CacheKeyBuilder.new(prefix, separator)
-    return setmetatable({
-        prefix = prefix or "app",
-        sep = separator or ":"
-    }, CacheKeyBuilder)
-end
+### แบบฝึกหัดที่ 1: Basic CI Pipeline
+สร้าง GitHub Actions workflow สำหรับ Lua library ที่:
+- รัน luacheck บน code ทั้งหมดใน `src/`
+- รัน Busted tests ใน `spec/`
+- ทดสอบกับ Lua 5.1, 5.4, และ LuaJIT
+- Upload test results เป็น artifacts
 
-function CacheKeyBuilder:build(...)
-    local parts = {self.prefix}
-    for _, part in ipairs({...}) do
-        if part ~= nil then
-            table.insert(parts, tostring(part))
-        end
-    end
-    return table.concat(parts, self.sep)
-end
+### แบบฝึกหัดที่ 2: Coverage Gate
+เพิ่ม code coverage ใน pipeline จากแบบฝึกหัดที่ 1:
+- รัน LuaCov พร้อมกับ tests
+- Generate HTML coverage report
+- Fail pipeline ถ้า coverage ต่ำกว่า 80%
+- Upload report ไปยัง Codecov
 
--- Version-aware keys
-function CacheKeyBuilder:versioned(version, ...)
-    local parts = {self.prefix, "v" .. version}
-    for _, p in ipairs({...}) do
-        table.insert(parts, tostring(p))
-    end
-    return table.concat(parts, self.sep)
-end
+### แบบฝึกหัดที่ 3: Docker Build Pipeline
+สร้าง workflow สำหรับ build และ push Docker image:
+- รัน tests ใน Docker container
+- ทำ security scan ด้วย Trivy
+- Build multi-platform image (amd64 + arm64)
+- Push ไปยัง GitHub Container Registry
+- Tag image ด้วย version และ commit SHA
 
--- Hash key (for long keys)
-function CacheKeyBuilder:hash(...)
-    local key = self:build(...)
-    if #key > 128 then
-        -- Hash the key
-        local h = 5381
-        for i = 1, #key do
-            h = ((h * 33) ~ string.byte(key, i)) & 0x7FFFFFFF
-        end
-        return self.prefix .. self.sep .. string.format("%x", h)
-    end
-    return key
-end
+### แบบฝึกหัดที่ 4: Multi-Environment Deployment
+สร้าง deployment pipeline ที่:
+- Auto-deploy ไปยัง dev เมื่อ push ไปยัง feature branch
+- Auto-deploy ไปยัง staging เมื่อ merge ไปยัง develop
+- Deploy ไปยัง production ต้องมี manual approval
+- มี rollback mechanism เมื่อ health check ไม่ผ่าน
 
--- Key with locale
-function CacheKeyBuilder:localized(locale, ...)
-    return self:build(locale, ...)
-end
+### แบบฝึกหัดที่ 5: Complete LuaRocks Release
+สร้าง release automation ที่:
+- ใช้ Conventional Commits สำหรับ auto-versioning
+- Generate CHANGELOG จาก commits
+- สร้าง GitHub Release พร้อม release notes
+- Upload package ไปยัง LuaRocks โดยอัตโนมัติ
+- ส่ง Slack notification เมื่อ release สำเร็จ
 
--- Parameterized key (for query results)
-local function hashParams(params)
-    if type(params) ~= "table" then return tostring(params) end
-    
-    -- Sort keys for consistency
-    local keys = {}
-    for k in pairs(params) do table.insert(keys, k) end
-    table.sort(keys)
-    
-    local parts = {}
-    for _, k in ipairs(keys) do
-        table.insert(parts, k .. "=" .. tostring(params[k]))
-    end
-    return table.concat(parts, "&")
-end
+---
 
-function CacheKeyBuilder:query(entity, params)
-    local paramStr = hashParams(params)
-    return self:build(entity, "query", paramStr)
-end
+## สรุป
 
--- Tag-aware key builder
-function CacheKeyBuilder:withTags(key, tags)
-    return {
-        key = key,
-        tags = tags,
-        build = function(self) return key end
-    }
-end
+ในบทนี้เราได้เรียนรู้การสร้าง CI/CD Pipeline ที่สมบูรณ์สำหรับ Lua projects:
 
-local kb = CacheKeyBuilder.new("myapp")
+- **GitHub Actions** - สร้าง workflows สำหรับ CI/CD ด้วย YAML
+- **Busted** - รัน unit tests และ integration tests ใน CI environment
+- **Luacheck** - ทำ static analysis และ style checking อัตโนมัติ
+- **LuaCov** - วัด code coverage และบังคับใช้ coverage threshold
+- **Semantic Versioning** - จัดการ version แบบอัตโนมัติด้วย Conventional Commits
+- **LuaRocks Publishing** - Publish packages ไปยัง LuaRocks อัตโนมัติ
+- **Docker Integration** - Build, scan, และ push Docker images ใน pipeline
+- **Integration Testing** - รัน tests กับ real services (Redis, PostgreSQL)
+- **Environment Promotion** - Deploy แบบ dev → staging → production พร้อม approval gates
+- **Optimization** - Caching, parallel execution, reusable workflows
 
-print("\n=== Cache Key Design ===")
-print("Key examples:")
-print("  User profile:", kb:build("user", 123, "profile"))
-print("  User orders:", kb:build("user", 123, "orders", "page", 1))
-print("  Product:", kb:build("product", "PRD-456"))
-print("  Config:", kb:build("config", "features"))
-print("  Versioned:", kb:versioned(2, "user", 123))
-print("  Localized:", kb:localized("th", "i18n", "home_title"))
-print("  Query:", kb:query("products", {category = "electronics", sort = "price", page = 1}))
-
-print("\nKey naming conventions:")
-local examples = {
-    "app:user:{id}",
-    "app:user:{id}:session",
-    "app:product:{id}:detail",
-    "app:category:{slug}:products",
-    "app:search:{query_hash}",
-    "app:config:{key}",
-    "app:counter:{entity}:{id}",
-    "app:lock:{resource}",
-    "app:ratelimit:{ip}:{window}",
-}
-for _, pattern in ipairs(examples) do
-    print("  " .. pattern)
-end
-```
-
-## สรุป Caching Strategies
-
-Caching เป็นหัวใจสำคัญของระบบ high-performance:
-
-**Cache Patterns:**
-1. **Cache-Aside** (Lazy Loading) - Application จัดการ cache เอง, ง่ายสุด
-2. **Write-Through** - เขียนพร้อมกันทั้ง cache และ DB, consistent
-3. **Write-Behind** - เขียน cache ก่อน, flush DB ทีหลัง, fast writes
-4. **Read-Through** - Cache จัดการ load เอง, transparent
-
-**Cache Invalidation:**
-- Tag-based, Version-based, Dependency-based
-- Stale-While-Revalidate, Stale-If-Error
-- Cascade invalidation
-
-**TTL Strategies:**
-- Static TTL, Dynamic TTL
-- Jittered TTL (ป้องกัน avalanche)
-- Sliding TTL (ต่ออายุเมื่อใช้งาน)
-
-**Failure Modes:**
-- **Cache Penetration** → Bloom Filter, Null Cache
-- **Cache Breakdown** → Mutex Lock, Early Renewal (XFetch)
-- **Cache Avalanche** → Jitter TTL, Multi-level Cache, Circuit Breaker
-
-**OpenResty/NGINX:**
-- `ngx.shared.DICT` สำหรับ shared memory cache
-- `ngx.ctx` สำหรับ per-request cache
-- `ngx.var` สำหรับ NGINX variable caching
-
-**HTTP Caching:**
-- `Cache-Control`: max-age, s-maxage, public/private, immutable
-- `ETag`: content hash validation
-- `Last-Modified`: timestamp validation
-- `Vary`: content negotiation
-
-**Distributed Cache:**
-- Redis/Memcached สำหรับ multi-instance
-- Consistent Hashing สำหรับ cache cluster
-- Pipeline/Batch สำหรับ efficiency
+การมี CI/CD pipeline ที่ดีช่วยให้ทีมสามารถ deliver code ได้อย่างรวดเร็วและมั่นใจว่า code quality อยู่ในระดับสูงตลอดเวลา

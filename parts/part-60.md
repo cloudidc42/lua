@@ -1,2124 +1,2081 @@
-# บทที่ 60: Message Queue
+# บทที่ 60: SQLite และ NoSQL Patterns ใน Lua
 
 ## บทนำ
 
-Message Queue คือกลไกสำคัญในการออกแบบระบบ distributed ที่ช่วยให้ components สื่อสารกันแบบ asynchronous ลด coupling และเพิ่ม resilience
+SQLite เป็น embedded database ที่ไม่ต้องการ server แยกต่างหาก ใช้งานได้ทันทีจาก application เพียงแค่ link library เข้าไป เหมาะสำหรับ desktop applications, mobile apps, หรือ applications ขนาดเล็กถึงกลางที่ไม่ต้องการ scalability ระดับสูง
 
 ---
 
-## ตัวอย่างที่ 1: ทำไมต้องใช้ Message Queue?
+## 60.1 SQLite พื้นฐานด้วย LuaSQLite3
+
+### ตัวอย่างที่ 1: การเปิดและปิด Database
 
 ```lua
--- Why Message Queues?
-local problems_without_queue = {
-    "1. Tight coupling: caller ต้องรอ callee ตลอดเวลา",
-    "2. Single point of failure: ถ้า service ล่มงานหายหมด",
-    "3. Overwhelm: traffic spike ทำให้ service ล่ม",
-    "4. Retry logic: ต้อง implement เอง",
-    "5. No priority: งานทุกชิ้นเท่ากันหมด",
+-- sqlite_basics.lua
+-- ต้องติดตั้ง: luarocks install lsqlite3
+
+local sqlite3 = require("lsqlite3")
+
+-- เปิด database (สร้างใหม่ถ้าไม่มี)
+local db = sqlite3.open("myapp.db")
+
+print("SQLite version:", sqlite3.version())
+print("Database opened successfully")
+
+-- ปิด database
+db:close()
+print("Database closed")
+
+-- เปิด in-memory database
+local memdb = sqlite3.open(":memory:")
+print("In-memory database opened")
+memdb:close()
+```
+
+### ตัวอย่างที่ 2: สร้างตารางและ Insert ข้อมูล
+
+```lua
+-- create_table.lua
+local sqlite3 = require("lsqlite3")
+
+local db = sqlite3.open(":memory:")
+
+-- สร้างตาราง
+db:exec([[
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        age INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+]])
+
+-- Insert ข้อมูล
+local stmt = db:prepare("INSERT INTO users (name, email, age) VALUES (?, ?, ?)")
+
+local users_data = {
+    {"สมชาย ใจดี", "somchai@example.com", 30},
+    {"สมหญิง รักษ์ดี", "somying@example.com", 25},
+    {"มานะ ขยันดี", "mana@example.com", 35},
+    {"วิชัย เก่งมาก", "wichai@example.com", 28},
 }
 
-local benefits_with_queue = {
-    "1. Decoupling: producer ไม่ต้องรู้จัก consumer",
-    "2. Resilience: consumer ล่มแต่ message ยังอยู่",
-    "3. Load leveling: buffer traffic spikes",
-    "4. Retry built-in: dead letter queue สำหรับ failures",
-    "5. Priority queues: ทำงานสำคัญก่อน",
-    "6. Async processing: user ไม่ต้องรองาน heavy",
-}
-
-print("=== Why Message Queues? ===")
-print("\nProblems WITHOUT queue:")
-for _, p in ipairs(problems_without_queue) do print("  " .. p) end
-print("\nBenefits WITH queue:")
-for _, b in ipairs(benefits_with_queue) do print("  " .. b) end
-
--- Common use cases
-local use_cases = {
-    { name = "Email sending",         pattern = "Work Queue" },
-    { name = "Image resizing",        pattern = "Work Queue" },
-    { name = "Report generation",     pattern = "Delay Queue" },
-    { name = "Real-time chat",        pattern = "Pub/Sub" },
-    { name = "Stock price updates",   pattern = "Pub/Sub" },
-    { name = "Order processing",      pattern = "Priority Queue" },
-    { name = "Log aggregation",       pattern = "Fan-out" },
-}
-
-print("\nCommon Use Cases:")
-for _, uc in ipairs(use_cases) do
-    print(string.format("  %-30s -> %s", uc.name, uc.pattern))
+for _, user in ipairs(users_data) do
+    stmt:bind_values(user[1], user[2], user[3])
+    stmt:step()
+    stmt:reset()
 end
+
+stmt:finalize()
+
+print("Inserted", db:changes(), "rows")
+print("Last row ID:", db:last_insert_rowid())
+
+db:close()
+```
+
+### ตัวอย่างที่ 3: Query ข้อมูล
+
+```lua
+-- query_data.lua
+local sqlite3 = require("lsqlite3")
+
+local db = sqlite3.open(":memory:")
+
+-- สร้างและ populate ตาราง
+db:exec([[
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        price REAL NOT NULL,
+        category TEXT,
+        stock INTEGER DEFAULT 0
+    )
+]])
+
+local insert = db:prepare(
+    "INSERT INTO products (name, price, category, stock) VALUES (?, ?, ?, ?)"
+)
+
+local products = {
+    {"Apple MacBook Pro", 59900, "Electronics", 15},
+    {"iPhone 15", 35900, "Electronics", 50},
+    {"โต๊ะไม้", 4500, "Furniture", 30},
+    {"เก้าอี้สำนักงาน", 3200, "Furniture", 45},
+    {"หนังสือ Lua Programming", 350, "Books", 100},
+    {"หนังสือ Clean Code", 420, "Books", 80},
+}
+
+for _, p in ipairs(products) do
+    insert:bind_values(p[1], p[2], p[3], p[4])
+    insert:step()
+    insert:reset()
+end
+insert:finalize()
+
+-- Query ทั้งหมด
+print("=== All Products ===")
+for row in db:nrows("SELECT * FROM products ORDER BY price DESC") do
+    print(string.format("  [%d] %s - %.2f บาท (คลัง: %d)",
+        row.id, row.name, row.price, row.stock))
+end
+
+-- Query ด้วย WHERE
+print("\n=== Electronics ===")
+local stmt = db:prepare("SELECT * FROM products WHERE category = ? AND price < ?")
+stmt:bind_values("Electronics", 40000)
+for row in stmt:nrows() do
+    print(string.format("  %s - %.2f บาท", row.name, row.price))
+end
+stmt:finalize()
+
+-- Aggregate
+print("\n=== Summary by Category ===")
+for row in db:nrows([[
+    SELECT category, 
+           COUNT(*) as count,
+           AVG(price) as avg_price,
+           SUM(stock) as total_stock
+    FROM products 
+    GROUP BY category
+    ORDER BY category
+]]) do
+    print(string.format("  %s: %d สินค้า, ราคาเฉลี่ย %.2f, คลัง %d",
+        row.category, row.count, row.avg_price, row.total_stock))
+end
+
+db:close()
 ```
 
 ---
 
-## ตัวอย่างที่ 2: Queue Patterns Overview
+## 60.2 Prepared Statements และ Transactions
+
+### ตัวอย่างที่ 4: Transaction Management
 
 ```lua
--- Queue patterns explanation
-local QueuePatterns = {}
+-- transactions.lua
+local sqlite3 = require("lsqlite3")
 
--- 1. FIFO (First In, First Out) - Queue ธรรมดา
-QueuePatterns.FIFO = {
-    description = "งานออกตามลำดับที่เข้ามา",
-    pros = { "Simple", "Fair ordering", "Easy to implement" },
-    cons = { "Head-of-line blocking", "No priority" },
-    use_cases = { "Email queue", "Log processing", "Sequential tasks" },
-}
+local db = sqlite3.open(":memory:")
 
--- 2. LIFO (Last In, First Out) - Stack
-QueuePatterns.LIFO = {
-    description = "งานล่าสุดออกก่อน",
-    pros = { "Recent work first", "Cache-friendly" },
-    cons = { "Starvation of old messages" },
-    use_cases = { "Undo operations", "Browser history" },
-}
+db:exec([[
+    CREATE TABLE accounts (
+        id INTEGER PRIMARY KEY,
+        owner TEXT NOT NULL,
+        balance REAL NOT NULL DEFAULT 0
+    )
+]])
 
--- 3. Priority Queue
-QueuePatterns.PRIORITY = {
-    description = "งานที่มี priority สูงออกก่อน",
-    pros = { "Critical tasks first", "Flexible ordering" },
-    cons = { "Complexity", "Priority inversion possible" },
-    use_cases = { "Order processing", "Incident response", "VIP users" },
-}
+-- เพิ่มข้อมูลเริ่มต้น
+db:exec([[
+    INSERT INTO accounts (owner, balance) VALUES
+    ('ลูกค้า A', 10000),
+    ('ลูกค้า B', 5000)
+]])
 
--- 4. Delay Queue
-QueuePatterns.DELAY = {
-    description = "งานรอเวลาที่กำหนดก่อนถูก process",
-    pros = { "Scheduled execution", "Retry with backoff" },
-    cons = { "Time-based, not event-based" },
-    use_cases = { "Scheduled emails", "Retry failed jobs", "Reminders" },
-}
+-- ฟังก์ชัน transfer เงิน
+local function transfer(db, from_id, to_id, amount)
+    -- ตรวจสอบยอดเงิน
+    local stmt = db:prepare("SELECT balance FROM accounts WHERE id = ?")
+    stmt:bind_values(from_id)
+    local row = stmt:first_row()
+    stmt:finalize()
 
--- 5. Dead Letter Queue
-QueuePatterns.DLQ = {
-    description = "เก็บ messages ที่ process ไม่ผ่าน",
-    pros = { "No message loss", "Debugging failed messages" },
-    cons = { "Requires separate monitoring" },
-    use_cases = { "Failed payments", "Invalid data", "System errors" },
-}
-
-print("=== Queue Patterns ===")
-for pattern_name, pattern in pairs(QueuePatterns) do
-    print(string.format("\n[%s] %s", pattern_name, pattern.description))
-    print("  Use cases: " .. table.concat(pattern.use_cases, ", "))
-end
-```
-
----
-
-## ตัวอย่างที่ 3: In-Memory FIFO Queue
-
-```lua
--- Simple In-Memory FIFO Queue
-local Queue = {}
-Queue.__index = Queue
-
-function Queue.new(options)
-    local self = setmetatable({}, Queue)
-    self.name      = options and options.name or "default"
-    self.items     = {}
-    self.head      = 1
-    self.tail      = 0
-    self.max_size  = options and options.max_size or math.huge
-    self.stats     = { enqueued = 0, dequeued = 0, failed = 0 }
-    return self
-end
-
--- Enqueue
-function Queue:push(item, metadata)
-    if self:size() >= self.max_size then
-        return false, "Queue is full (max=" .. self.max_size .. ")"
+    if not row then
+        return false, "ไม่พบบัญชีต้นทาง"
     end
-    
-    self.tail = self.tail + 1
-    self.items[self.tail] = {
-        id          = self.stats.enqueued + 1,
-        data        = item,
-        enqueued_at = os.time(),
-        attempts    = 0,
-        metadata    = metadata or {},
-    }
-    self.stats.enqueued = self.stats.enqueued + 1
-    return true, self.tail
-end
 
--- Dequeue
-function Queue:pop()
-    if self:is_empty() then return nil end
-    
-    local item = self.items[self.head]
-    self.items[self.head] = nil
-    self.head = self.head + 1
-    self.stats.dequeued = self.stats.dequeued + 1
-    return item
-end
-
--- Peek without removing
-function Queue:peek()
-    return self.items[self.head]
-end
-
--- Peek last item
-function Queue:peek_last()
-    return self.items[self.tail]
-end
-
-function Queue:size()
-    return self.tail - self.head + 1
-end
-
-function Queue:is_empty()
-    return self.head > self.tail
-end
-
-function Queue:clear()
-    self.items = {}
-    self.head  = 1
-    self.tail  = 0
-end
-
--- Iterate all items without dequeuing
-function Queue:each(fn)
-    for i = self.head, self.tail do
-        if self.items[i] then
-            fn(self.items[i], i)
-        end
+    if row[1] < amount then
+        return false, string.format("ยอดเงินไม่พอ (มี %.2f, ต้องการ %.2f)", row[1], amount)
     end
-end
 
--- Stats
-function Queue:get_stats()
-    return {
-        name      = self.name,
-        size      = self:size(),
-        enqueued  = self.stats.enqueued,
-        dequeued  = self.stats.dequeued,
-        failed    = self.stats.failed,
-    }
-end
+    -- เริ่ม transaction
+    db:exec("BEGIN TRANSACTION")
 
--- ทดสอบ
-print("=== In-Memory FIFO Queue ===")
-local q = Queue.new({ name = "email_queue", max_size = 100 })
+    local ok, err = pcall(function()
+        local deduct = db:prepare("UPDATE accounts SET balance = balance - ? WHERE id = ?")
+        deduct:bind_values(amount, from_id)
+        deduct:step()
+        deduct:finalize()
 
--- Enqueue tasks
-local tasks = {
-    { type = "welcome_email",  to = "alice@example.com", template = "welcome" },
-    { type = "order_confirm",  to = "bob@example.com",   order_id = 1001 },
-    { type = "password_reset", to = "charlie@example.com", token = "abc123" },
-    { type = "weekly_digest",  to = "diana@example.com" },
-}
-
-for _, task in ipairs(tasks) do
-    local ok, id = q:push(task)
-    print(string.format("Enqueued [%d]: %s -> %s", id, task.type, task.to))
-end
-
-print("\nQueue size:", q:size())
-print("Peek:", q:peek().data.type)
-
--- Process
-print("\nProcessing:")
-while not q:is_empty() do
-    local item = q:pop()
-    print(string.format("  Processing [%d] %s (attempt %d)",
-        item.id, item.data.type, item.attempts))
-end
-
-print("\nStats:", q:get_stats().enqueued, "enqueued,", q:get_stats().dequeued, "dequeued")
-```
-
----
-
-## ตัวอย่างที่ 4: Priority Queue
-
-```lua
--- Priority Queue implementation
-local PriorityQueue = {}
-PriorityQueue.__index = PriorityQueue
-
-function PriorityQueue.new(options)
-    local self = setmetatable({}, PriorityQueue)
-    self.heap     = {}
-    self.options  = options or {}
-    self.min_heap = self.options.min_heap ~= false  -- true = min priority value = highest priority
-    self.stats    = { enqueued = 0, dequeued = 0 }
-    return self
-end
-
--- Heap operations
-local function parent(i) return math.floor(i / 2) end
-local function left(i)   return 2 * i end
-local function right(i)  return 2 * i + 1 end
-
-function PriorityQueue:_swap(i, j)
-    self.heap[i], self.heap[j] = self.heap[j], self.heap[i]
-end
-
-function PriorityQueue:_compare(i, j)
-    local pi = self.heap[i].priority
-    local pj = self.heap[j].priority
-    return self.min_heap and pi < pj or pi > pj
-end
-
-function PriorityQueue:_heapify_up(i)
-    while i > 1 and self:_compare(i, parent(i)) do
-        self:_swap(i, parent(i))
-        i = parent(i)
-    end
-end
-
-function PriorityQueue:_heapify_down(i)
-    local n = #self.heap
-    while true do
-        local target = i
-        local l, r   = left(i), right(i)
-        
-        if l <= n and self:_compare(l, target) then target = l end
-        if r <= n and self:_compare(r, target) then target = r end
-        
-        if target == i then break end
-        self:_swap(i, target)
-        i = target
-    end
-end
-
--- Enqueue with priority
-function PriorityQueue:push(data, priority)
-    local item = {
-        data        = data,
-        priority    = priority,
-        id          = self.stats.enqueued + 1,
-        enqueued_at = os.time(),
-    }
-    table.insert(self.heap, item)
-    self:_heapify_up(#self.heap)
-    self.stats.enqueued = self.stats.enqueued + 1
-    return item.id
-end
-
--- Dequeue highest priority item
-function PriorityQueue:pop()
-    if #self.heap == 0 then return nil end
-    
-    local top = self.heap[1]
-    local last = table.remove(self.heap)
-    
-    if #self.heap > 0 then
-        self.heap[1] = last
-        self:_heapify_down(1)
-    end
-    
-    self.stats.dequeued = self.stats.dequeued + 1
-    return top
-end
-
-function PriorityQueue:peek()
-    return self.heap[1]
-end
-
-function PriorityQueue:size()
-    return #self.heap
-end
-
-function PriorityQueue:is_empty()
-    return #self.heap == 0
-end
-
--- Priority constants
-local Priority = {
-    CRITICAL = 1,
-    HIGH     = 2,
-    NORMAL   = 3,
-    LOW      = 4,
-    BULK     = 5,
-}
-
--- ทดสอบ
-print("=== Priority Queue ===")
-local pq = PriorityQueue.new()
-
--- Add tasks with different priorities
-local job_list = {
-    { name = "Send marketing email",   priority = Priority.BULK     },
-    { name = "Database backup",        priority = Priority.HIGH     },
-    { name = "Security alert response", priority = Priority.CRITICAL },
-    { name = "Generate monthly report", priority = Priority.NORMAL   },
-    { name = "Update search index",    priority = Priority.LOW      },
-    { name = "Process payment",        priority = Priority.CRITICAL },
-    { name = "Resize uploaded image",  priority = Priority.NORMAL   },
-    { name = "Send order confirmation", priority = Priority.HIGH    },
-}
-
-for _, job in ipairs(job_list) do
-    pq:push(job, job.priority)
-end
-
-print(string.format("Queue has %d jobs", pq:size()))
-print("\nProcessing by priority:")
-
-local labels = { [1]="CRITICAL", [2]="HIGH", [3]="NORMAL", [4]="LOW", [5]="BULK" }
-while not pq:is_empty() do
-    local item = pq:pop()
-    print(string.format("  [%s] %s", labels[item.priority] or "?", item.data.name))
-end
-```
-
----
-
-## ตัวอย่างที่ 5: Delay Queue
-
-```lua
--- Delay Queue - execute messages at specific time
-local DelayQueue = {}
-DelayQueue.__index = DelayQueue
-
-function DelayQueue.new()
-    local self = setmetatable({}, DelayQueue)
-    self.items  = {}
-    self.id_seq = 0
-    return self
-end
-
--- Schedule message for future execution
-function DelayQueue:schedule(data, delay_seconds)
-    self.id_seq = self.id_seq + 1
-    local item = {
-        id           = self.id_seq,
-        data         = data,
-        scheduled_at = os.time(),
-        execute_at   = os.time() + delay_seconds,
-        delay        = delay_seconds,
-    }
-    table.insert(self.items, item)
-    -- Keep sorted by execute_at
-    table.sort(self.items, function(a, b)
-        return a.execute_at < b.execute_at
+        local credit = db:prepare("UPDATE accounts SET balance = balance + ? WHERE id = ?")
+        credit:bind_values(amount, to_id)
+        credit:step()
+        credit:finalize()
     end)
-    return item.id
-end
 
--- Schedule at specific timestamp
-function DelayQueue:schedule_at(data, timestamp)
-    return self:schedule(data, timestamp - os.time())
-end
-
--- Get messages that are ready to execute
-function DelayQueue:poll(max_items)
-    max_items = max_items or 10
-    local now  = os.time()
-    local ready = {}
-    
-    for i = #self.items, 1, -1 do
-        if self.items[i].execute_at <= now then
-            table.insert(ready, 1, table.remove(self.items, i))
-            if #ready >= max_items then break end
-        end
-    end
-    
-    return ready
-end
-
--- Cancel scheduled message
-function DelayQueue:cancel(id)
-    for i, item in ipairs(self.items) do
-        if item.id == id then
-            table.remove(self.items, i)
-            return true
-        end
-    end
-    return false
-end
-
--- Get next execution time
-function DelayQueue:next_at()
-    if #self.items == 0 then return nil end
-    return self.items[1].execute_at
-end
-
-function DelayQueue:size()
-    return #self.items
-end
-
--- Exponential backoff delay
-function DelayQueue.calc_backoff(attempt, base_delay, max_delay)
-    base_delay = base_delay or 5
-    max_delay  = max_delay or 3600
-    local delay = base_delay * (2 ^ (attempt - 1))
-    -- Add jitter
-    delay = delay + math.random(0, math.floor(delay * 0.1))
-    return math.min(delay, max_delay)
-end
-
--- ทดสอบ
-print("=== Delay Queue ===")
-local dq = DelayQueue.new()
-
--- Schedule various tasks
-local id1 = dq:schedule({ type = "send_email", to = "alice@example.com" }, -2)  -- past (ready)
-local id2 = dq:schedule({ type = "reminder",    id = 1 }, -1)                    -- past (ready)
-local id3 = dq:schedule({ type = "backup",      db = "prod" }, 3600)             -- 1 hour
-local id4 = dq:schedule({ type = "report",      period = "monthly" }, 86400)     -- 1 day
-
-print(string.format("Scheduled %d tasks", dq:size()))
-print("Next execution in:", (dq:next_at() or os.time()) - os.time(), "seconds")
-
--- Poll ready items
-local ready = dq:poll()
-print(string.format("\nReady to process: %d items", #ready))
-for _, item in ipairs(ready) do
-    print(string.format("  [%d] %s (was delayed %ds)",
-        item.id, item.data.type, item.delay))
-end
-
-print("Remaining in queue:", dq:size())
-
--- Backoff calculation
-print("\nExponential backoff for retries:")
-for i = 1, 6 do
-    local delay = DelayQueue.calc_backoff(i, 5, 300)
-    print(string.format("  Attempt %d: retry after %d seconds", i, delay))
-end
-```
-
----
-
-## ตัวอย่างที่ 6: Dead Letter Queue
-
-```lua
--- Dead Letter Queue (DLQ) implementation
-local DLQManager = {}
-DLQManager.__index = DLQManager
-
-function DLQManager.new(config)
-    local self = setmetatable({}, DLQManager)
-    self.config = {
-        max_retries   = config.max_retries   or 3,
-        retry_delay   = config.retry_delay   or 60,
-        dlq_retention = config.dlq_retention or 7 * 86400, -- 7 days
-    }
-    self.main_queue = {}
-    self.retry_queue = {}
-    self.dlq = {}
-    self.stats = { processed = 0, failed = 0, dlq_count = 0, retried = 0 }
-    return self
-end
-
--- Enqueue message
-function DLQManager:enqueue(message)
-    local entry = {
-        id          = os.time() .. "_" .. math.random(1000, 9999),
-        data        = message,
-        attempts    = 0,
-        enqueued_at = os.time(),
-        errors      = {},
-    }
-    table.insert(self.main_queue, entry)
-    return entry.id
-end
-
--- Process next message
-function DLQManager:process_next(processor_fn)
-    if #self.main_queue == 0 then
-        -- Check retry queue
-        local now = os.time()
-        for i = #self.retry_queue, 1, -1 do
-            local item = self.retry_queue[i]
-            if now >= item.retry_at then
-                table.remove(self.retry_queue, i)
-                table.insert(self.main_queue, 1, item)
-            end
-        end
-        if #self.main_queue == 0 then return nil, "Queue empty" end
-    end
-    
-    local message = table.remove(self.main_queue, 1)
-    message.attempts = message.attempts + 1
-    message.last_attempted = os.time()
-    
-    -- Try processing
-    local ok, err = pcall(processor_fn, message.data)
-    
     if ok then
-        self.stats.processed = self.stats.processed + 1
-        return true, message
+        db:exec("COMMIT")
+        return true, "โอนเงินสำเร็จ"
     else
-        -- Failed
-        table.insert(message.errors, {
-            attempt = message.attempts,
-            error   = tostring(err),
-            time    = os.time(),
-        })
-        
-        if message.attempts < self.config.max_retries then
-            -- Schedule retry with exponential backoff
-            local delay = self.config.retry_delay * (2 ^ (message.attempts - 1))
-            message.retry_at = os.time() + delay
-            table.insert(self.retry_queue, message)
-            self.stats.retried = self.stats.retried + 1
-            print(string.format("[DLQ] Message %s retry #%d in %ds",
-                message.id, message.attempts, delay))
-        else
-            -- Move to DLQ
-            message.dlq_reason = "Max retries (" .. self.config.max_retries .. ") exceeded"
-            message.dlq_at     = os.time()
-            table.insert(self.dlq, message)
-            self.stats.failed    = self.stats.failed + 1
-            self.stats.dlq_count = self.stats.dlq_count + 1
-            print(string.format("[DLQ] Message %s moved to DLQ: %s",
-                message.id, message.dlq_reason))
-        end
-        
-        return false, message
+        db:exec("ROLLBACK")
+        return false, "เกิดข้อผิดพลาด: " .. tostring(err)
     end
 end
 
--- Process DLQ messages (manual retry)
-function DLQManager:reprocess_dlq(processor_fn, max_messages)
-    max_messages = max_messages or 10
-    local reprocessed = 0
-    
-    for i = 1, math.min(max_messages, #self.dlq) do
-        local message = table.remove(self.dlq, 1)
-        message.attempts = 0
-        message.errors   = {}
-        message.dlq_reason = nil
-        
-        local ok, _ = pcall(processor_fn, message.data)
-        if ok then
-            reprocessed = reprocessed + 1
-            self.stats.dlq_count = self.stats.dlq_count - 1
-        else
-            -- Re-add to DLQ
-            message.dlq_at = os.time()
-            table.insert(self.dlq, message)
-        end
+-- ทดสอบ transfer
+local function show_balances()
+    for row in db:nrows("SELECT owner, balance FROM accounts ORDER BY id") do
+        print(string.format("  %s: %.2f บาท", row.owner, row.balance))
     end
-    
-    return reprocessed
 end
 
-function DLQManager:stats_summary()
-    return {
-        main_queue   = #self.main_queue,
-        retry_queue  = #self.retry_queue,
-        dlq_count    = #self.dlq,
-        processed    = self.stats.processed,
-        failed       = self.stats.failed,
-        retried      = self.stats.retried,
-    }
-end
+print("=== ก่อน Transfer ===")
+show_balances()
 
--- ทดสอบ
-math.randomseed(os.time())
-print("=== Dead Letter Queue ===")
+local ok, msg = transfer(db, 1, 2, 3000)
+print("\nTransfer 3000 บาท:", msg)
+print("=== หลัง Transfer ===")
+show_balances()
 
-local dlq_manager = DLQManager.new({
-    max_retries  = 3,
-    retry_delay  = 1,
-})
+-- ทดสอบ transfer ที่ล้มเหลว
+ok, msg = transfer(db, 2, 1, 99999)
+print("\nTransfer 99999 บาท:", msg)
+print("=== ยอดไม่เปลี่ยน ===")
+show_balances()
 
--- Enqueue messages
-local msg_ids = {}
-for i = 1, 5 do
-    local id = dlq_manager:enqueue({
-        type    = "process_payment",
-        order_id = i,
-        amount  = math.random(100, 5000),
-    })
-    table.insert(msg_ids, id)
-end
+db:close()
+```
 
-print(string.format("Enqueued %d messages", #msg_ids))
+### ตัวอย่างที่ 5: Batch Insert ด้วย Transaction
 
--- Processor that fails 40% of the time
-local process_count = 0
-local function flaky_processor(data)
-    process_count = process_count + 1
-    if process_count % 3 == 0 then  -- fail every 3rd
-        error("Payment gateway timeout")
+```lua
+-- batch_insert.lua
+local sqlite3 = require("lsqlite3")
+local os = require("os")
+
+local db = sqlite3.open(":memory:")
+
+db:exec([[
+    CREATE TABLE logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        level TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+]])
+
+-- วัดประสิทธิภาพ: insert ทีละรายการ vs batch
+local function time_insert(label, count, use_transaction)
+    local start = os.clock()
+
+    if use_transaction then
+        db:exec("BEGIN TRANSACTION")
     end
-    print(string.format("  ✓ Processed order #%d (%.0f THB)",
-        data.order_id, data.amount))
+
+    local stmt = db:prepare(
+        "INSERT INTO logs (level, message, created_at) VALUES (?, ?, ?)"
+    )
+
+    local levels = {"INFO", "WARN", "ERROR", "DEBUG"}
+    for i = 1, count do
+        local level = levels[(i % 4) + 1]
+        stmt:bind_values(level, "Log message #" .. i, os.time())
+        stmt:step()
+        stmt:reset()
+    end
+
+    stmt:finalize()
+
+    if use_transaction then
+        db:exec("COMMIT")
+    end
+
+    local elapsed = os.clock() - start
+    print(string.format("  %s: %d rows ใน %.3f วินาที",
+        label, count, elapsed))
+
+    -- ล้างข้อมูล
+    db:exec("DELETE FROM logs")
 end
 
--- Process all messages
-print("\nProcessing messages:")
-for i = 1, #msg_ids do
-    dlq_manager:process_next(flaky_processor)
-end
+print("=== Benchmark Insert ===")
+time_insert("ไม่มี Transaction", 100, false)
+time_insert("มี Transaction", 100, true)
+time_insert("Transaction 1000 rows", 1000, true)
 
--- Process retries
-print("\nProcessing retries:")
-for i = 1, #msg_ids do
-    dlq_manager:process_next(flaky_processor)
-end
-
-local stats = dlq_manager:stats_summary()
-print("\nFinal Stats:")
-print("  Processed:", stats.processed)
-print("  In retry queue:", stats.retry_queue)
-print("  In DLQ:", stats.dlq_count)
+db:close()
 ```
 
 ---
 
-## ตัวอย่างที่ 7: Redis-Based Queue
+## 60.3 Advanced Queries และ Indexes
+
+### ตัวอย่างที่ 6: Indexes และ Query Optimization
 
 ```lua
--- Redis-based Queue implementation
-local RedisQueue = {}
-RedisQueue.__index = RedisQueue
+-- indexes.lua
+local sqlite3 = require("lsqlite3")
 
--- Mock Redis for simulation
-local redis_storage = {}
+local db = sqlite3.open(":memory:")
 
-local function redis_rpush(key, value)
-    if not redis_storage[key] then redis_storage[key] = {} end
-    table.insert(redis_storage[key], value)
-    return #redis_storage[key]
+-- สร้างตารางและ indexes
+db:exec([[
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        total_price REAL NOT NULL,
+        status TEXT DEFAULT 'pending',
+        order_date TEXT NOT NULL,
+        shipped_date TEXT
+    );
+    
+    -- สร้าง indexes เพื่อเพิ่มประสิทธิภาพ
+    CREATE INDEX idx_orders_customer ON orders(customer_id);
+    CREATE INDEX idx_orders_status ON orders(status);
+    CREATE INDEX idx_orders_date ON orders(order_date);
+    
+    -- Composite index
+    CREATE INDEX idx_orders_customer_date ON orders(customer_id, order_date);
+]])
+
+-- Populate ข้อมูลทดสอบ
+db:exec("BEGIN")
+local insert = db:prepare([[
+    INSERT INTO orders (customer_id, product_id, quantity, total_price, status, order_date)
+    VALUES (?, ?, ?, ?, ?, ?)
+]])
+
+local statuses = {"pending", "processing", "shipped", "delivered", "cancelled"}
+math.randomseed(42)
+
+for i = 1, 500 do
+    local customer_id = math.random(1, 50)
+    local product_id = math.random(1, 100)
+    local qty = math.random(1, 10)
+    local price = qty * (math.random(100, 5000) / 10)
+    local status = statuses[math.random(#statuses)]
+    local days_ago = math.random(0, 365)
+    local date = string.format("2024-%02d-%02d",
+        math.random(1, 12), math.random(1, 28))
+
+    insert:bind_values(customer_id, product_id, qty, price, status, date)
+    insert:step()
+    insert:reset()
+end
+insert:finalize()
+db:exec("COMMIT")
+
+-- Query ที่ใช้ประโยชน์จาก index
+print("=== Orders by Customer ===")
+local stmt = db:prepare([[
+    SELECT COUNT(*) as cnt, SUM(total_price) as total
+    FROM orders 
+    WHERE customer_id = ? AND status = 'delivered'
+]])
+stmt:bind_values(1)
+for row in stmt:nrows() do
+    print(string.format("  Customer 1 delivered: %d orders, total %.2f", 
+        row.cnt, row.total or 0))
+end
+stmt:finalize()
+
+-- Complex JOIN-like query (SQLite ไม่มี JOIN กับ in-memory tables แต่ทำได้)
+print("\n=== Top 5 Customers by Revenue ===")
+for row in db:nrows([[
+    SELECT 
+        customer_id,
+        COUNT(*) as order_count,
+        SUM(total_price) as total_revenue,
+        AVG(total_price) as avg_order
+    FROM orders
+    WHERE status IN ('shipped', 'delivered')
+    GROUP BY customer_id
+    ORDER BY total_revenue DESC
+    LIMIT 5
+]]) do
+    print(string.format("  Customer %d: %d orders, %.2f รวม",
+        row.customer_id, row.order_count, row.total_revenue))
 end
 
-local function redis_lpop(key)
-    if not redis_storage[key] or #redis_storage[key] == 0 then return nil end
-    return table.remove(redis_storage[key], 1)
-end
+db:close()
+```
 
-local function redis_brpoplpush(source, dest, timeout)
-    -- Block right pop + left push (atomic)
-    if not redis_storage[source] or #redis_storage[source] == 0 then
-        return nil  -- timeout
+### ตัวอย่างที่ 7: Full-Text Search ด้วย FTS5
+
+```lua
+-- fts_search.lua
+local sqlite3 = require("lsqlite3")
+
+local db = sqlite3.open(":memory:")
+
+-- สร้าง FTS virtual table
+db:exec([[
+    CREATE VIRTUAL TABLE articles USING fts5(
+        title,
+        content,
+        author,
+        tokenize = "unicode61 remove_diacritics 1"
+    )
+]])
+
+-- เพิ่มบทความ
+local articles = {
+    {
+        title = "Introduction to Lua Programming",
+        content = "Lua is a powerful scripting language designed for embedded systems. It has a simple syntax and is easy to learn.",
+        author = "John Doe"
+    },
+    {
+        title = "Advanced Lua Techniques",
+        content = "Learn advanced concepts like metatables, coroutines, and closures in Lua programming language.",
+        author = "Jane Smith"
+    },
+    {
+        title = "Lua for Game Development",
+        content = "Many game engines use Lua for scripting. LÖVE2D and Defold are popular choices for indie game developers.",
+        author = "Game Dev"
+    },
+    {
+        title = "SQLite with Lua",
+        content = "SQLite is an embedded database perfect for Lua applications. Learn how to use lsqlite3 library.",
+        author = "DB Expert"
+    },
+    {
+        title = "Web Development with OpenResty",
+        content = "OpenResty combines Nginx with Lua to create high-performance web applications and APIs.",
+        author = "Web Dev"
+    },
+}
+
+local insert = db:prepare("INSERT INTO articles VALUES (?, ?, ?)")
+for _, article in ipairs(articles) do
+    insert:bind_values(article.title, article.content, article.author)
+    insert:step()
+    insert:reset()
+end
+insert:finalize()
+
+-- ค้นหา
+local function search(query)
+    print(string.format("\n=== Search: '%s' ===", query))
+    local stmt = db:prepare([[
+        SELECT title, author, 
+               snippet(articles, 1, '<mark>', '</mark>', '...', 15) as excerpt
+        FROM articles 
+        WHERE articles MATCH ?
+        ORDER BY rank
+    ]])
+    stmt:bind_values(query)
+
+    local found = 0
+    for row in stmt:nrows() do
+        found = found + 1
+        print(string.format("  [%d] %s (โดย %s)", found, row.title, row.author))
+        print(string.format("      %s", row.excerpt))
     end
-    local val = table.remove(redis_storage[source])  -- right pop
-    if not redis_storage[dest] then redis_storage[dest] = {} end
-    table.insert(redis_storage[dest], 1, val)  -- left push to dest
-    return val
-end
 
-local function redis_llen(key)
-    return #(redis_storage[key] or {})
-end
-
-local function redis_lrange(key, start, stop)
-    local list = redis_storage[key] or {}
-    local result = {}
-    local len = #list
-    if start < 0 then start = len + start + 1 end
-    if stop < 0 then stop = len + stop + 1 end
-    for i = start + 1, math.min(stop + 1, len) do
-        table.insert(result, list[i])
+    if found == 0 then
+        print("  ไม่พบผลลัพธ์")
     end
+    stmt:finalize()
+end
+
+search("Lua")
+search("game development")
+search("embedded database")
+search("Python")  -- ไม่มีใน database
+
+db:close()
+```
+
+---
+
+## 60.4 ORM Pattern สำหรับ SQLite
+
+### ตัวอย่างที่ 8: Simple ORM
+
+```lua
+-- simple_orm.lua
+local sqlite3 = require("lsqlite3")
+
+-- Base Model class
+local Model = {}
+Model.__index = Model
+
+function Model.new(db, table_name, schema)
+    local instance = setmetatable({}, Model)
+    instance._db = db
+    instance._table = table_name
+    instance._schema = schema
+    instance:_create_table()
+    return instance
+end
+
+function Model:_create_table()
+    local columns = {"id INTEGER PRIMARY KEY AUTOINCREMENT"}
+    for _, col in ipairs(self._schema) do
+        table.insert(columns, col.name .. " " .. col.type ..
+            (col.not_null and " NOT NULL" or "") ..
+            (col.default ~= nil and " DEFAULT " .. tostring(col.default) or ""))
+    end
+    table.insert(columns, "created_at INTEGER DEFAULT (strftime('%s', 'now'))")
+    table.insert(columns, "updated_at INTEGER DEFAULT (strftime('%s', 'now'))")
+
+    local sql = string.format("CREATE TABLE IF NOT EXISTS %s (%s)",
+        self._table, table.concat(columns, ", "))
+    self._db:exec(sql)
+end
+
+function Model:create(data)
+    local cols = {}
+    local placeholders = {}
+    local values = {}
+
+    for _, col in ipairs(self._schema) do
+        if data[col.name] ~= nil then
+            table.insert(cols, col.name)
+            table.insert(placeholders, "?")
+            table.insert(values, data[col.name])
+        end
+    end
+
+    local sql = string.format(
+        "INSERT INTO %s (%s) VALUES (%s)",
+        self._table,
+        table.concat(cols, ", "),
+        table.concat(placeholders, ", ")
+    )
+
+    local stmt = self._db:prepare(sql)
+    stmt:bind_values(table.unpack(values))
+    stmt:step()
+    stmt:finalize()
+
+    return self:find(self._db:last_insert_rowid())
+end
+
+function Model:find(id)
+    local stmt = self._db:prepare(
+        "SELECT * FROM " .. self._table .. " WHERE id = ?"
+    )
+    stmt:bind_values(id)
+    local row = stmt:first_row()
+    stmt:finalize()
+
+    if not row then return nil end
+
+    -- แปลง numeric row เป็น named table
+    local result = {id = row[1]}
+    for i, col in ipairs(self._schema) do
+        result[col.name] = row[i + 1]
+    end
+    result.created_at = row[#self._schema + 2]
+    result.updated_at = row[#self._schema + 3]
     return result
 end
 
-local function redis_lrem(key, count, value)
-    local list = redis_storage[key]
-    if not list then return 0 end
-    local removed = 0
-    for i = #list, 1, -1 do
-        if list[i] == value then
-            table.remove(list, i)
-            removed = removed + 1
-            if count > 0 and removed >= count then break end
-        end
-    end
-    return removed
-end
+function Model:where(conditions, limit, order)
+    local wheres = {}
+    local values = {}
 
--- JSON serialize/deserialize (simple)
-local function serialize(data)
-    if type(data) == "string" then return data end
-    local parts = {}
-    for k, v in pairs(data) do
-        local val_str
-        if type(v) == "string" then
-            val_str = '"' .. v:gsub('"', '\\"') .. '"'
-        elseif type(v) == "number" or type(v) == "boolean" then
-            val_str = tostring(v)
+    for col, val in pairs(conditions) do
+        if type(val) == "table" then
+            -- Support {op, value}
+            table.insert(wheres, col .. " " .. val[1] .. " ?")
+            table.insert(values, val[2])
         else
-            val_str = '"' .. tostring(v) .. '"'
+            table.insert(wheres, col .. " = ?")
+            table.insert(values, val)
         end
-        table.insert(parts, '"' .. k .. '":' .. val_str)
     end
-    return "{" .. table.concat(parts, ",") .. "}"
-end
 
-local function deserialize(str)
-    -- Simple JSON parser for flat objects
-    local obj = {}
-    for k, v in str:gmatch('"(%w+)"%s*:%s*"([^"]*)"') do
-        obj[k] = v
+    local sql = "SELECT * FROM " .. self._table
+    if #wheres > 0 then
+        sql = sql .. " WHERE " .. table.concat(wheres, " AND ")
     end
-    for k, v in str:gmatch('"(%w+)"%s*:%s*(%d+)') do
-        obj[k] = tonumber(v)
+    if order then sql = sql .. " ORDER BY " .. order end
+    if limit then sql = sql .. " LIMIT " .. limit end
+
+    local stmt = self._db:prepare(sql)
+    if #values > 0 then
+        stmt:bind_values(table.unpack(values))
     end
-    for k, v in str:gmatch('"(%w+)"%s*:%s*(true)') do
-        obj[k] = true
+
+    local results = {}
+    for numeric_row in stmt:urows() do
+        local row = {id = numeric_row[1]}
+        for i, col in ipairs(self._schema) do
+            row[col.name] = numeric_row[i + 1]
+        end
+        table.insert(results, row)
     end
-    for k, v in str:gmatch('"(%w+)"%s*:%s*(false)') do
-        obj[k] = false
+    stmt:finalize()
+
+    return results
+end
+
+function Model:update(id, data)
+    local sets = {}
+    local values = {}
+
+    for _, col in ipairs(self._schema) do
+        if data[col.name] ~= nil then
+            table.insert(sets, col.name .. " = ?")
+            table.insert(values, data[col.name])
+        end
     end
-    return obj
+
+    table.insert(sets, "updated_at = strftime('%s', 'now')")
+    table.insert(values, id)
+
+    local sql = string.format(
+        "UPDATE %s SET %s WHERE id = ?",
+        self._table, table.concat(sets, ", ")
+    )
+
+    local stmt = self._db:prepare(sql)
+    stmt:bind_values(table.unpack(values))
+    stmt:step()
+    stmt:finalize()
+
+    return self:find(id)
 end
 
-function RedisQueue.new(config)
-    local self = setmetatable({}, RedisQueue)
-    self.name         = config.name or "default"
-    self.processing   = config.name .. ":processing"
-    self.failed       = config.name .. ":failed"
-    self.max_retries  = config.max_retries or 3
-    return self
+function Model:delete(id)
+    local stmt = self._db:prepare(
+        "DELETE FROM " .. self._table .. " WHERE id = ?"
+    )
+    stmt:bind_values(id)
+    stmt:step()
+    local affected = self._db:changes()
+    stmt:finalize()
+    return affected > 0
 end
 
--- Enqueue (RPUSH to end)
-function RedisQueue:push(job_data)
-    local job = {
-        id          = tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999)),
-        data        = job_data,
-        attempts    = 0,
-        created_at  = os.time(),
-    }
-    local serialized = serialize(job)
-    redis_rpush(self.name, serialized)
-    return job.id
-end
+function Model:count(conditions)
+    local wheres = {}
+    local values = {}
 
--- Dequeue (LPOP from front, atomically move to processing)
-function RedisQueue:pop()
-    local raw = redis_brpoplpush(self.name, self.processing, 0)
-    if not raw then return nil end
-    
-    -- Parse
-    local id = raw:match('"id":"([^"]+)"')
-    local data_str = raw:match('"data":{([^}]+)}')
-    
-    return {
-        id       = id,
-        raw      = raw,
-        data     = data_str and deserialize("{" .. data_str .. "}") or {},
-        attempts = tonumber(raw:match('"attempts":(%d+)') or "0"),
-    }
-end
-
--- Acknowledge: remove from processing
-function RedisQueue:ack(job)
-    redis_lrem(self.processing, 1, job.raw)
-end
-
--- Nack: move back to main queue or DLQ
-function RedisQueue:nack(job, error_msg)
-    redis_lrem(self.processing, 1, job.raw)
-    
-    local new_attempts = (job.attempts or 0) + 1
-    
-    if new_attempts <= self.max_retries then
-        -- Re-queue for retry
-        local retry_job = job.raw:gsub('"attempts":(%d+)', '"attempts":' .. new_attempts)
-        redis_rpush(self.name, retry_job)
-        print(string.format("[Queue] Retry %d/%d for job %s",
-            new_attempts, self.max_retries, job.id or "?"))
-    else
-        -- Move to DLQ
-        local dlq_entry = job.raw .. ',"error":"' .. (error_msg or "unknown") .. '"'
-        redis_rpush(self.failed, dlq_entry)
-        print(string.format("[Queue] Job %s moved to DLQ after %d attempts",
-            job.id or "?", new_attempts))
+    if conditions then
+        for col, val in pairs(conditions) do
+            table.insert(wheres, col .. " = ?")
+            table.insert(values, val)
+        end
     end
+
+    local sql = "SELECT COUNT(*) FROM " .. self._table
+    if #wheres > 0 then
+        sql = sql .. " WHERE " .. table.concat(wheres, " AND ")
+    end
+
+    local stmt = self._db:prepare(sql)
+    if #values > 0 then
+        stmt:bind_values(table.unpack(values))
+    end
+    local row = stmt:first_row()
+    stmt:finalize()
+
+    return row and row[1] or 0
 end
 
-function RedisQueue:length()
-    return redis_llen(self.name)
-end
+-- ทดสอบ ORM
+local db = sqlite3.open(":memory:")
 
-function RedisQueue:processing_count()
-    return redis_llen(self.processing)
-end
-
-function RedisQueue:dlq_count()
-    return redis_llen(self.failed)
-end
-
--- ทดสอบ
-math.randomseed(os.time())
-print("=== Redis-Based Queue ===")
-
-local queue = RedisQueue.new({
-    name         = "jobs:email",
-    max_retries  = 2,
+-- สร้าง User model
+local User = Model.new(db, "users", {
+    {name = "name", type = "TEXT", not_null = true},
+    {name = "email", type = "TEXT", not_null = true},
+    {name = "age", type = "INTEGER"},
+    {name = "active", type = "INTEGER", default = 1},
 })
 
--- Push jobs
-local job_types = {
-    { type = "welcome",      recipient = "alice@example.com" },
-    { type = "order_confirm", recipient = "bob@example.com",  order_id = 42 },
-    { type = "password_reset", recipient = "charlie@example.com", token = "xyz" },
-}
+-- Create
+print("=== Creating Users ===")
+local u1 = User:create({name = "สมชาย", email = "somchai@test.com", age = 30})
+local u2 = User:create({name = "สมหญิง", email = "somying@test.com", age = 25})
+local u3 = User:create({name = "มานะ", email = "mana@test.com", age = 35, active = 0})
 
-for _, job in ipairs(job_types) do
-    local id = queue:push(job)
-    print(string.format("Pushed job %s", id:sub(1, 15) .. "..."))
+print("Created user:", u1.id, u1.name, u1.email)
+
+-- Find
+print("\n=== Finding User ===")
+local found = User:find(2)
+print("Found:", found.name, "age:", found.age)
+
+-- Where
+print("\n=== Active Users ===")
+local actives = User:where({active = 1}, nil, "name ASC")
+for _, u in ipairs(actives) do
+    print("  -", u.name, "(อายุ", u.age, ")")
 end
 
-print(string.format("Queue length: %d", queue:length()))
+-- Update
+print("\n=== Update User ===")
+local updated = User:update(1, {age = 31, active = 1})
+print("Updated:", updated.name, "age:", updated.age)
 
--- Process with some failures
-local fail_count = 0
-print("\nProcessing:")
-for i = 1, #job_types do
-    local job = queue:pop()
-    if job then
-        print(string.format("  Got job [%s] attempts=%d",
-            job.id and job.id:sub(1, 12) or "?", job.attempts))
-        
-        fail_count = fail_count + 1
-        if fail_count == 2 then
-            -- Simulate failure
-            queue:nack(job, "SMTP connection refused")
-        else
-            queue:ack(job)
-            print("  ✓ Acknowledged")
-        end
-    end
-end
+-- Count
+print("\n=== Count ===")
+print("Total users:", User:count())
+print("Active users:", User:count({active = 1}))
 
-print(string.format("\nQueue: %d, Processing: %d, DLQ: %d",
-    queue:length(), queue:processing_count(), queue:dlq_count()))
+-- Delete
+print("\n=== Delete User ===")
+local deleted = User:delete(3)
+print("Deleted:", deleted)
+print("Remaining:", User:count())
+
+db:close()
 ```
 
 ---
 
-## ตัวอย่างที่ 8: Publish/Subscribe
+## 60.5 NoSQL Patterns ใน Lua
+
+### ตัวอย่างที่ 9: Document Store ด้วย SQLite JSON
 
 ```lua
--- Pub/Sub Message Broker
-local PubSubBroker = {}
-PubSubBroker.__index = PubSubBroker
+-- document_store.lua
+-- SQLite 3.38+ รองรับ JSON functions
 
-function PubSubBroker.new(config)
-    local self = setmetatable({}, PubSubBroker)
-    self.subscribers   = {}   -- topic -> [{ id, callback, filter }]
-    self.message_log   = {}   -- history for replay
-    self.max_history   = config and config.max_history or 100
-    self.stats         = { published = 0, delivered = 0 }
-    return self
-end
+local sqlite3 = require("lsqlite3")
 
--- Subscribe to topic
-function PubSubBroker:subscribe(topic, callback, options)
-    if not self.subscribers[topic] then
-        self.subscribers[topic] = {}
+local db = sqlite3.open(":memory:")
+
+-- สร้าง document store table
+db:exec([[
+    CREATE TABLE documents (
+        id TEXT PRIMARY KEY,
+        collection TEXT NOT NULL,
+        data TEXT NOT NULL,  -- JSON
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+    );
+    
+    CREATE INDEX idx_doc_collection ON documents(collection);
+]])
+
+-- JSON encoding/decoding แบบง่าย
+local function json_encode(t)
+    if type(t) == "number" then return tostring(t) end
+    if type(t) == "boolean" then return t and "true" or "false" end
+    if type(t) == "string" then
+        return '"' .. t:gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
     end
-    
-    local sub = {
-        id       = tostring(#self.subscribers[topic] + 1) .. "_" .. topic,
-        callback = callback,
-        filter   = options and options.filter,
-        group    = options and options.group,
-        created  = os.time(),
-    }
-    
-    table.insert(self.subscribers[topic], sub)
-    return sub.id
-end
-
--- Unsubscribe
-function PubSubBroker:unsubscribe(sub_id)
-    for topic, subs in pairs(self.subscribers) do
-        for i, sub in ipairs(subs) do
-            if sub.id == sub_id then
-                table.remove(subs, i)
-                print("[PubSub] Unsubscribed: " .. sub_id)
-                return true
+    if type(t) == "table" then
+        -- ตรวจว่าเป็น array หรือ object
+        local is_array = #t > 0
+        if is_array then
+            local parts = {}
+            for _, v in ipairs(t) do
+                table.insert(parts, json_encode(v))
             end
-        end
-    end
-    return false
-end
-
--- Publish to topic
-function PubSubBroker:publish(topic, message, metadata)
-    local msg = {
-        id        = os.time() .. "_" .. math.random(1000, 9999),
-        topic     = topic,
-        data      = message,
-        metadata  = metadata or {},
-        timestamp = os.time(),
-    }
-    
-    self.stats.published = self.stats.published + 1
-    
-    -- Store in history
-    table.insert(self.message_log, msg)
-    if #self.message_log > self.max_history then
-        table.remove(self.message_log, 1)
-    end
-    
-    -- Deliver to subscribers
-    local subs = self.subscribers[topic] or {}
-    local delivered = 0
-    
-    -- Consumer group: only ONE consumer in group gets the message
-    local group_seen = {}
-    
-    for _, sub in ipairs(subs) do
-        -- Check filter
-        if sub.filter and not sub.filter(msg) then
-            goto continue
-        end
-        
-        -- Consumer group deduplication
-        if sub.group then
-            if group_seen[sub.group] then goto continue end
-            group_seen[sub.group] = true
-        end
-        
-        local ok, err = pcall(sub.callback, msg)
-        if ok then
-            delivered = delivered + 1
-            self.stats.delivered = self.stats.delivered + 1
+            return "[" .. table.concat(parts, ",") .. "]"
         else
-            print(string.format("[PubSub] Delivery failed to %s: %s", sub.id, err))
-        end
-        
-        ::continue::
-    end
-    
-    return msg.id, delivered
-end
-
--- Replay messages from specific time
-function PubSubBroker:replay(topic, from_timestamp, callback)
-    local replayed = 0
-    for _, msg in ipairs(self.message_log) do
-        if msg.topic == topic and msg.timestamp >= from_timestamp then
-            callback(msg)
-            replayed = replayed + 1
-        end
-    end
-    return replayed
-end
-
--- Wildcard subscription (pattern matching)
-function PubSubBroker:subscribe_pattern(pattern, callback)
-    -- Store pattern subscriber
-    if not self.subscribers["__patterns__"] then
-        self.subscribers["__patterns__"] = {}
-    end
-    local sub = {
-        id       = "pattern_" .. pattern,
-        pattern  = pattern,
-        callback = callback,
-    }
-    table.insert(self.subscribers["__patterns__"], sub)
-    return sub.id
-end
-
--- Override publish to check patterns
-local orig_publish = PubSubBroker.publish
-PubSubBroker.publish = function(self, topic, message, metadata)
-    local msg_id, delivered = orig_publish(self, topic, message, metadata)
-    
-    -- Check pattern subscribers
-    local patterns = self.subscribers["__patterns__"] or {}
-    for _, sub in ipairs(patterns) do
-        local lua_pattern = sub.pattern:gsub("%*", ".*"):gsub("%?", ".")
-        if topic:match("^" .. lua_pattern .. "$") then
-            pcall(sub.callback, {
-                id = msg_id, topic = topic, data = message,
-                metadata = metadata, timestamp = os.time()
-            })
-            delivered = delivered + 1
-        end
-    end
-    
-    return msg_id, delivered
-end
-
--- ทดสอบ
-math.randomseed(os.time())
-print("=== Pub/Sub Message Broker ===")
-
-local broker = PubSubBroker.new({ max_history = 50 })
-
--- Subscribe
-broker:subscribe("orders.created", function(msg)
-    print(string.format("  [Order Handler] New order: %s",
-        type(msg.data) == "table" and msg.data.id or tostring(msg.data)))
-end)
-
-broker:subscribe("orders.created", function(msg)
-    print(string.format("  [Inventory Handler] Reserve stock for order: %s",
-        type(msg.data) == "table" and (msg.data.product or "?") or "?"))
-end)
-
-broker:subscribe("orders.created", function(msg)
-    print(string.format("  [Email Handler] Send confirmation for order %s",
-        type(msg.data) == "table" and msg.data.id or "?"))
-end, { group = "notification-group" })
-
-broker:subscribe("orders.updated", function(msg)
-    print(string.format("  [Audit Handler] Order updated: %s -> %s",
-        type(msg.data) == "table" and (msg.data.id or "?") or "?",
-        type(msg.data) == "table" and (msg.data.status or "?") or "?"))
-end)
-
--- Pattern subscriber
-broker:subscribe_pattern("orders.*", function(msg)
-    print(string.format("  [Analytics] Event on topic '%s'", msg.topic))
-end)
-
--- Publish
-print("\nPublishing events:")
-local id1, cnt1 = broker:publish("orders.created", {
-    id      = 1001,
-    product = "Laptop",
-    amount  = 35000,
-    user_id = 1,
-})
-print(string.format("Published to orders.created: %d receivers", cnt1))
-
-local id2, cnt2 = broker:publish("orders.updated", {
-    id     = 1001,
-    status = "shipped",
-})
-print(string.format("Published to orders.updated: %d receivers", cnt2))
-
-print("\nBroker stats:", broker.stats.published, "published,",
-      broker.stats.delivered, "total deliveries")
-```
-
----
-
-## ตัวอย่างที่ 9: Topic Exchange (RabbitMQ-style)
-
-```lua
--- Topic Exchange - Routes messages based on routing keys
-local TopicExchange = {}
-TopicExchange.__index = TopicExchange
-
-function TopicExchange.new(name)
-    local self = setmetatable({}, TopicExchange)
-    self.name    = name
-    self.queues  = {}   -- queue_name -> { messages }
-    self.bindings = {}  -- { queue, pattern }
-    return self
-end
-
--- Bind queue to exchange with routing key pattern
-function TopicExchange:bind(queue_name, pattern)
-    if not self.queues[queue_name] then
-        self.queues[queue_name] = {}
-    end
-    table.insert(self.bindings, { queue = queue_name, pattern = pattern })
-    print(string.format("[Exchange:%s] Bound queue '%s' with pattern '%s'",
-        self.name, queue_name, pattern))
-end
-
--- Match routing key against pattern
--- * matches one word, # matches zero or more words
-local function routing_key_matches(pattern, routing_key)
-    -- Convert AMQP pattern to Lua pattern
-    local lua_pat = "^"
-    
-    for part in (pattern .. "."):gmatch("([^%.]*%.?)") do
-        local word = part:gsub("%.$", "")
-        local has_dot = part:match("%.$") and "%" .. "." or ""
-        
-        if word == "#" then
-            lua_pat = lua_pat .. "([%w_]+%.)*([%w_]+)?"
-        elseif word == "*" then
-            lua_pat = lua_pat .. "[%w_]+" .. has_dot
-        else
-            lua_pat = lua_pat .. word:gsub("%.", "%%.") .. has_dot
-        end
-    end
-    
-    lua_pat = lua_pat .. "$"
-    
-    return routing_key:match(lua_pat) ~= nil
-end
-
--- Publish to exchange
-function TopicExchange:publish(routing_key, message)
-    local routed_to = {}
-    
-    for _, binding in ipairs(self.bindings) do
-        if routing_key_matches(binding.pattern, routing_key) then
-            if not self.queues[binding.queue] then
-                self.queues[binding.queue] = {}
+            local parts = {}
+            for k, v in pairs(t) do
+                table.insert(parts, '"' .. k .. '":' .. json_encode(v))
             end
-            table.insert(self.queues[binding.queue], {
-                routing_key = routing_key,
-                data        = message,
-                timestamp   = os.time(),
-            })
-            table.insert(routed_to, binding.queue)
+            return "{" .. table.concat(parts, ",") .. "}"
         end
     end
-    
-    print(string.format("[Exchange:%s] Routing '%s' -> [%s]",
-        self.name, routing_key, table.concat(routed_to, ", ")))
-    
-    return #routed_to
+    return "null"
 end
 
--- Consume from queue
-function TopicExchange:consume(queue_name)
-    if not self.queues[queue_name] or #self.queues[queue_name] == 0 then
-        return nil
-    end
-    return table.remove(self.queues[queue_name], 1)
+-- UUID generator แบบง่าย
+local function uuid()
+    math.randomseed(os.time() + math.random(1000000))
+    return string.format("%08x-%04x-%04x-%04x-%012x",
+        math.random(0xFFFFFFFF),
+        math.random(0xFFFF),
+        math.random(0xFFFF),
+        math.random(0xFFFF),
+        math.random(0xFFFFFFFFFFFF)
+    )
 end
 
--- Queue stats
-function TopicExchange:queue_stats()
-    local stats = {}
-    for name, queue in pairs(self.queues) do
-        stats[name] = #queue
-    end
-    return stats
+-- DocumentStore class
+local DocumentStore = {}
+DocumentStore.__index = DocumentStore
+
+function DocumentStore.new(db)
+    return setmetatable({_db = db}, DocumentStore)
 end
 
--- ทดสอบ
-print("=== Topic Exchange (AMQP-style) ===")
+function DocumentStore:insert(collection, doc)
+    local id = doc._id or uuid()
+    doc._id = id
 
-local exchange = TopicExchange.new("events")
+    local stmt = self._db:prepare([[
+        INSERT OR REPLACE INTO documents (id, collection, data)
+        VALUES (?, ?, ?)
+    ]])
+    stmt:bind_values(id, collection, json_encode(doc))
+    stmt:step()
+    stmt:finalize()
 
--- Bind queues with patterns
--- Syntax: * = one word, # = zero or more words
-exchange:bind("all_orders",        "order.#")         -- all order events
-exchange:bind("order_payments",    "order.*.payment") -- payment events
-exchange:bind("critical_events",   "*.critical.*")    -- all critical events
-exchange:bind("user_notifications", "user.#")         -- user events
-exchange:bind("analytics",          "#")              -- everything
-
--- Publish messages
-print("\nPublishing events:")
-local routing_keys = {
-    "order.created",
-    "order.1001.payment",
-    "order.cancelled",
-    "user.login",
-    "user.critical.breach",
-    "system.health",
-    "system.critical.downtime",
-}
-
-for _, key in ipairs(routing_keys) do
-    local count = exchange:publish(key, { event = key, timestamp = os.time() })
-    print(string.format("  Routed to %d queues", count))
-end
-
--- Queue sizes
-print("\nQueue sizes:")
-local stats = exchange:queue_stats()
-for queue, count in pairs(stats) do
-    print(string.format("  %-25s: %d messages", queue, count))
-end
-
--- Consume from analytics
-print("\nConsuming from 'all_orders':")
-local msg
-repeat
-    msg = exchange:consume("all_orders")
-    if msg then
-        print(string.format("  [%s] %s", msg.routing_key, tostring(msg.data.event)))
-    end
-until not msg
-```
-
----
-
-## ตัวอย่างที่ 10: Message Retry with Backoff
-
-```lua
--- Message Retry with Exponential Backoff
-local RetryManager = {}
-RetryManager.__index = RetryManager
-
-function RetryManager.new(config)
-    local self = setmetatable({}, RetryManager)
-    self.config = {
-        max_attempts = config.max_attempts or 5,
-        base_delay   = config.base_delay   or 5,    -- seconds
-        max_delay    = config.max_delay    or 3600, -- 1 hour
-        jitter       = config.jitter       ~= false, -- add randomness
-        backoff_type = config.backoff_type or "exponential",
-    }
-    self.pending  = {}
-    self.history  = {}
-    return self
-end
-
--- Calculate delay for next retry
-function RetryManager:calc_delay(attempt)
-    local base  = self.config.base_delay
-    local max_d = self.config.max_delay
-    local delay
-    
-    if self.config.backoff_type == "exponential" then
-        delay = base * (2 ^ (attempt - 1))
-    elseif self.config.backoff_type == "linear" then
-        delay = base * attempt
-    elseif self.config.backoff_type == "constant" then
-        delay = base
-    else
-        delay = base
-    end
-    
-    -- Cap at max delay
-    delay = math.min(delay, max_d)
-    
-    -- Add jitter: ±10% random
-    if self.config.jitter then
-        local jitter_range = math.floor(delay * 0.1)
-        if jitter_range > 0 then
-            delay = delay + math.random(-jitter_range, jitter_range)
-        end
-    end
-    
-    return math.max(1, delay)
-end
-
--- Submit job with retry logic
-function RetryManager:submit(job_id, job_data, process_fn)
-    local attempts = 0
-    local last_error = nil
-    
-    while attempts < self.config.max_attempts do
-        attempts = attempts + 1
-        print(string.format("[Retry] Job %s: attempt %d/%d",
-            job_id, attempts, self.config.max_attempts))
-        
-        local ok, err = pcall(process_fn, job_data)
-        
-        if ok then
-            table.insert(self.history, {
-                job_id   = job_id,
-                attempts = attempts,
-                success  = true,
-                time     = os.time(),
-            })
-            print(string.format("[Retry] Job %s: SUCCESS after %d attempts",
-                job_id, attempts))
-            return true, attempts
-        else
-            last_error = tostring(err)
-            
-            if attempts < self.config.max_attempts then
-                local delay = self:calc_delay(attempts)
-                print(string.format("[Retry] Job %s: FAILED (%s), retry in %ds",
-                    job_id, last_error, delay))
-                -- ในระบบจริงจะ sleep หรือใส่ delay queue
-                -- os.execute("sleep " .. delay)
-            end
-        end
-    end
-    
-    -- All attempts exhausted
-    table.insert(self.history, {
-        job_id    = job_id,
-        attempts  = attempts,
-        success   = false,
-        error     = last_error,
-        time      = os.time(),
-    })
-    print(string.format("[Retry] Job %s: EXHAUSTED (%d attempts)",
-        job_id, attempts))
-    return false, attempts
-end
-
--- Show delay schedule
-function RetryManager:show_schedule(attempts)
-    attempts = attempts or self.config.max_attempts
-    print(string.format("\nRetry schedule (%s backoff, base=%ds, max=%ds):",
-        self.config.backoff_type, self.config.base_delay, self.config.max_delay))
-    
-    local total = 0
-    for i = 1, attempts do
-        local delay = self:calc_delay(i)
-        total = total + delay
-        print(string.format("  Attempt %d: wait %4ds (total: %ds)",
-            i, delay, total))
-    end
-end
-
--- ทดสอบ
-math.randomseed(os.time())
-print("=== Message Retry with Backoff ===")
-
-local retry_mgr = RetryManager.new({
-    max_attempts = 5,
-    base_delay   = 2,
-    max_delay    = 60,
-    backoff_type = "exponential",
-    jitter       = false,
-})
-
-retry_mgr:show_schedule()
-
--- Test job that fails first N times
-local attempts_before_success = 3
-local call_count = 0
-
-local function unstable_processor(data)
-    call_count = call_count + 1
-    if call_count < attempts_before_success then
-        error("Connection timeout: " .. call_count)
-    end
-    print("  ✓ Processed: " .. tostring(data.message))
-end
-
-print("\nRunning job with flaky processor (fails first 2 attempts):")
-local success, total_attempts = retry_mgr:submit(
-    "job_001",
-    { message = "Process this data" },
-    unstable_processor
-)
-
-print(string.format("\nResult: success=%s, total_attempts=%d",
-    tostring(success), total_attempts))
-```
-
----
-
-## ตัวอย่างที่ 11: Idempotency
-
-```lua
--- Idempotent Message Processing
-local IdempotencyManager = {}
-IdempotencyManager.__index = IdempotencyManager
-
-function IdempotencyManager.new(config)
-    local self = setmetatable({}, IdempotencyManager)
-    self.processed_keys = {}  -- idempotency_key -> result
-    self.key_ttl = config and config.ttl or 86400  -- 24 hours
-    self.stats = { processed = 0, skipped = 0 }
-    return self
-end
-
--- Generate idempotency key
-function IdempotencyManager.generate_key(data)
-    if type(data) == "string" then return data end
-    
-    -- Create deterministic key from data
-    local parts = {}
-    local keys = {}
-    for k in pairs(data) do table.insert(keys, k) end
-    table.sort(keys)
-    
-    for _, k in ipairs(keys) do
-        table.insert(parts, k .. "=" .. tostring(data[k]))
-    end
-    
-    local combined = table.concat(parts, "&")
-    
-    -- Simple hash
-    local hash = 0
-    for i = 1, #combined do
-        hash = ((hash * 31) + string.byte(combined, i)) % (2^32)
-    end
-    
-    return string.format("idem_%08x", hash)
-end
-
--- Process with idempotency check
-function IdempotencyManager:process(idempotency_key, job_data, process_fn)
-    -- Check if already processed
-    local existing = self.processed_keys[idempotency_key]
-    if existing then
-        if os.time() < existing.expires_at then
-            self.stats.skipped = self.stats.skipped + 1
-            print(string.format("[Idempotent] SKIP (already processed): %s", idempotency_key))
-            return existing.result, true  -- result, was_duplicate
-        else
-            self.processed_keys[idempotency_key] = nil
-        end
-    end
-    
-    -- Process for first time
-    local ok, result = pcall(process_fn, job_data)
-    
-    if ok then
-        self.processed_keys[idempotency_key] = {
-            result     = result,
-            processed_at = os.time(),
-            expires_at = os.time() + self.key_ttl,
-        }
-        self.stats.processed = self.stats.processed + 1
-        return result, false  -- result, was_duplicate
-    else
-        return nil, false, tostring(result)  -- error
-    end
-end
-
--- Cleanup expired keys
-function IdempotencyManager:cleanup()
-    local now = os.time()
-    local removed = 0
-    for key, entry in pairs(self.processed_keys) do
-        if now > entry.expires_at then
-            self.processed_keys[key] = nil
-            removed = removed + 1
-        end
-    end
-    return removed
-end
-
--- ทดสอบ
-print("=== Idempotency ===")
-
-local idem = IdempotencyManager.new({ ttl = 300 })
-
--- Simulate duplicate webhook deliveries
-local webhook_events = {
-    { id = "evt_001", type = "payment.succeeded", amount = 1500 },
-    { id = "evt_002", type = "order.created",     order_id = 42 },
-    { id = "evt_001", type = "payment.succeeded", amount = 1500 },  -- duplicate!
-    { id = "evt_003", type = "user.verified",     user_id = 5 },
-    { id = "evt_002", type = "order.created",     order_id = 42 },  -- duplicate!
-    { id = "evt_001", type = "payment.succeeded", amount = 1500 },  -- duplicate!
-}
-
-print("Processing webhook events:")
-for _, event in ipairs(webhook_events) do
-    local key = "webhook_" .. event.id
-    
-    local result, was_dup = idem:process(key, event, function(data)
-        -- Process the event
-        if data.type == "payment.succeeded" then
-            print(string.format("  [NEW] Recording payment of %.0f THB", data.amount))
-            return { recorded = true, amount = data.amount }
-        elseif data.type == "order.created" then
-            print(string.format("  [NEW] Creating order #%d", data.order_id))
-            return { created = true, order_id = data.order_id }
-        elseif data.type == "user.verified" then
-            print(string.format("  [NEW] Verifying user #%d", data.user_id))
-            return { verified = true }
-        end
-    end)
-    
-    if was_dup then
-        print(string.format("  [DUP] Event %s skipped (idempotent)", event.id))
-    end
-end
-
-print(string.format("\nStats: %d processed, %d duplicates skipped",
-    idem.stats.processed, idem.stats.skipped))
-```
-
----
-
-## ตัวอย่างที่ 12: Consumer Groups
-
-```lua
--- Consumer Groups for parallel processing
-local ConsumerGroup = {}
-ConsumerGroup.__index = ConsumerGroup
-
-function ConsumerGroup.new(queue_name, group_name, config)
-    local self = setmetatable({}, ConsumerGroup)
-    self.queue_name  = queue_name
-    self.group_name  = group_name
-    self.config      = config or {}
-    self.consumers   = {}
-    self.pending     = {}  -- pending ACKs
-    self.messages    = {}  -- shared message store
-    self.offset      = 0   -- current processing position
-    return self
-end
-
--- Simulate shared message stream (Redis Stream-like)
-local message_streams = {}
-
-function ConsumerGroup:write(data)
-    if not message_streams[self.queue_name] then
-        message_streams[self.queue_name] = {}
-    end
-    local id = tostring(os.time()) .. "-" .. tostring(#message_streams[self.queue_name] + 1)
-    table.insert(message_streams[self.queue_name], {
-        id   = id,
-        data = data,
-        time = os.time(),
-    })
     return id
 end
 
--- Register consumer in group
-function ConsumerGroup:add_consumer(consumer_id, process_fn)
-    self.consumers[consumer_id] = {
-        id         = consumer_id,
-        process_fn = process_fn,
-        processed  = 0,
-        errors     = 0,
-        active     = true,
-    }
-    print(string.format("[CG:%s] Consumer '%s' joined group '%s'",
-        self.queue_name, consumer_id, self.group_name))
-end
+function DocumentStore:findById(collection, id)
+    local stmt = self._db:prepare([[
+        SELECT data FROM documents WHERE id = ? AND collection = ?
+    ]])
+    stmt:bind_values(id, collection)
+    local row = stmt:first_row()
+    stmt:finalize()
 
--- Read next message for consumer
-function ConsumerGroup:read_next(consumer_id)
-    local consumer = self.consumers[consumer_id]
-    if not consumer then return nil, "Consumer not found" end
-    
-    local stream = message_streams[self.queue_name]
-    if not stream then return nil end
-    
-    self.offset = self.offset + 1
-    local msg = stream[self.offset]
-    if not msg then
-        self.offset = self.offset - 1
-        return nil
+    if row then
+        -- ใน production ควรใช้ JSON library ที่ดีกว่า
+        return {_raw = row[1], _id = id}
     end
-    
-    -- Track pending
-    self.pending[msg.id] = {
-        consumer_id  = consumer_id,
-        message      = msg,
-        delivered_at = os.time(),
-    }
-    
-    return msg
+    return nil
 end
 
--- Acknowledge message
-function ConsumerGroup:ack(consumer_id, message_id)
-    local pending = self.pending[message_id]
-    if pending and pending.consumer_id == consumer_id then
-        self.pending[message_id] = nil
-        local consumer = self.consumers[consumer_id]
-        if consumer then consumer.processed = consumer.processed + 1 end
-        return true
+function DocumentStore:count(collection)
+    local stmt = self._db:prepare(
+        "SELECT COUNT(*) FROM documents WHERE collection = ?"
+    )
+    stmt:bind_values(collection)
+    local row = stmt:first_row()
+    stmt:finalize()
+    return row and row[1] or 0
+end
+
+function DocumentStore:listAll(collection, limit)
+    local sql = "SELECT id, data FROM documents WHERE collection = ? ORDER BY created_at DESC"
+    if limit then sql = sql .. " LIMIT " .. limit end
+
+    local stmt = self._db:prepare(sql)
+    stmt:bind_values(collection)
+
+    local results = {}
+    for row in stmt:urows() do
+        table.insert(results, {_id = row[1], _raw = row[2]})
     end
-    return false, "Not owner or not found"
+    stmt:finalize()
+
+    return results
 end
 
--- Process all pending for consumer
-function ConsumerGroup:process_consumer(consumer_id)
-    local consumer = self.consumers[consumer_id]
-    if not consumer then return 0, "Consumer not found" end
-    
-    local processed = 0
-    
-    while true do
-        local msg = self:read_next(consumer_id)
-        if not msg then break end
-        
-        local ok, err = pcall(consumer.process_fn, msg.data)
-        
-        if ok then
-            self:ack(consumer_id, msg.id)
-            processed = processed + 1
-        else
-            consumer.errors = consumer.errors + 1
-            print(string.format("[CG] Consumer %s failed on msg %s: %s",
-                consumer_id, msg.id, err))
-            -- In real system: retry or move to DLQ
-            self.pending[msg.id] = nil
+function DocumentStore:delete(collection, id)
+    local stmt = self._db:prepare(
+        "DELETE FROM documents WHERE id = ? AND collection = ?"
+    )
+    stmt:bind_values(id, collection)
+    stmt:step()
+    local affected = self._db:changes()
+    stmt:finalize()
+    return affected > 0
+end
+
+-- ทดสอบ
+local store = DocumentStore.new(db)
+
+-- Insert documents
+print("=== Inserting Documents ===")
+local blog_id = store:insert("posts", {
+    title = "First Post",
+    content = "Hello World from SQLite Document Store",
+    tags = {"lua", "sqlite", "nosql"},
+    author = {name = "Admin", email = "admin@test.com"},
+    published = true,
+    views = 0
+})
+print("Inserted post:", blog_id)
+
+store:insert("posts", {
+    title = "Lua Tutorial",
+    content = "Learning Lua programming language",
+    tags = {"lua", "tutorial"},
+    author = {name = "Teacher", email = "teacher@test.com"},
+    published = false,
+    views = 0
+})
+
+store:insert("users", {
+    name = "Test User",
+    email = "test@example.com",
+    role = "admin"
+})
+
+-- Count
+print("\n=== Collections ===")
+print("Posts:", store:count("posts"))
+print("Users:", store:count("users"))
+
+-- List
+print("\n=== All Posts ===")
+local posts = store:listAll("posts")
+for _, post in ipairs(posts) do
+    print("  [" .. post._id .. "]:", post._raw:sub(1, 60) .. "...")
+end
+
+-- Find by ID
+print("\n=== Find Post ===")
+local found = store:findById("posts", blog_id)
+if found then
+    print("Found:", found._raw:sub(1, 80))
+end
+
+-- Delete
+print("\n=== Delete Post ===")
+local deleted = store:delete("posts", blog_id)
+print("Deleted:", deleted)
+print("Remaining posts:", store:count("posts"))
+
+db:close()
+```
+
+---
+
+## 60.6 Key-Value Store
+
+### ตัวอย่างที่ 10: Persistent Key-Value Store
+
+```lua
+-- kv_store.lua
+local sqlite3 = require("lsqlite3")
+
+-- KV Store class
+local KVStore = {}
+KVStore.__index = KVStore
+
+function KVStore.new(path)
+    local self = setmetatable({}, KVStore)
+    self._db = sqlite3.open(path or ":memory:")
+    self._db:exec([[
+        CREATE TABLE IF NOT EXISTS kv_store (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            type TEXT DEFAULT 'string',
+            expires_at INTEGER,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_kv_expires ON kv_store(expires_at)
+            WHERE expires_at IS NOT NULL;
+    ]])
+    return self
+end
+
+function KVStore:set(key, value, ttl_seconds)
+    local vtype = type(value)
+    local encoded_value
+
+    if vtype == "table" then
+        -- Simple serialization
+        encoded_value = require and tostring(value) or "{}"
+        vtype = "table"
+    elseif vtype == "number" or vtype == "boolean" then
+        encoded_value = tostring(value)
+    else
+        encoded_value = tostring(value or "")
+    end
+
+    local expires_at = ttl_seconds and (os.time() + ttl_seconds) or nil
+
+    local stmt = self._db:prepare([[
+        INSERT OR REPLACE INTO kv_store (key, value, type, expires_at, updated_at)
+        VALUES (?, ?, ?, ?, strftime('%s', 'now'))
+    ]])
+    stmt:bind_values(key, encoded_value, vtype, expires_at)
+    stmt:step()
+    stmt:finalize()
+
+    return true
+end
+
+function KVStore:get(key)
+    -- ลบ expired keys ก่อน
+    self:_cleanup_expired()
+
+    local stmt = self._db:prepare([[
+        SELECT value, type, expires_at FROM kv_store
+        WHERE key = ? AND (expires_at IS NULL OR expires_at > strftime('%s', 'now'))
+    ]])
+    stmt:bind_values(key)
+    local row = stmt:first_row()
+    stmt:finalize()
+
+    if not row then return nil end
+
+    local value, vtype = row[1], row[2]
+
+    if vtype == "number" then
+        return tonumber(value)
+    elseif vtype == "boolean" then
+        return value == "true"
+    else
+        return value
+    end
+end
+
+function KVStore:delete(key)
+    local stmt = self._db:prepare("DELETE FROM kv_store WHERE key = ?")
+    stmt:bind_values(key)
+    stmt:step()
+    local affected = self._db:changes()
+    stmt:finalize()
+    return affected > 0
+end
+
+function KVStore:exists(key)
+    self:_cleanup_expired()
+    local stmt = self._db:prepare([[
+        SELECT 1 FROM kv_store 
+        WHERE key = ? AND (expires_at IS NULL OR expires_at > strftime('%s', 'now'))
+    ]])
+    stmt:bind_values(key)
+    local row = stmt:first_row()
+    stmt:finalize()
+    return row ~= nil
+end
+
+function KVStore:ttl(key)
+    local stmt = self._db:prepare([[
+        SELECT expires_at - strftime('%s', 'now') FROM kv_store
+        WHERE key = ? AND expires_at IS NOT NULL
+    ]])
+    stmt:bind_values(key)
+    local row = stmt:first_row()
+    stmt:finalize()
+    return row and row[1] or -1
+end
+
+function KVStore:keys(pattern)
+    self:_cleanup_expired()
+    local sql = [[
+        SELECT key FROM kv_store
+        WHERE expires_at IS NULL OR expires_at > strftime('%s', 'now')
+    ]]
+
+    if pattern then
+        sql = sql .. " AND key LIKE ?"
+    end
+    sql = sql .. " ORDER BY key"
+
+    local stmt = self._db:prepare(sql)
+    if pattern then
+        stmt:bind_values(pattern:gsub("*", "%%"))
+    end
+
+    local results = {}
+    for row in stmt:urows() do
+        table.insert(results, row[1])
+    end
+    stmt:finalize()
+
+    return results
+end
+
+function KVStore:incr(key, amount)
+    amount = amount or 1
+    local current = tonumber(self:get(key)) or 0
+    local new_val = current + amount
+    self:set(key, new_val)
+    return new_val
+end
+
+function KVStore:_cleanup_expired()
+    self._db:exec([[
+        DELETE FROM kv_store 
+        WHERE expires_at IS NOT NULL AND expires_at <= strftime('%s', 'now')
+    ]])
+end
+
+function KVStore:close()
+    self._db:close()
+end
+
+-- ทดสอบ KV Store
+local kv = KVStore.new()
+
+print("=== Basic Operations ===")
+kv:set("username", "admin")
+kv:set("login_count", 42)
+kv:set("is_active", true)
+
+print("username:", kv:get("username"))
+print("login_count:", kv:get("login_count"))
+print("is_active:", kv:get("is_active"))
+
+print("\n=== Increment ===")
+kv:incr("login_count")
+kv:incr("login_count")
+kv:incr("login_count", 10)
+print("login_count after incr:", kv:get("login_count"))
+
+print("\n=== TTL (Time-To-Live) ===")
+kv:set("session_token", "abc123xyz", 3600)  -- expires in 1 hour
+print("session_token:", kv:get("session_token"))
+print("TTL remaining:", kv:ttl("session_token"), "seconds")
+
+print("\n=== Keys Pattern ===")
+kv:set("user:1:name", "สมชาย")
+kv:set("user:1:email", "somchai@test.com")
+kv:set("user:2:name", "สมหญิง")
+kv:set("user:2:email", "somying@test.com")
+kv:set("config:debug", "true")
+
+local user_keys = kv:keys("user:*")
+print("User keys:")
+for _, k in ipairs(user_keys) do
+    print("  " .. k .. " =", kv:get(k))
+end
+
+print("\nAll keys count:", #kv:keys())
+
+kv:close()
+```
+
+---
+
+## 60.7 Database Migration Pattern
+
+### ตัวอย่างที่ 11: Schema Migration System
+
+```lua
+-- migrations.lua
+local sqlite3 = require("lsqlite3")
+
+-- Migration Manager
+local MigrationManager = {}
+MigrationManager.__index = MigrationManager
+
+function MigrationManager.new(db)
+    local self = setmetatable({}, MigrationManager)
+    self._db = db
+    self._migrations = {}
+    self:_init()
+    return self
+end
+
+function MigrationManager:_init()
+    self._db:exec([[
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at INTEGER DEFAULT (strftime('%s', 'now'))
+        )
+    ]])
+end
+
+function MigrationManager:add(version, name, up_fn, down_fn)
+    table.insert(self._migrations, {
+        version = version,
+        name = name,
+        up = up_fn,
+        down = down_fn,
+    })
+    table.sort(self._migrations, function(a, b)
+        return a.version < b.version
+    end)
+end
+
+function MigrationManager:_is_applied(version)
+    local stmt = self._db:prepare(
+        "SELECT 1 FROM schema_migrations WHERE version = ?"
+    )
+    stmt:bind_values(version)
+    local row = stmt:first_row()
+    stmt:finalize()
+    return row ~= nil
+end
+
+function MigrationManager:migrate()
+    local applied = 0
+
+    for _, migration in ipairs(self._migrations) do
+        if not self:_is_applied(migration.version) then
+            print(string.format("  Applying migration %s: %s",
+                migration.version, migration.name))
+
+            self._db:exec("BEGIN")
+            local ok, err = pcall(migration.up, self._db)
+
+            if ok then
+                local stmt = self._db:prepare(
+                    "INSERT INTO schema_migrations (version, name) VALUES (?, ?)"
+                )
+                stmt:bind_values(migration.version, migration.name)
+                stmt:step()
+                stmt:finalize()
+                self._db:exec("COMMIT")
+                applied = applied + 1
+                print("    -> Applied successfully")
+            else
+                self._db:exec("ROLLBACK")
+                error(string.format("Migration %s failed: %s",
+                    migration.version, err))
+            end
         end
     end
-    
-    return processed
+
+    if applied == 0 then
+        print("  No pending migrations")
+    else
+        print(string.format("  Applied %d migration(s)", applied))
+    end
+end
+
+function MigrationManager:rollback(steps)
+    steps = steps or 1
+    local rolled_back = 0
+
+    -- หา migrations ที่ applied แล้ว (เรียง descending)
+    local applied_migrations = {}
+    for _, migration in ipairs(self._migrations) do
+        if self:_is_applied(migration.version) then
+            table.insert(applied_migrations, migration)
+        end
+    end
+
+    -- Reverse
+    for i = 1, #applied_migrations / 2 do
+        local j = #applied_migrations - i + 1
+        applied_migrations[i], applied_migrations[j] = applied_migrations[j], applied_migrations[i]
+    end
+
+    for i = 1, math.min(steps, #applied_migrations) do
+        local migration = applied_migrations[i]
+        if not migration.down then
+            print(string.format("  Migration %s has no rollback", migration.version))
+            break
+        end
+
+        print(string.format("  Rolling back %s: %s",
+            migration.version, migration.name))
+
+        self._db:exec("BEGIN")
+        local ok, err = pcall(migration.down, self._db)
+
+        if ok then
+            local stmt = self._db:prepare(
+                "DELETE FROM schema_migrations WHERE version = ?"
+            )
+            stmt:bind_values(migration.version)
+            stmt:step()
+            stmt:finalize()
+            self._db:exec("COMMIT")
+            rolled_back = rolled_back + 1
+            print("    -> Rolled back successfully")
+        else
+            self._db:exec("ROLLBACK")
+            error(string.format("Rollback %s failed: %s",
+                migration.version, err))
+        end
+    end
+
+    print(string.format("  Rolled back %d migration(s)", rolled_back))
+end
+
+function MigrationManager:status()
+    print("=== Migration Status ===")
+    for _, migration in ipairs(self._migrations) do
+        local applied = self:_is_applied(migration.version)
+        print(string.format("  [%s] %s: %s",
+            applied and "x" or " ",
+            migration.version,
+            migration.name))
+    end
+end
+
+-- ทดสอบ Migrations
+local db = sqlite3.open(":memory:")
+local mgr = MigrationManager.new(db)
+
+-- Define migrations
+mgr:add("001", "create_users_table",
+    function(db)  -- up
+        db:exec([[
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL
+            )
+        ]])
+    end,
+    function(db)  -- down
+        db:exec("DROP TABLE users")
+    end
+)
+
+mgr:add("002", "add_users_age_column",
+    function(db)
+        db:exec("ALTER TABLE users ADD COLUMN age INTEGER")
+    end,
+    function(db)
+        -- SQLite ไม่รองรับ DROP COLUMN ใน version เก่า
+        -- แต่สำหรับ demo:
+        print("    (SQLite: cannot drop column, skipping)")
+    end
+)
+
+mgr:add("003", "create_products_table",
+    function(db)
+        db:exec([[
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
+        ]])
+    end,
+    function(db)
+        db:exec("DROP TABLE products")
+    end
+)
+
+-- Run migrations
+print("=== Running Migrations ===")
+mgr:migrate()
+
+mgr:status()
+
+-- Run again (should skip)
+print("\n=== Re-running (should skip) ===")
+mgr:migrate()
+
+-- Rollback 1
+print("\n=== Rollback 1 Step ===")
+mgr:rollback(1)
+mgr:status()
+
+-- Re-migrate
+print("\n=== Re-migrate ===")
+mgr:migrate()
+mgr:status()
+
+db:close()
+```
+
+---
+
+## 60.8 Connection Pool สำหรับ SQLite
+
+### ตัวอย่างที่ 12: Database Connection Pool
+
+```lua
+-- connection_pool.lua
+local sqlite3 = require("lsqlite3")
+
+-- SQLite Connection Pool
+local Pool = {}
+Pool.__index = Pool
+
+function Pool.new(db_path, pool_size)
+    local self = setmetatable({}, Pool)
+    self._path = db_path or ":memory:"
+    self._size = pool_size or 5
+    self._connections = {}
+    self._available = {}
+
+    -- สร้าง connections ล่วงหน้า
+    for i = 1, self._size do
+        local conn = sqlite3.open(self._path)
+        -- เปิด WAL mode สำหรับ concurrent access
+        conn:exec("PRAGMA journal_mode=WAL")
+        conn:exec("PRAGMA synchronous=NORMAL")
+        self._connections[i] = conn
+        self._available[i] = true
+    end
+
+    return self
+end
+
+function Pool:acquire(timeout)
+    timeout = timeout or 5  -- seconds
+    local start = os.time()
+
+    while true do
+        for i, available in ipairs(self._available) do
+            if available then
+                self._available[i] = false
+                return i, self._connections[i]
+            end
+        end
+
+        -- ถ้าหมด pool รอ
+        if os.time() - start > timeout then
+            return nil, nil, "timeout: no connections available"
+        end
+
+        -- ใน production จะใช้ coroutine yield ที่นี่
+        -- แต่สำหรับ demo ใช้ busy wait แทน
+        os.execute("sleep 0.01")
+    end
+end
+
+function Pool:release(conn_id)
+    if conn_id and self._available[conn_id] == false then
+        self._available[conn_id] = true
+    end
+end
+
+function Pool:execute(fn)
+    local conn_id, conn, err = self:acquire()
+    if not conn then
+        return nil, err
+    end
+
+    local ok, result = pcall(fn, conn)
+    self:release(conn_id)
+
+    if ok then
+        return result
+    else
+        return nil, result
+    end
+end
+
+function Pool:stats()
+    local total = #self._connections
+    local used = 0
+    for _, available in ipairs(self._available) do
+        if not available then used = used + 1 end
+    end
+    return {total = total, used = used, available = total - used}
+end
+
+function Pool:close()
+    for _, conn in ipairs(self._connections) do
+        conn:close()
+    end
+end
+
+-- ทดสอบ Pool
+print("=== Connection Pool Demo ===")
+local pool = Pool.new(":memory:", 3)
+
+-- Initialize schema ใน connection แรก
+local _, conn1 = pool:acquire()
+conn1:exec([[
+    CREATE TABLE IF NOT EXISTS counter (
+        key TEXT PRIMARY KEY,
+        value INTEGER DEFAULT 0
+    )
+]])
+conn1:exec("INSERT OR IGNORE INTO counter (key, value) VALUES ('hits', 0)")
+pool:release(1)
+
+print("Pool stats:", pool:stats().total, "total,",
+    pool:stats().available, "available")
+
+-- Execute queries ผ่าน pool
+for i = 1, 5 do
+    local result = pool:execute(function(db)
+        db:exec("UPDATE counter SET value = value + 1 WHERE key = 'hits'")
+        for row in db:nrows("SELECT value FROM counter WHERE key = 'hits'") do
+            return row.value
+        end
+    end)
+    print(string.format("  Request %d: counter = %s", i, tostring(result)))
 end
 
 -- Stats
-function ConsumerGroup:stats()
-    local consumer_stats = {}
-    for id, c in pairs(self.consumers) do
-        consumer_stats[id] = { processed = c.processed, errors = c.errors }
-    end
-    return {
-        queue       = self.queue_name,
-        group       = self.group_name,
-        total_msgs  = #(message_streams[self.queue_name] or {}),
-        pending     = (function()
-            local c = 0; for _ in pairs(self.pending) do c = c + 1 end; return c
-        end)(),
-        consumers   = consumer_stats,
-    }
-end
+local stats = pool:stats()
+print(string.format("\nFinal pool stats: %d total, %d available, %d used",
+    stats.total, stats.available, stats.used))
 
--- ทดสอบ
-print("=== Consumer Groups ===")
-
-local cg = ConsumerGroup.new("orders", "processors")
-
--- Write messages to stream
-print("Writing messages:")
-for i = 1, 6 do
-    local id = cg:write({
-        order_id = 1000 + i,
-        product  = "Product " .. i,
-        amount   = (i * 100),
-    })
-    print(string.format("  Written message %s", id))
-end
-
--- Add consumers
-cg:add_consumer("worker-1", function(data)
-    print(string.format("    [W1] Processing order #%d (%.0f THB)",
-        data.order_id, data.amount))
-end)
-
-cg:add_consumer("worker-2", function(data)
-    print(string.format("    [W2] Processing order #%d (%.0f THB)",
-        data.order_id, data.amount))
-end)
-
--- Each consumer processes some messages
-print("\nWorker-1 processing:")
-local w1 = cg:process_consumer("worker-1")
-print(string.format("Worker-1 processed: %d messages", w1))
-
-print("\nWorker-2 processing:")
-local w2 = cg:process_consumer("worker-2")
-print(string.format("Worker-2 processed: %d messages", w2))
-
--- Final stats
-local stats = cg:stats()
-print(string.format("\nGroup Stats: %d total, %d pending",
-    stats.total_msgs, stats.pending))
-for id, cs in pairs(stats.consumers) do
-    print(string.format("  %s: %d processed, %d errors", id, cs.processed, cs.errors))
-end
+pool:close()
 ```
 
 ---
 
-## ตัวอย่างที่ 13: Background Job Processor
+## 60.9 Caching Layer
+
+### ตัวอย่างที่ 13: SQLite-backed Cache
 
 ```lua
--- Complete Background Job Processor
-local JobProcessor = {}
-JobProcessor.__index = JobProcessor
+-- sqlite_cache.lua
+local sqlite3 = require("lsqlite3")
 
-function JobProcessor.new(config)
-    local self = setmetatable({}, JobProcessor)
-    self.config = {
-        concurrency = config.concurrency or 3,
-        max_retries = config.max_retries or 3,
-        retry_delay = config.retry_delay or 5,
-        timeout     = config.timeout     or 30,
-    }
-    self.queues       = {}  -- { name -> Queue }
-    self.handlers     = {}  -- { job_type -> handler_fn }
-    self.middlewares  = {}  -- before/after hooks
-    self.stats        = { total = 0, success = 0, failed = 0, retried = 0 }
-    self.running      = false
-    self.job_log      = {}
-    return self
-end
+local Cache = {}
+Cache.__index = Cache
 
--- Register job handler
-function JobProcessor:register(job_type, handler, options)
-    self.handlers[job_type] = {
-        fn      = handler,
-        options = options or {},
-        name    = job_type,
-    }
-    print("[Processor] Registered handler: " .. job_type)
-end
-
--- Add middleware
-function JobProcessor:use(middleware)
-    table.insert(self.middlewares, middleware)
-end
-
--- Enqueue job
-function JobProcessor:enqueue(queue_name, job_type, data, options)
-    if not self.queues[queue_name] then
-        self.queues[queue_name] = {}
-    end
-    
+function Cache.new(options)
     options = options or {}
-    local job = {
-        id          = string.format("job_%d_%d", os.time(), math.random(1000, 9999)),
-        type        = job_type,
-        queue       = queue_name,
-        data        = data,
-        priority    = options.priority or 3,
-        attempts    = 0,
-        max_retries = options.max_retries or self.config.max_retries,
-        created_at  = os.time(),
-        scheduled_at = options.delay and (os.time() + options.delay) or os.time(),
-        status      = "pending",
-    }
-    
-    table.insert(self.queues[queue_name], job)
-    table.sort(self.queues[queue_name], function(a, b)
-        if a.priority ~= b.priority then return a.priority < b.priority end
-        return a.created_at < b.created_at
-    end)
-    
-    print(string.format("[Processor] Enqueued: [%s] %s (priority=%d)",
-        job.id, job_type, job.priority))
-    
-    return job.id
-end
-
--- Process single job
-function JobProcessor:_process_job(job)
-    local handler_info = self.handlers[job.type]
-    if not handler_info then
-        return false, "No handler for job type: " .. job.type
-    end
-    
-    job.status   = "processing"
-    job.attempts = job.attempts + 1
-    job.started_at = os.time()
-    
-    -- Run before middlewares
-    local ctx = { job = job, start_time = os.time() }
-    for _, mw in ipairs(self.middlewares) do
-        if mw.before then
-            pcall(mw.before, ctx)
-        end
-    end
-    
-    -- Execute handler
-    local ok, result = pcall(handler_info.fn, job.data, ctx)
-    
-    job.finished_at = os.time()
-    job.duration    = job.finished_at - job.started_at
-    
-    -- Run after middlewares
-    ctx.result = result
-    ctx.error  = not ok and result or nil
-    for _, mw in ipairs(self.middlewares) do
-        if mw.after then
-            pcall(mw.after, ctx)
-        end
-    end
-    
-    if ok then
-        job.status = "completed"
-        job.result = result
-        self.stats.success = self.stats.success + 1
-        table.insert(self.job_log, {
-            id = job.id, type = job.type,
-            success = true, duration = job.duration,
-        })
-        return true, result
-    else
-        local error_msg = tostring(result)
-        job.last_error = error_msg
-        
-        if job.attempts < job.max_retries then
-            job.status = "retry"
-            local delay = self.config.retry_delay * (2 ^ (job.attempts - 1))
-            job.retry_at = os.time() + delay
-            self.stats.retried = self.stats.retried + 1
-            return false, error_msg, "retry"
-        else
-            job.status = "failed"
-            self.stats.failed = self.stats.failed + 1
-            table.insert(self.job_log, {
-                id = job.id, type = job.type,
-                success = false, error = error_msg,
-            })
-            return false, error_msg, "failed"
-        end
-    end
-end
-
--- Process all jobs in queue
-function JobProcessor:process_queue(queue_name)
-    local queue = self.queues[queue_name]
-    if not queue or #queue == 0 then
-        return 0
-    end
-    
-    local processed = 0
-    local retry_jobs = {}
-    
-    while #queue > 0 do
-        local job = table.remove(queue, 1)
-        
-        -- Skip if not yet scheduled
-        if job.scheduled_at > os.time() then
-            table.insert(retry_jobs, job)
-            goto continue
-        end
-        
-        self.stats.total = self.stats.total + 1
-        print(string.format("\n[Processor] Running job [%s] %s (attempt %d)",
-            job.id, job.type, job.attempts + 1))
-        
-        local ok, result, disposition = self:_process_job(job)
-        
-        if ok then
-            print(string.format("[Processor] ✓ Completed [%s] in %dms",
-                job.id, (job.duration or 0) * 1000))
-            processed = processed + 1
-        elseif disposition == "retry" then
-            print(string.format("[Processor] ↩ Retry [%s] (attempt %d/%d)",
-                job.id, job.attempts, job.max_retries))
-            table.insert(retry_jobs, job)
-        else
-            print(string.format("[Processor] ✗ Failed [%s]: %s",
-                job.id, result))
-        end
-        
-        ::continue::
-    end
-    
-    -- Re-add retry jobs
-    for _, job in ipairs(retry_jobs) do
-        table.insert(queue, job)
-    end
-    
-    return processed
-end
-
--- Get stats
-function JobProcessor:get_stats()
-    local queue_sizes = {}
-    for name, q in pairs(self.queues) do
-        queue_sizes[name] = #q
-    end
-    return {
-        total      = self.stats.total,
-        success    = self.stats.success,
-        failed     = self.stats.failed,
-        retried    = self.stats.retried,
-        queues     = queue_sizes,
-        success_rate = self.stats.total > 0 and
-            string.format("%.1f%%", self.stats.success / self.stats.total * 100) or "N/A",
-    }
-end
-
--- ทดสอบ
-math.randomseed(os.time())
-print("=== Background Job Processor ===")
-
-local processor = JobProcessor.new({
-    concurrency = 3,
-    max_retries = 3,
-    retry_delay = 1,
-})
-
--- Add logging middleware
-processor:use({
-    before = function(ctx)
-        print(string.format("  → Start: %s", ctx.job.type))
-    end,
-    after = function(ctx)
-        if ctx.error then
-            print(string.format("  ← Error: %s", ctx.error))
-        end
-    end,
-})
-
--- Register handlers
-processor:register("send_email", function(data, ctx)
-    -- Simulate occasional failure
-    if math.random() < 0.3 then
-        error("SMTP connection refused")
-    end
-    print(string.format("  Email sent to: %s", data.to))
-    return { delivered = true }
-end)
-
-processor:register("resize_image", function(data, ctx)
-    print(string.format("  Resized: %s to %dx%d",
-        data.filename, data.width, data.height))
-    return { url = "/resized/" .. data.filename }
-end)
-
-processor:register("generate_report", function(data, ctx)
-    print(string.format("  Report generated: %s for %s",
-        data.type, data.period))
-    return { filename = data.type .. "_" .. data.period .. ".pdf" }
-end)
-
--- Enqueue jobs
-print("\nEnqueueing jobs:")
-processor:enqueue("default", "send_email",      { to = "alice@example.com", subject = "Welcome!" }, { priority = 2 })
-processor:enqueue("default", "send_email",      { to = "bob@example.com",   subject = "Invoice"  }, { priority = 2 })
-processor:enqueue("default", "resize_image",    { filename = "photo.jpg",  width = 800, height = 600 })
-processor:enqueue("default", "generate_report", { type = "sales", period = "2024-03" }, { priority = 4 })
-processor:enqueue("default", "send_email",      { to = "charlie@example.com", subject = "Alert!" }, { priority = 1 })
-
--- Process
-print("\nProcessing queue:")
-processor:process_queue("default")
-
--- Second pass for retries
-print("\nSecond pass (retries):")
-processor:process_queue("default")
-
--- Final stats
-local final_stats = processor:get_stats()
-print(string.format("\nFinal Stats:"))
-print(string.format("  Total:   %d", final_stats.total))
-print(string.format("  Success: %d (%s)", final_stats.success, final_stats.success_rate))
-print(string.format("  Failed:  %d", final_stats.failed))
-print(string.format("  Retried: %d", final_stats.retried))
-```
-
----
-
-## ตัวอย่างที่ 14: Exactly-Once Delivery
-
-```lua
--- Exactly-Once Delivery guarantee
-local ExactlyOnce = {}
-ExactlyOnce.__index = ExactlyOnce
-
-function ExactlyOnce.new(config)
-    local self = setmetatable({}, ExactlyOnce)
-    self.dedup_window  = config and config.dedup_window or 3600
-    self.processed_ids = {}  -- message_id -> timestamp
-    self.stats = { received = 0, processed = 0, duplicates = 0 }
+    local self = setmetatable({}, Cache)
+    self._db = sqlite3.open(options.path or ":memory:")
+    self._max_size = options.max_size or 1000
+    self._default_ttl = options.default_ttl or 3600
+    self._hits = 0
+    self._misses = 0
+    self:_init()
     return self
 end
 
--- Message fingerprint for dedup
-local function message_fingerprint(message)
-    local parts = {}
-    if type(message) == "table" then
-        for k, v in pairs(message) do
-            table.insert(parts, tostring(k) .. ":" .. tostring(v))
-        end
-        table.sort(parts)
+function Cache:_init()
+    self._db:exec([[
+        CREATE TABLE IF NOT EXISTS cache (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            expires_at INTEGER,
+            hit_count INTEGER DEFAULT 0,
+            last_accessed INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_cache_accessed ON cache(last_accessed);
+    ]])
+end
+
+function Cache:set(key, value, ttl)
+    ttl = ttl or self._default_ttl
+    local expires_at = os.time() + ttl
+
+    -- Serialize value
+    local serialized
+    if type(value) == "string" then
+        serialized = "s:" .. value
+    elseif type(value) == "number" then
+        serialized = "n:" .. tostring(value)
+    elseif type(value) == "boolean" then
+        serialized = "b:" .. (value and "1" or "0")
     else
-        table.insert(parts, tostring(message))
+        serialized = "t:" .. tostring(value)
     end
-    
-    local combined = table.concat(parts, "|")
-    local hash = 0
-    for i = 1, #combined do
-        hash = ((hash * 31) + string.byte(combined, i)) % (2^32)
+
+    -- Evict if too large
+    local count_row = self._db:nrows("SELECT COUNT(*) as c FROM cache")()
+    if count_row and count_row.c >= self._max_size then
+        self:_evict()
     end
-    return string.format("msg_%08x", hash)
+
+    local stmt = self._db:prepare([[
+        INSERT OR REPLACE INTO cache (key, value, expires_at, hit_count, last_accessed)
+        VALUES (?, ?, ?, 0, strftime('%s', 'now'))
+    ]])
+    stmt:bind_values(key, serialized, expires_at)
+    stmt:step()
+    stmt:finalize()
 end
 
--- Process with exactly-once guarantee
-function ExactlyOnce:process(message_id, message, handler)
-    self.stats.received = self.stats.received + 1
-    
-    -- Auto-generate ID if not provided
-    if not message_id then
-        message_id = message_fingerprint(message)
+function Cache:get(key)
+    -- Cleanup expired
+    self._db:exec(string.format(
+        "DELETE FROM cache WHERE expires_at <= %d", os.time()
+    ))
+
+    local stmt = self._db:prepare([[
+        SELECT value FROM cache 
+        WHERE key = ? AND expires_at > strftime('%s', 'now')
+    ]])
+    stmt:bind_values(key)
+    local row = stmt:first_row()
+    stmt:finalize()
+
+    if not row then
+        self._misses = self._misses + 1
+        return nil
     end
-    
-    -- Cleanup expired IDs
-    local now = os.time()
-    local to_remove = {}
-    for id, ts in pairs(self.processed_ids) do
-        if now - ts > self.dedup_window then
-            table.insert(to_remove, id)
+
+    -- Update stats
+    self._db:exec(string.format([[
+        UPDATE cache 
+        SET hit_count = hit_count + 1, last_accessed = strftime('%%s', 'now')
+        WHERE key = '%s'
+    ]], key:gsub("'", "''")))
+
+    self._hits = self._hits + 1
+
+    -- Deserialize
+    local serialized = row[1]
+    local prefix = serialized:sub(1, 2)
+    local val = serialized:sub(3)
+
+    if prefix == "s:" then return val
+    elseif prefix == "n:" then return tonumber(val)
+    elseif prefix == "b:" then return val == "1"
+    else return val
+    end
+end
+
+function Cache:delete(key)
+    local stmt = self._db:prepare("DELETE FROM cache WHERE key = ?")
+    stmt:bind_values(key)
+    stmt:step()
+    stmt:finalize()
+end
+
+function Cache:_evict()
+    -- LRU eviction: ลบ 10% ของ entries ที่ใช้งานน้อยที่สุด
+    local evict_count = math.max(1, math.floor(self._max_size * 0.1))
+    self._db:exec(string.format([[
+        DELETE FROM cache WHERE key IN (
+            SELECT key FROM cache ORDER BY last_accessed ASC LIMIT %d
+        )
+    ]], evict_count))
+end
+
+function Cache:stats()
+    local count_row = self._db:nrows("SELECT COUNT(*) as c FROM cache")()
+    local total = count_row and count_row.c or 0
+    local hit_rate = (self._hits + self._misses) > 0
+        and (self._hits / (self._hits + self._misses) * 100)
+        or 0
+
+    return {
+        size = total,
+        hits = self._hits,
+        misses = self._misses,
+        hit_rate = string.format("%.1f%%", hit_rate)
+    }
+end
+
+-- Memoize helper
+function Cache:memoize(key_fn, compute_fn, ttl)
+    return function(...)
+        local key = key_fn(...)
+        local cached = self:get(key)
+        if cached ~= nil then
+            return cached
         end
-    end
-    for _, id in ipairs(to_remove) do
-        self.processed_ids[id] = nil
-    end
-    
-    -- Check duplicate
-    if self.processed_ids[message_id] then
-        self.stats.duplicates = self.stats.duplicates + 1
-        print(string.format("[EO] DUPLICATE message %s (originally processed %ds ago)",
-            message_id, now - self.processed_ids[message_id]))
-        return true, nil, true  -- success, result, was_duplicate
-    end
-    
-    -- Process the message
-    local ok, result = pcall(handler, message)
-    
-    if ok then
-        self.processed_ids[message_id] = now
-        self.stats.processed = self.stats.processed + 1
-        return true, result, false
-    else
-        return false, nil, false, tostring(result)
+        local result = compute_fn(...)
+        self:set(key, result, ttl)
+        return result
     end
 end
 
--- ทดสอบ
-print("=== Exactly-Once Delivery ===")
+-- ทดสอบ Cache
+local cache = Cache.new({max_size = 100, default_ttl = 60})
 
-local eo = ExactlyOnce.new({ dedup_window = 60 })
+print("=== Basic Cache Operations ===")
+cache:set("user:1", "สมชาย")
+cache:set("config:debug", true)
+cache:set("counter", 42)
 
--- Simulate network duplicates
-local events = {
-    { id = "msg_001", data = { type = "payment", amount = 500 } },
-    { id = "msg_002", data = { type = "order",   id = 42 } },
-    { id = "msg_001", data = { type = "payment", amount = 500 } },  -- duplicate
-    { id = "msg_003", data = { type = "refund",  amount = 200 } },
-    { id = "msg_002", data = { type = "order",   id = 42 } },  -- duplicate
-    { id = "msg_001", data = { type = "payment", amount = 500 } },  -- duplicate
-}
+print("user:1 =", cache:get("user:1"))
+print("config:debug =", cache:get("config:debug"))
+print("counter =", cache:get("counter"))
+print("missing =", tostring(cache:get("nonexistent")))
 
-local processed_payments = 0
-local processed_orders   = 0
-
-print("Processing events (with duplicates):")
-for _, event in ipairs(events) do
-    local ok, result, was_dup = eo:process(event.id, event.data, function(msg)
-        if msg.type == "payment" then
-            processed_payments = processed_payments + 1
-            print(string.format("  [NEW] Processing payment of %.0f THB", msg.amount))
-            return { status = "charged" }
-        elseif msg.type == "order" then
-            processed_orders = processed_orders + 1
-            print(string.format("  [NEW] Creating order #%d", msg.id))
-            return { status = "created" }
-        elseif msg.type == "refund" then
-            print(string.format("  [NEW] Processing refund of %.0f THB", msg.amount))
-            return { status = "refunded" }
-        end
-    end)
-    
-    if was_dup then
-        print("  [DUP] Skipped")
-    end
+print("\n=== Memoization ===")
+local expensive_compute = function(n)
+    -- จำลอง expensive operation
+    local sum = 0
+    for i = 1, n do sum = sum + i end
+    return sum
 end
 
-print(string.format("\nResults: payments=%d, orders=%d (should be 1 each)",
-    processed_payments, processed_orders))
+local memoized = cache:memoize(
+    function(n) return "sum:" .. n end,
+    expensive_compute,
+    300
+)
 
-local stats = eo.stats
-print(string.format("Stats: received=%d, processed=%d, duplicates=%d",
-    stats.received, stats.processed, stats.duplicates))
+print("sum(100) =", memoized(100))
+print("sum(100) cached =", memoized(100))  -- จาก cache
+print("sum(200) =", memoized(200))
+
+print("\n=== Cache Stats ===")
+local stats = cache:stats()
+print(string.format("  Size: %d, Hits: %d, Misses: %d, Hit Rate: %s",
+    stats.size, stats.hits, stats.misses, stats.hit_rate))
 ```
 
 ---
 
-## สรุปบทที่ 60
+## 60.10 Pattern: Repository Pattern
+
+### ตัวอย่างที่ 14: Repository Pattern พร้อม Unit of Work
+
+```lua
+-- repository_pattern.lua
+local sqlite3 = require("lsqlite3")
+
+-- Repository base class
+local Repository = {}
+Repository.__index = Repository
+
+function Repository.new(db, table_name)
+    return setmetatable({
+        _db = db,
+        _table = table_name,
+    }, Repository)
+end
+
+function Repository:findAll(options)
+    options = options or {}
+    local sql = "SELECT * FROM " .. self._table
+
+    local wheres = {}
+    local values = {}
+
+    if options.where then
+        for col, val in pairs(options.where) do
+            table.insert(wheres, col .. " = ?")
+            table.insert(values, val)
+        end
+    end
+
+    if #wheres > 0 then
+        sql = sql .. " WHERE " .. table.concat(wheres, " AND ")
+    end
+
+    if options.order then sql = sql .. " ORDER BY " .. options.order end
+    if options.limit then sql = sql .. " LIMIT " .. options.limit end
+    if options.offset then sql = sql .. " OFFSET " .. options.offset end
+
+    local stmt = self._db:prepare(sql)
+    if #values > 0 then
+        stmt:bind_values(table.unpack(values))
+    end
+
+    local results = {}
+    for row in stmt:nrows() do
+        table.insert(results, row)
+    end
+    stmt:finalize()
+
+    return results
+end
+
+function Repository:findById(id)
+    local stmt = self._db:prepare(
+        "SELECT * FROM " .. self._table .. " WHERE id = ?"
+    )
+    stmt:bind_values(id)
+    local row = stmt:first_row()
+    stmt:finalize()
+    return row
+end
+
+function Repository:save(entity)
+    if entity.id then
+        return self:_update(entity)
+    else
+        return self:_insert(entity)
+    end
+end
+
+function Repository:_insert(entity)
+    local cols = {}
+    local placeholders = {}
+    local values = {}
+
+    for k, v in pairs(entity) do
+        if k ~= "id" then
+            table.insert(cols, k)
+            table.insert(placeholders, "?")
+            table.insert(values, v)
+        end
+    end
+
+    local sql = string.format(
+        "INSERT INTO %s (%s) VALUES (%s)",
+        self._table,
+        table.concat(cols, ", "),
+        table.concat(placeholders, ", ")
+    )
+
+    local stmt = self._db:prepare(sql)
+    stmt:bind_values(table.unpack(values))
+    stmt:step()
+    stmt:finalize()
+
+    entity.id = self._db:last_insert_rowid()
+    return entity
+end
+
+function Repository:_update(entity)
+    local sets = {}
+    local values = {}
+
+    for k, v in pairs(entity) do
+        if k ~= "id" then
+            table.insert(sets, k .. " = ?")
+            table.insert(values, v)
+        end
+    end
+
+    table.insert(values, entity.id)
+
+    local sql = string.format(
+        "UPDATE %s SET %s WHERE id = ?",
+        self._table,
+        table.concat(sets, ", ")
+    )
+
+    local stmt = self._db:prepare(sql)
+    stmt:bind_values(table.unpack(values))
+    stmt:step()
+    stmt:finalize()
+
+    return entity
+end
+
+function Repository:delete(id)
+    local stmt = self._db:prepare(
+        "DELETE FROM " .. self._table .. " WHERE id = ?"
+    )
+    stmt:bind_values(id)
+    stmt:step()
+    local affected = self._db:changes()
+    stmt:finalize()
+    return affected > 0
+end
+
+-- Unit of Work
+local UnitOfWork = {}
+UnitOfWork.__index = UnitOfWork
+
+function UnitOfWork.new(db)
+    local self = setmetatable({}, UnitOfWork)
+    self._db = db
+    self._new = {}
+    self._dirty = {}
+    self._deleted = {}
+    return self
+end
+
+function UnitOfWork:register_new(entity, repo)
+    table.insert(self._new, {entity = entity, repo = repo})
+end
+
+function UnitOfWork:register_dirty(entity, repo)
+    table.insert(self._dirty, {entity = entity, repo = repo})
+end
+
+function UnitOfWork:register_deleted(id, repo)
+    table.insert(self._deleted, {id = id, repo = repo})
+end
+
+function UnitOfWork:commit()
+    self._db:exec("BEGIN")
+
+    local ok, err = pcall(function()
+        for _, item in ipairs(self._new) do
+            item.repo:save(item.entity)
+        end
+        for _, item in ipairs(self._dirty) do
+            item.repo:save(item.entity)
+        end
+        for _, item in ipairs(self._deleted) do
+            item.repo:delete(item.id)
+        end
+    end)
+
+    if ok then
+        self._db:exec("COMMIT")
+        self._new = {}
+        self._dirty = {}
+        self._deleted = {}
+        return true
+    else
+        self._db:exec("ROLLBACK")
+        return false, err
+    end
+end
+
+-- ทดสอบ
+local db = sqlite3.open(":memory:")
+
+db:exec([[
+    CREATE TABLE customers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT,
+        tier TEXT DEFAULT 'standard'
+    );
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        status TEXT DEFAULT 'pending'
+    )
+]])
+
+local customer_repo = Repository.new(db, "customers")
+local order_repo = Repository.new(db, "orders")
+
+-- สร้าง Unit of Work
+local uow = UnitOfWork.new(db)
+
+local c1 = {name = "ลูกค้า VIP", email = "vip@test.com", tier = "premium"}
+local c2 = {name = "ลูกค้าทั่วไป", email = "normal@test.com", tier = "standard"}
+
+uow:register_new(c1, customer_repo)
+uow:register_new(c2, customer_repo)
+
+local ok, err = uow:commit()
+print("Commit result:", ok, err)
+
+print("\n=== Customers ===")
+for _, c in ipairs(customer_repo:findAll({order = "id"})) do
+    print(string.format("  [%d] %s (%s)", c.id, c.name, c.tier))
+end
+
+-- Add orders
+local uow2 = UnitOfWork.new(db)
+uow2:register_new({customer_id = c1.id, amount = 5000, status = "paid"}, order_repo)
+uow2:register_new({customer_id = c1.id, amount = 3500, status = "pending"}, order_repo)
+uow2:register_new({customer_id = c2.id, amount = 1200, status = "paid"}, order_repo)
+uow2:commit()
+
+print("\n=== Orders for Customer 1 ===")
+for _, o in ipairs(order_repo:findAll({where = {customer_id = c1.id}})) do
+    print(string.format("  Order #%d: %.2f (%s)", o.id, o.amount, o.status))
+end
+
+db:close()
+```
+
+---
+
+## 60.11 สรุปและ Best Practices
+
+### ตัวอย่างที่ 15: Best Practices Checklist
+
+```lua
+-- best_practices.lua
+-- รวม best practices ทั้งหมดสำหรับ SQLite/NoSQL ใน Lua
+
+--[[
+✅ SQLite Best Practices:
+
+1. Connection Management
+   - ใช้ connection pool สำหรับ multi-threaded apps
+   - ปิด connection เมื่อไม่ใช้งาน
+   - ใช้ WAL mode สำหรับ concurrent reads
+
+2. Performance
+   - ใช้ transactions สำหรับ batch writes
+   - สร้าง indexes บน columns ที่ query บ่อย
+   - ใช้ prepared statements (ไม่ต้อง parse SQL ซ้ำ)
+   - เปิด PRAGMA cache_size สำหรับ large databases
+
+3. Data Safety
+   - ใช้ transactions สำหรับ operations ที่ต้องเป็น atomic
+   - Handle errors อย่างเหมาะสม
+   - Backup ก่อน migration
+
+4. Schema Design
+   - ใช้ INTEGER PRIMARY KEY AUTOINCREMENT
+   - เพิ่ม created_at/updated_at ในทุกตาราง
+   - ใช้ FOREIGN KEY constraints
+
+5. Security
+   - ใช้ parameterized queries (ไม่ใช้ string concatenation)
+   - Validate input ก่อน insert
+   - จำกัด file permissions ของ .db file
+]]
+
+local sqlite3 = require("lsqlite3")
+
+local function demonstrate_pragmas(db)
+    print("=== SQLite PRAGMAs ===")
+
+    -- WAL mode: เพิ่ม concurrent read performance
+    db:exec("PRAGMA journal_mode=WAL")
+
+    -- Cache size (หน่วย KB หรือ จำนวน pages ถ้าเป็น negative)
+    db:exec("PRAGMA cache_size=-10000")  -- ~10MB cache
+
+    -- Synchronous mode (NORMAL = good balance)
+    db:exec("PRAGMA synchronous=NORMAL")
+
+    -- Foreign key support (ปิดโดย default!)
+    db:exec("PRAGMA foreign_keys=ON")
+
+    -- ตรวจสอบ pragmas
+    for row in db:nrows("PRAGMA journal_mode") do
+        print("  journal_mode:", row[1])
+    end
+    for row in db:nrows("PRAGMA foreign_keys") do
+        print("  foreign_keys:", row[1] == 1 and "ON" or "OFF")
+    end
+    for row in db:nrows("PRAGMA cache_size") do
+        print("  cache_size:", row[1])
+    end
+end
+
+local function demonstrate_safe_queries(db)
+    print("\n=== Safe Query Patterns ===")
+
+    db:exec("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)")
+    db:exec("INSERT INTO test VALUES (1, 'Alice', 100), (2, 'Bob', 200)")
+
+    -- ✅ GOOD: Parameterized query
+    local stmt = db:prepare("SELECT * FROM test WHERE name = ? AND value > ?")
+    stmt:bind_values("Alice", 50)
+    for row in stmt:nrows() do
+        print("  Safe query found:", row.name, row.value)
+    end
+    stmt:finalize()
+
+    -- ❌ BAD: String concatenation (SQL injection risk!)
+    -- local user_input = "' OR '1'='1"
+    -- db:exec("SELECT * FROM test WHERE name = '" .. user_input .. "'")
+    -- ^ อย่าทำแบบนี้!
+
+    print("  ✅ Always use parameterized queries!")
+end
+
+local db = sqlite3.open(":memory:")
+
+demonstrate_pragmas(db)
+demonstrate_safe_queries(db)
+
+print("\n=== Summary ===")
+print([[
+SQLite ใน Lua เหมาะสำหรับ:
+  ✅ Desktop/mobile applications
+  ✅ Configuration storage
+  ✅ Local caching
+  ✅ Prototype development
+  ✅ Embedded systems
+
+ไม่เหมาะสำหรับ:
+  ❌ High concurrency write workloads
+  ❌ Very large datasets (>1TB)
+  ❌ Distributed systems
+  ❌ Complex analytics queries
+]])
+
+db:close()
+```
+
+---
+
+## แบบฝึกหัด
+
+**ข้อที่ 1:** สร้าง Todo application โดยใช้ SQLite ที่มีความสามารถ:
+- เพิ่ม/ลบ/แก้ไข task
+- จัดกลุ่ม task ด้วย tags
+- ค้นหา task ด้วย keyword
+- Export ข้อมูลเป็น JSON
+
+**ข้อที่ 2:** สร้าง Simple Event Sourcing system ที่:
+- บันทึก events ทุกอย่างลง SQLite
+- Rebuild state จาก events
+- Query events ตามช่วงเวลา
+- Snapshot state เป็น optimization
+
+**ข้อที่ 3:** พัฒนา Cache system ที่:
+- รองรับ TTL ต่างกันต่อ key
+- Implement LRU eviction
+- มี statistics (hit rate, miss rate)
+- รองรับ namespace (user:*, session:*, etc.)
+
+**ข้อที่ 4:** สร้าง Database Migration tool ที่:
+- อ่าน migration files จาก directory
+- Apply migrations ตาม version order
+- รองรับ rollback
+- แสดง migration status
+
+---
+
+## สรุป
 
 ในบทนี้เราได้เรียนรู้:
+- **SQLite พื้นฐาน**: การเปิด/ปิด database, CRUD operations
+- **Prepared Statements**: ป้องกัน SQL injection, เพิ่มประสิทธิภาพ
+- **Transactions**: ACID properties, batch operations
+- **Indexes**: Query optimization
+- **ORM Pattern**: Abstract database operations
+- **Document Store**: NoSQL pattern ด้วย SQLite JSON
+- **Key-Value Store**: Simple persistent KV storage
+- **Connection Pool**: Manage multiple connections
+- **Caching**: SQLite-backed cache ด้วย TTL
+- **Repository Pattern**: Clean code architecture
+- **Migration System**: Schema version management
 
-1. **ทำไมต้องใช้ Message Queue** - Decoupling, resilience, load leveling
-2. **Queue Patterns** - FIFO, LIFO, Priority, Delay, Dead Letter Queue
-3. **In-Memory FIFO Queue** - Simple queue implementation
-4. **Priority Queue** - Heap-based priority processing
-5. **Delay Queue** - Scheduled execution, exponential backoff
-6. **Dead Letter Queue** - Failed message handling
-7. **Redis-Based Queue** - RPUSH/LPOP, processing queue pattern
-8. **Pub/Sub** - Message broker, topic-based delivery
-9. **Topic Exchange** - AMQP-style routing keys with wildcards
-10. **Message Retry** - Exponential backoff, max retries
-11. **Idempotency** - Prevent duplicate processing
-12. **Consumer Groups** - Parallel processing, message distribution
-13. **Background Job Processor** - Complete job system with middleware
-14. **Exactly-Once Delivery** - Deduplication guarantee
-
-### Key Principles
-
-- **At-most-once**: ส่งครั้งเดียว อาจหาย (fast but lossy)
-- **At-least-once**: ส่งซ้ำได้ ต้องจัดการ duplicates (most common)
-- **Exactly-once**: ส่งครั้งเดียวแน่นอน (hardest, slowest)
-
-### Technology Recommendations
-
-| Use Case | Technology |
-|----------|------------|
-| Simple queue | Redis Lists |
-| Reliable messaging | RabbitMQ, AWS SQS |
-| Event streaming | Apache Kafka, Redis Streams |
-| Scheduled jobs | Redis + Sorted Set |
-| Priority queue | Redis Sorted Set |
-
-> **สำคัญ**: ใน production ใช้ message broker จริงเช่น RabbitMQ, Kafka, หรือ Redis Streams เพื่อความน่าเชื่อถือและ persistence
+**ถัดไป**: บทที่ 61 จะเรียนรู้เกี่ยวกับ LÖVE2D สำหรับพัฒนาเกม 2D ด้วย Lua
