@@ -1,1921 +1,1389 @@
-# บทที่ 69: Docker + Lua Applications
+# บทที่ 69: Distributed Tracing
 
 ## บทนำ
 
-Docker ช่วยให้เราสามารถ package แอปพลิเคชันพร้อม dependencies ทั้งหมดลงใน container ที่ทำงานได้เหมือนกันทุก environment ในบทนี้เราจะเรียนรู้การใช้ Docker กับ Lua applications และ OpenResty
+ในระบบ Microservices ที่ซับซ้อน การติดตามว่า Request หนึ่งๆ ไหลผ่าน Service ต่างๆ อย่างไรนั้นเป็นสิ่งสำคัญมาก **Distributed Tracing** คือเทคนิคที่ช่วยให้เราสามารถมองเห็นเส้นทางของ Request ตั้งแต่ต้นจนจบ ระบุ Bottleneck และ Debug ปัญหาที่เกิดขึ้นใน Production ได้อย่างมีประสิทธิภาพ
+
+ในบทนี้เราจะเรียนรู้การนำ Distributed Tracing มาใช้ใน OpenResty/Lua โดยใช้มาตรฐาน OpenTelemetry และการส่งข้อมูลไปยัง Zipkin และ Jaeger
 
 ---
 
-## 69.1 Docker Basics สำหรับ Lua Developers
+## 69.1 OpenTelemetry Concepts
+
+### 69.1.1 Trace, Span และ Context
+
+**OpenTelemetry** กำหนดแนวคิดหลักสามประการ:
+
+- **Trace**: การเดินทางทั้งหมดของ Request หนึ่งๆ ผ่านระบบ ประกอบด้วย Span หลายอัน
+- **Span**: หน่วยงานย่อยของ Trace แต่ละ Span แทนการทำงานหนึ่งอย่าง เช่น HTTP Request, Database Query
+- **Context**: ข้อมูลที่ถ่ายทอดระหว่าง Span เพื่อให้รู้ว่า Span ใดเป็น Parent/Child
 
 ```lua
--- ตัวอย่างที่ 1: Docker concept simulator ใน Lua
--- (แสดงให้เห็น concepts ของ Docker)
-
-local DockerConcept = {}
-DockerConcept.__index = DockerConcept
-
-function DockerConcept.new()
-    local self    = setmetatable({}, DockerConcept)
-    self.images   = {}
-    self.containers = {}
-    self.networks   = {}
-    self.volumes    = {}
-    return self
-end
-
-function DockerConcept:build(tag, config)
-    local image = {
-        id      = string.format("sha256:%032x", math.random(0x7FFFFFFF)),
-        tag     = tag,
-        base    = config.from,
-        layers  = {},
-        size    = 0,
-        created = os.time(),
-    }
-
-    -- Simulate layer creation
-    for _, instruction in ipairs(config.instructions or {}) do
-        local layer = {
-            type     = instruction.type,
-            command  = instruction.command,
-            size_mb  = math.random(1, 50),
-        }
-        table.insert(image.layers, layer)
-        image.size = image.size + layer.size_mb
-    end
-
-    self.images[tag] = image
-    print(string.format("[BUILD] Image '%s' built: %d layers, ~%dMB",
-        tag, #image.layers, image.size))
-    return image
-end
-
-function DockerConcept:run(imageName, config)
-    local image = self.images[imageName]
-    if not image then
-        error("Image not found: " .. imageName)
-    end
-
-    local containerId = string.format("%12x", math.random(0x7FFFFFFFFFFFFFFF))
-    local container   = {
-        id       = containerId,
-        name     = config.name or ("container_" .. containerId:sub(1, 6)),
-        image    = imageName,
-        status   = "running",
-        ports    = config.ports or {},
-        env      = config.env or {},
-        volumes  = config.volumes or {},
-        network  = config.network or "bridge",
-        startTime = os.time(),
-    }
-
-    self.containers[containerId] = container
-    print(string.format("[RUN] Container '%s' started from '%s'",
-        container.name, imageName))
-    return container
-end
-
-function DockerConcept:stop(containerId)
-    local c = self.containers[containerId]
-    if c then
-        c.status = "stopped"
-        print(string.format("[STOP] Container '%s' stopped", c.name))
-    end
-end
-
-function DockerConcept:ps()
-    print("CONTAINER ID   IMAGE           STATUS    NAMES")
-    for id, c in pairs(self.containers) do
-        print(string.format("%-14s %-15s %-9s %s",
-            id:sub(1, 12), c.image:sub(1, 15), c.status, c.name))
-    end
-end
-
--- ทดสอบ
-math.randomseed(42)
-local docker = DockerConcept.new()
-
-docker:build("my-lua-app:1.0", {
-    from = "ubuntu:22.04",
-    instructions = {
-        {type = "RUN",  command = "apt-get install -y lua5.4"},
-        {type = "COPY", command = "app.lua /app/"},
-        {type = "CMD",  command = "lua /app/app.lua"},
-    }
-})
-
-local c1 = docker:run("my-lua-app:1.0", {
-    name    = "lua-app-1",
-    ports   = {["8080/tcp"] = "8080"},
-    env     = {APP_ENV = "production"},
-})
-
-local c2 = docker:run("my-lua-app:1.0", {
-    name    = "lua-app-2",
-    ports   = {["8080/tcp"] = "8081"},
-    env     = {APP_ENV = "production"},
-})
-
-docker:ps()
-docker:stop(c1.id)
-
-print("\nAfter stop:")
-docker:ps()
+-- โครงสร้างพื้นฐานของ Span
+local span = {
+    trace_id   = "4bf92f3577b34da6a3ce929d0e0e4736",  -- 128-bit hex
+    span_id    = "00f067aa0ba902b7",                   -- 64-bit hex
+    parent_id  = nil,                                   -- nil = root span
+    name       = "HTTP GET /api/users",
+    start_time = ngx.now() * 1000,                      -- microseconds
+    end_time   = nil,
+    status     = "OK",    -- OK, ERROR, UNSET
+    attributes = {},
+    events     = {},
+}
 ```
 
----
+### 69.1.2 Trace ID Generation
 
-## 69.2 Dockerfile สำหรับ Lua Application
+Trace ID ต้องมีความ Unique สูงมาก โดยทั่วไปใช้ 128-bit Random Number
 
 ```lua
--- ตัวอย่างที่ 2: Dockerfile generator สำหรับ Lua app
-local Dockerfile = {}
-Dockerfile.__index = Dockerfile
-
-function Dockerfile.new()
-    local self = setmetatable({}, Dockerfile)
-    self.instructions = {}
-    return self
-end
-
-function Dockerfile:FROM(image, alias)
-    local instr = "FROM " .. image
-    if alias then instr = instr .. " AS " .. alias end
-    table.insert(self.instructions, instr)
-    return self
-end
-
-function Dockerfile:ARG(name, default)
-    local instr = "ARG " .. name
-    if default then instr = instr .. "=" .. default end
-    table.insert(self.instructions, instr)
-    return self
-end
-
-function Dockerfile:ENV(key, value)
-    table.insert(self.instructions, string.format("ENV %s=%s", key, tostring(value)))
-    return self
-end
-
-function Dockerfile:RUN(command)
-    table.insert(self.instructions, "RUN " .. command)
-    return self
-end
-
-function Dockerfile:COPY(src, dst, from)
-    local instr = "COPY"
-    if from then instr = instr .. " --from=" .. from end
-    instr = instr .. string.format(" %s %s", src, dst)
-    table.insert(self.instructions, instr)
-    return self
-end
-
-function Dockerfile:WORKDIR(path)
-    table.insert(self.instructions, "WORKDIR " .. path)
-    return self
-end
-
-function Dockerfile:EXPOSE(port, protocol)
-    local instr = "EXPOSE " .. tostring(port)
-    if protocol then instr = instr .. "/" .. protocol end
-    table.insert(self.instructions, instr)
-    return self
-end
-
-function Dockerfile:CMD(cmd)
-    if type(cmd) == "table" then
-        local parts = {}
-        for _, c in ipairs(cmd) do
-            table.insert(parts, '"' .. c .. '"')
-        end
-        table.insert(self.instructions, "CMD [" .. table.concat(parts, ", ") .. "]")
-    else
-        table.insert(self.instructions, "CMD " .. cmd)
+-- ฟังก์ชันสร้าง Trace ID (128-bit = 32 hex chars)
+local function generate_trace_id()
+    local bytes = {}
+    for i = 1, 16 do
+        bytes[i] = math.random(0, 255)
     end
-    return self
+    return string.format(
+        "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+        table.unpack(bytes)
+    )
 end
 
-function Dockerfile:ENTRYPOINT(cmd)
-    if type(cmd) == "table" then
-        local parts = {}
-        for _, c in ipairs(cmd) do
-            table.insert(parts, '"' .. c .. '"')
-        end
-        table.insert(self.instructions, "ENTRYPOINT [" .. table.concat(parts, ", ") .. "]")
-    else
-        table.insert(self.instructions, "ENTRYPOINT " .. cmd)
+-- ฟังก์ชันสร้าง Span ID (64-bit = 16 hex chars)
+local function generate_span_id()
+    local bytes = {}
+    for i = 1, 8 do
+        bytes[i] = math.random(0, 255)
     end
-    return self
+    return string.format(
+        "%02x%02x%02x%02x%02x%02x%02x%02x",
+        table.unpack(bytes)
+    )
 end
 
-function Dockerfile:HEALTHCHECK(config)
-    local instr = "HEALTHCHECK"
-    if config.interval then instr = instr .. " --interval=" .. config.interval end
-    if config.timeout   then instr = instr .. " --timeout="  .. config.timeout  end
-    if config.retries   then instr = instr .. " --retries="  .. config.retries  end
-    instr = instr .. " CMD " .. config.cmd
-    table.insert(self.instructions, instr)
-    return self
+-- ใช้ OpenResty random bytes เพื่อความปลอดภัยกว่า
+local function generate_id_secure(bytes_count)
+    local random_bytes = require("resty.random").bytes(bytes_count)
+    local hex = require("resty.string").to_hex(random_bytes)
+    return hex
 end
-
-function Dockerfile:USER(user)
-    table.insert(self.instructions, "USER " .. user)
-    return self
-end
-
-function Dockerfile:LABEL(labels)
-    local parts = {}
-    for k, v in pairs(labels) do
-        table.insert(parts, string.format('%s="%s"', k, v))
-    end
-    table.insert(self.instructions, "LABEL " .. table.concat(parts, " \\\n      "))
-    return self
-end
-
-function Dockerfile:render()
-    return table.concat(self.instructions, "\n")
-end
-
--- Dockerfile สำหรับ Lua CLI application
-local luaDockerfile = Dockerfile.new()
-    :FROM("ubuntu:22.04")
-    :LABEL({
-        maintainer  = "dev@example.com",
-        version     = "1.0.0",
-        description = "Lua application container",
-    })
-    :ARG("LUA_VERSION", "5.4")
-    :ENV("LUA_PATH", "/app/?.lua;;")
-    :ENV("APP_ENV",  "production")
-    :RUN("apt-get update && apt-get install -y \\\n    lua5.4 \\\n    luarocks \\\n    && rm -rf /var/lib/apt/lists/*")
-    :RUN("luarocks install luasocket")
-    :RUN("luarocks install lua-cjson")
-    :WORKDIR("/app")
-    :COPY("*.lua", "./")
-    :COPY("*.rockspec", "./")
-    :RUN("adduser --disabled-password --gecos '' appuser")
-    :USER("appuser")
-    :EXPOSE(8080)
-    :HEALTHCHECK({
-        interval = "30s",
-        timeout  = "5s",
-        retries  = 3,
-        cmd      = "lua /app/healthcheck.lua || exit 1",
-    })
-    :CMD({"lua", "main.lua"})
-
-print("=== Dockerfile for Lua Application ===")
-print(luaDockerfile:render())
 ```
 
----
+### 69.1.3 Context Propagation
 
-## 69.3 Dockerfile สำหรับ OpenResty
-
-```lua
--- ตัวอย่างที่ 3: OpenResty Dockerfile
-local openrestyDockerfile = Dockerfile.new()
-    :FROM("openresty/openresty:1.25.3.2-alpine")
-    :LABEL({maintainer = "devops@example.com", version = "2.0.0"})
-    :ENV("NGINX_WORKER_PROCESSES",  "auto")
-    :ENV("NGINX_WORKER_CONNECTIONS", "1024")
-    :RUN("apk add --no-cache \\\n    curl \\\n    luarocks \\\n    && luarocks install lua-resty-http")
-    :COPY("nginx/nginx.conf",    "/usr/local/openresty/nginx/conf/nginx.conf")
-    :COPY("nginx/conf.d/",       "/etc/nginx/conf.d/")
-    :COPY("lua/",                "/usr/local/openresty/lualib/app/")
-    :EXPOSE(80)
-    :EXPOSE(443)
-    :HEALTHCHECK({
-        interval = "10s",
-        timeout  = "3s",
-        retries  = 3,
-        cmd      = "curl -f http://localhost/health || exit 1",
-    })
-    :CMD({"/usr/local/openresty/bin/openresty", "-g", "daemon off;"})
-
-print("=== Dockerfile for OpenResty ===")
-print(openrestyDockerfile:render())
-```
-
----
-
-## 69.4 Multi-stage Build
+Context Propagation คือกลไกที่ทำให้ Trace สามารถข้ามไปยัง Service อื่นได้
 
 ```lua
--- ตัวอย่างที่ 4: Multi-stage Dockerfile
-local function generateMultiStageDockerfile()
-    local lines = {}
+-- Context object สำหรับ propagation
+local TraceContext = {}
+TraceContext.__index = TraceContext
 
-    -- Stage 1: Builder
-    table.insert(lines, "# Stage 1: Builder - install dependencies")
-    table.insert(lines, "FROM ubuntu:22.04 AS builder")
-    table.insert(lines, "")
-    table.insert(lines, "RUN apt-get update && apt-get install -y \\")
-    table.insert(lines, "    lua5.4 \\")
-    table.insert(lines, "    luarocks \\")
-    table.insert(lines, "    build-essential \\")
-    table.insert(lines, "    git \\")
-    table.insert(lines, "    && rm -rf /var/lib/apt/lists/*")
-    table.insert(lines, "")
-    table.insert(lines, "WORKDIR /build")
-    table.insert(lines, "COPY *.rockspec ./")
-    table.insert(lines, "RUN luarocks install --tree /build/rocks --only-deps *.rockspec 2>/dev/null || true")
-    table.insert(lines, "COPY . .")
-    table.insert(lines, "")
-    table.insert(lines, "# Run tests in builder stage")
-    table.insert(lines, "RUN lua test/run_tests.lua")
-    table.insert(lines, "")
-
-    -- Stage 2: Production
-    table.insert(lines, "# Stage 2: Production - minimal image")
-    table.insert(lines, "FROM ubuntu:22.04 AS production")
-    table.insert(lines, "")
-    table.insert(lines, "RUN apt-get update && apt-get install -y \\")
-    table.insert(lines, "    lua5.4 \\")
-    table.insert(lines, "    libssl3 \\")
-    table.insert(lines, "    && rm -rf /var/lib/apt/lists/*")
-    table.insert(lines, "")
-    table.insert(lines, "# Copy only what's needed")
-    table.insert(lines, "COPY --from=builder /build/rocks /usr/local/lib/lua/rocks")
-    table.insert(lines, "COPY --from=builder /build/src   /app/src")
-    table.insert(lines, "COPY --from=builder /build/main.lua /app/")
-    table.insert(lines, "")
-    table.insert(lines, "# Security: non-root user")
-    table.insert(lines, "RUN groupadd -r appgroup && useradd -r -g appgroup appuser")
-    table.insert(lines, "RUN chown -R appuser:appgroup /app")
-    table.insert(lines, "")
-    table.insert(lines, "WORKDIR /app")
-    table.insert(lines, "USER appuser")
-    table.insert(lines, "")
-    table.insert(lines, "ENV LUA_PATH=/app/src/?.lua;/usr/local/lib/lua/rocks/share/lua/5.4/?.lua;;")
-    table.insert(lines, "ENV LUA_CPATH=/usr/local/lib/lua/rocks/lib/lua/5.4/?.so;;")
-    table.insert(lines, "")
-    table.insert(lines, "EXPOSE 8080")
-    table.insert(lines, "HEALTHCHECK --interval=30s --timeout=5s --retries=3 \\")
-    table.insert(lines, "    CMD lua /app/src/health.lua || exit 1")
-    table.insert(lines, "")
-    table.insert(lines, 'ENTRYPOINT ["lua"]')
-    table.insert(lines, 'CMD ["/app/main.lua"]')
-
-    return table.concat(lines, "\n")
+function TraceContext.new(trace_id, span_id, flags)
+    return setmetatable({
+        trace_id  = trace_id or generate_trace_id(),
+        span_id   = span_id or generate_span_id(),
+        flags     = flags or 1,  -- 1 = sampled
+        baggage   = {},
+    }, TraceContext)
 end
 
-print("=== Multi-stage Dockerfile ===")
-print(generateMultiStageDockerfile())
-```
-
----
-
-## 69.5 Docker Compose สำหรับ Development
-
-```lua
--- ตัวอย่างที่ 5: Docker Compose generator
-local ComposeGenerator = {}
-ComposeGenerator.__index = ComposeGenerator
-
-function ComposeGenerator.new(version)
-    local self    = setmetatable({}, ComposeGenerator)
-    self.version  = version or "3.9"
-    self.services = {}
-    self.networks = {}
-    self.volumes  = {}
-    return self
+function TraceContext:set_baggage(key, value)
+    self.baggage[key] = value
 end
 
-function ComposeGenerator:addService(name, config)
-    self.services[name] = config
-    return self
+function TraceContext:get_baggage(key)
+    return self.baggage[key]
 end
 
-function ComposeGenerator:addNetwork(name, config)
-    self.networks[name] = config or {driver = "bridge"}
-    return self
-end
-
-function ComposeGenerator:addVolume(name, config)
-    self.volumes[name] = config or {}
-    return self
-end
-
-function ComposeGenerator:_indent(str, spaces)
-    local prefix = string.rep(" ", spaces)
-    return str:gsub("\n", "\n" .. prefix)
-end
-
-function ComposeGenerator:_yamlValue(v, indent)
-    indent = indent or 0
-    local t = type(v)
-    if t == "nil"     then return "null"
-    elseif t == "boolean" then return tostring(v)
-    elseif t == "number"  then return tostring(v)
-    elseif t == "string"  then
-        -- Quote if contains special chars
-        if v:match("[:#{}%[%]]") or v == "" then
-            return '"' .. v:gsub('"', '\\"') .. '"'
-        end
-        return v
-    end
-    return tostring(v)
-end
-
-function ComposeGenerator:render()
-    local lines = {}
-    table.insert(lines, "version: '" .. self.version .. "'")
-    table.insert(lines, "")
-    table.insert(lines, "services:")
-
-    for name, svc in pairs(self.services) do
-        table.insert(lines, "  " .. name .. ":")
-
-        if svc.build then
-            if type(svc.build) == "string" then
-                table.insert(lines, "    build: " .. svc.build)
-            else
-                table.insert(lines, "    build:")
-                table.insert(lines, "      context: " .. (svc.build.context or "."))
-                if svc.build.dockerfile then
-                    table.insert(lines, "      dockerfile: " .. svc.build.dockerfile)
-                end
-                if svc.build.target then
-                    table.insert(lines, "      target: " .. svc.build.target)
-                end
-                if svc.build.args then
-                    table.insert(lines, "      args:")
-                    for k, v in pairs(svc.build.args) do
-                        table.insert(lines, string.format("        %s: %s", k, tostring(v)))
-                    end
-                end
-            end
-        end
-
-        if svc.image then
-            table.insert(lines, "    image: " .. svc.image)
-        end
-
-        if svc.container_name then
-            table.insert(lines, "    container_name: " .. svc.container_name)
-        end
-
-        if svc.restart then
-            table.insert(lines, "    restart: " .. svc.restart)
-        end
-
-        if svc.ports and #svc.ports > 0 then
-            table.insert(lines, "    ports:")
-            for _, p in ipairs(svc.ports) do
-                table.insert(lines, '      - "' .. p .. '"')
-            end
-        end
-
-        if svc.environment then
-            table.insert(lines, "    environment:")
-            for k, v in pairs(svc.environment) do
-                table.insert(lines, string.format("      %s: %s", k, tostring(v)))
-            end
-        end
-
-        if svc.env_file then
-            table.insert(lines, "    env_file:")
-            for _, f in ipairs(svc.env_file) do
-                table.insert(lines, "      - " .. f)
-            end
-        end
-
-        if svc.volumes and #svc.volumes > 0 then
-            table.insert(lines, "    volumes:")
-            for _, v in ipairs(svc.volumes) do
-                table.insert(lines, "      - " .. v)
-            end
-        end
-
-        if svc.networks and #svc.networks > 0 then
-            table.insert(lines, "    networks:")
-            for _, n in ipairs(svc.networks) do
-                table.insert(lines, "      - " .. n)
-            end
-        end
-
-        if svc.depends_on and #svc.depends_on > 0 then
-            table.insert(lines, "    depends_on:")
-            for _, d in ipairs(svc.depends_on) do
-                table.insert(lines, "      - " .. d)
-            end
-        end
-
-        if svc.healthcheck then
-            local hc = svc.healthcheck
-            table.insert(lines, "    healthcheck:")
-            table.insert(lines, '      test: ["CMD", ' ..
-                table.concat(
-                    (function()
-                        local parts = {}
-                        for p in hc.test:gmatch("%S+") do
-                            table.insert(parts, '"' .. p .. '"')
-                        end
-                        return parts
-                    end)(),
-                ", ") .. "]")
-            if hc.interval then
-                table.insert(lines, "      interval: " .. hc.interval)
-            end
-            if hc.timeout then
-                table.insert(lines, "      timeout: " .. hc.timeout)
-            end
-            if hc.retries then
-                table.insert(lines, "      retries: " .. hc.retries)
-            end
-        end
-
-        if svc.command then
-            table.insert(lines, "    command: " .. svc.command)
-        end
-
-        if svc.deploy then
-            table.insert(lines, "    deploy:")
-            if svc.deploy.replicas then
-                table.insert(lines, "      replicas: " .. svc.deploy.replicas)
-            end
-            if svc.deploy.resources then
-                table.insert(lines, "      resources:")
-                table.insert(lines, "        limits:")
-                table.insert(lines, "          cpus: '" .. (svc.deploy.resources.cpus or "0.5") .. "'")
-                table.insert(lines, "          memory: " .. (svc.deploy.resources.memory or "256M"))
-            end
-        end
-    end
-
-    -- Networks
-    if next(self.networks) then
-        table.insert(lines, "")
-        table.insert(lines, "networks:")
-        for name, net in pairs(self.networks) do
-            table.insert(lines, "  " .. name .. ":")
-            if net.driver then
-                table.insert(lines, "    driver: " .. net.driver)
-            end
-        end
-    end
-
-    -- Volumes
-    if next(self.volumes) then
-        table.insert(lines, "")
-        table.insert(lines, "volumes:")
-        for name, vol in pairs(self.volumes) do
-            table.insert(lines, "  " .. name .. ":")
-            if vol.driver then
-                table.insert(lines, "    driver: " .. vol.driver)
-            end
-        end
-    end
-
-    return table.concat(lines, "\n")
-end
-
-local compose = ComposeGenerator.new("3.9")
-
-compose:addService("app", {
-    build = {
-        context    = ".",
-        dockerfile = "Dockerfile",
-        target     = "production",
-        args       = {LUA_VERSION = "5.4"},
-    },
-    container_name = "lua-app",
-    restart        = "unless-stopped",
-    ports          = {"8080:8080"},
-    environment    = {
-        APP_ENV    = "development",
-        LOG_LEVEL  = "debug",
-        DB_HOST    = "postgres",
-        REDIS_HOST = "redis",
-    },
-    volumes  = {
-        "./src:/app/src",
-        "./config:/app/config:ro",
-        "app-logs:/app/logs",
-    },
-    networks    = {"app-network"},
-    depends_on  = {"postgres", "redis"},
-    healthcheck = {
-        test     = "curl -f http://localhost:8080/health",
-        interval = "30s",
-        timeout  = "5s",
-        retries  = 3,
-    },
-    deploy = {
-        replicas  = 2,
-        resources = {cpus = "0.5", memory = "256M"},
-    },
-})
-
-compose:addService("postgres", {
-    image          = "postgres:15-alpine",
-    container_name = "lua-postgres",
-    restart        = "unless-stopped",
-    ports          = {"5432:5432"},
-    environment    = {
-        POSTGRES_DB       = "appdb",
-        POSTGRES_USER     = "appuser",
-        POSTGRES_PASSWORD = "secret",
-    },
-    volumes  = {"postgres-data:/var/lib/postgresql/data"},
-    networks = {"app-network"},
-    healthcheck = {
-        test     = "pg_isready -U appuser -d appdb",
-        interval = "10s",
-        timeout  = "5s",
-        retries  = 5,
-    },
-})
-
-compose:addService("redis", {
-    image          = "redis:7-alpine",
-    container_name = "lua-redis",
-    restart        = "unless-stopped",
-    ports          = {"6379:6379"},
-    command        = "redis-server --appendonly yes",
-    volumes        = {"redis-data:/data"},
-    networks       = {"app-network"},
-    healthcheck    = {
-        test     = "redis-cli ping",
-        interval = "10s",
-        timeout  = "3s",
-        retries  = 3,
-    },
-})
-
-compose:addService("nginx", {
-    image          = "nginx:alpine",
-    container_name = "lua-nginx",
-    ports          = {"80:80", "443:443"},
-    volumes        = {
-        "./nginx/nginx.conf:/etc/nginx/nginx.conf:ro",
-        "./nginx/ssl:/etc/nginx/ssl:ro",
-    },
-    networks    = {"app-network"},
-    depends_on  = {"app"},
-})
-
-compose:addNetwork("app-network", {driver = "bridge"})
-compose:addVolume("postgres-data", {})
-compose:addVolume("redis-data",    {})
-compose:addVolume("app-logs",      {})
-
-print("=== docker-compose.yml ===")
-print(compose:render())
-```
-
----
-
-## 69.6 Environment Variables Management
-
-```lua
--- ตัวอย่างที่ 6: Environment variable management
-local EnvManager = {}
-EnvManager.__index = EnvManager
-
-function EnvManager.new()
-    local self       = setmetatable({}, EnvManager)
-    self.required    = {}
-    self.optional    = {}
-    self.config      = {}
-    return self
-end
-
-function EnvManager:require(name, description, validator)
-    table.insert(self.required, {
-        name        = name,
-        description = description,
-        validator   = validator,
-    })
-    return self
-end
-
-function EnvManager:optional(name, default, description)
-    table.insert(self.optional, {
-        name        = name,
-        default     = default,
-        description = description,
-    })
-    return self
-end
-
-function EnvManager:load()
-    local errors = {}
-
-    -- Load required variables
-    for _, v in ipairs(self.required) do
-        local value = os.getenv(v.name)
-        if not value then
-            table.insert(errors, string.format(
-                "Required environment variable '%s' is not set: %s",
-                v.name, v.description or ""))
-        else
-            if v.validator and not v.validator(value) then
-                table.insert(errors, string.format(
-                    "Invalid value for '%s': %s", v.name, value))
-            else
-                self.config[v.name] = value
-            end
-        end
-    end
-
-    if #errors > 0 then
-        return nil, table.concat(errors, "\n")
-    end
-
-    -- Load optional variables
-    for _, v in ipairs(self.optional) do
-        self.config[v.name] = os.getenv(v.name) or v.default
-    end
-
-    return self.config, nil
-end
-
-function EnvManager:get(name)
-    return self.config[name]
-end
-
-function EnvManager:getInt(name)
-    return tonumber(self.config[name])
-end
-
-function EnvManager:getBool(name)
-    local v = self.config[name]
-    return v == "true" or v == "1" or v == "yes"
-end
-
-function EnvManager:generateDotenv()
-    local lines = {}
-    table.insert(lines, "# Required variables")
-    for _, v in ipairs(self.required) do
-        table.insert(lines, string.format("# %s (required) - %s",
-            v.name, v.description or ""))
-        table.insert(lines, v.name .. "=")
-        table.insert(lines, "")
-    end
-    table.insert(lines, "# Optional variables (with defaults)")
-    for _, v in ipairs(self.optional) do
-        table.insert(lines, string.format("# %s - %s",
-            v.name, v.description or ""))
-        table.insert(lines, string.format("%s=%s", v.name, tostring(v.default or "")))
-        table.insert(lines, "")
-    end
-    return table.concat(lines, "\n")
-end
-
-local env = EnvManager.new()
-
-env:require("DATABASE_URL",    "PostgreSQL connection string",
-    function(v) return v:match("^postgres://") ~= nil end)
-env:require("SECRET_KEY",      "Application secret key (min 32 chars)",
-    function(v) return #v >= 32 end)
-env:require("REDIS_URL",       "Redis connection string")
-
-env:optional("APP_ENV",        "production", "Application environment")
-env:optional("PORT",           "8080",       "HTTP server port")
-env:optional("LOG_LEVEL",      "INFO",       "Logging level")
-env:optional("MAX_CONNECTIONS", "100",       "Database max connections")
-env:optional("TIMEOUT_MS",     "5000",       "Request timeout in ms")
-env:optional("DEBUG",          "false",      "Enable debug mode")
-
-print("=== .env.example ===")
-print(env:generateDotenv())
-
--- Simulate loading (without actual env vars set)
--- env:load() would fail without required vars being set
-print("Config structure: DATABASE_URL, SECRET_KEY, REDIS_URL are required")
-```
-
----
-
-## 69.7 Volume Mounting
-
-```lua
--- ตัวอย่างที่ 7: Volume configuration helper
-local VolumeConfig = {}
-VolumeConfig.__index = VolumeConfig
-
-function VolumeConfig.new()
-    local self   = setmetatable({}, VolumeConfig)
-    self.volumes = {}
-    return self
-end
-
-function VolumeConfig:bind(hostPath, containerPath, options)
-    table.insert(self.volumes, {
-        type     = "bind",
-        source   = hostPath,
-        target   = containerPath,
-        readonly = options and options.readonly or false,
-    })
-    return self
-end
-
-function VolumeConfig:named(volumeName, containerPath, options)
-    table.insert(self.volumes, {
-        type     = "volume",
-        source   = volumeName,
-        target   = containerPath,
-        readonly = options and options.readonly or false,
-    })
-    return self
-end
-
-function VolumeConfig:tmpfs(containerPath, size)
-    table.insert(self.volumes, {
-        type   = "tmpfs",
-        target = containerPath,
-        tmpfs  = {size = size},
-    })
-    return self
-end
-
-function VolumeConfig:toDockerFlags()
-    local flags = {}
-    for _, v in ipairs(self.volumes) do
-        if v.type == "bind" then
-            local flag = string.format("-v %s:%s", v.source, v.target)
-            if v.readonly then flag = flag .. ":ro" end
-            table.insert(flags, flag)
-        elseif v.type == "volume" then
-            local flag = string.format("--mount type=volume,source=%s,target=%s",
-                v.source, v.target)
-            if v.readonly then flag = flag .. ",readonly" end
-            table.insert(flags, flag)
-        elseif v.type == "tmpfs" then
-            table.insert(flags, string.format("--mount type=tmpfs,target=%s", v.target))
-        end
-    end
-    return table.concat(flags, " \\\n  ")
-end
-
-function VolumeConfig:toComposeYaml()
-    local lines = {}
-    table.insert(lines, "    volumes:")
-    for _, v in ipairs(self.volumes) do
-        if v.type == "bind" then
-            local entry = string.format("      - %s:%s", v.source, v.target)
-            if v.readonly then entry = entry .. ":ro" end
-            table.insert(lines, entry)
-        elseif v.type == "volume" then
-            table.insert(lines, string.format("      - %s:%s", v.source, v.target))
-        elseif v.type == "tmpfs" then
-            table.insert(lines, string.format("      - type: tmpfs\n        target: %s", v.target))
-        end
-    end
-    return table.concat(lines, "\n")
-end
-
-local vols = VolumeConfig.new()
-    :bind("./src",       "/app/src")
-    :bind("./config",    "/app/config", {readonly = true})
-    :named("app-data",   "/app/data")
-    :named("app-logs",   "/var/log/app")
-    :tmpfs("/tmp/cache", "64m")
-
-print("=== Docker run flags ===")
-print("docker run " .. vols:toDockerFlags() .. " my-app:latest")
-print("\n=== Docker Compose volumes section ===")
-print(vols:toComposeYaml())
-```
-
----
-
-## 69.8 Health Checks in Docker
-
-```lua
--- ตัวอย่างที่ 8: Health check script สำหรับ Lua app
-
--- health.lua - script ที่ใช้ใน Docker HEALTHCHECK
-local function runHealthCheck()
-    local checks = {}
-    local overall = true
-
-    -- Check 1: Process responsive
-    local function checkProcess()
-        -- ตรวจสอบว่า main process ยังทำงาน
-        local pidFile = "/var/run/app.pid"
-        local f       = io.open(pidFile, "r")
-        if not f then return false, "PID file not found" end
-        local pid = f:read("*n")
-        f:close()
-        if not pid then return false, "Invalid PID" end
-        return true, "Process running (PID: " .. pid .. ")"
-    end
-
-    -- Check 2: HTTP endpoint
-    local function checkHTTP()
-        -- ใน production ใช้ socket หรือ curl
-        -- สำหรับ demo simulate
-        return true, "HTTP 200 OK"
-    end
-
-    -- Check 3: Database connectivity
-    local function checkDatabase()
-        -- ใน production เปิด connection จริง
-        return true, "Database connected"
-    end
-
-    -- Check 4: Disk space
-    local function checkDisk()
-        -- ใน production ใช้ df command
-        return true, "Disk space OK"
-    end
-
-    local checkList = {
-        {name = "process",  fn = checkProcess},
-        {name = "http",     fn = checkHTTP},
-        {name = "database", fn = checkDatabase},
-        {name = "disk",     fn = checkDisk},
-    }
-
-    for _, c in ipairs(checkList) do
-        local ok, msg = c.fn()
-        checks[c.name] = {ok = ok, message = msg}
-        if not ok then overall = false end
-    end
-
-    return overall, checks
-end
-
-local ok, checks = runHealthCheck()
-
-print("Health Check Result:")
-for name, c in pairs(checks) do
-    print(string.format("  %-15s [%s] %s",
-        name, c.ok and "PASS" or "FAIL", c.message))
-end
-print("\nOverall: " .. (ok and "HEALTHY" or "UNHEALTHY"))
-
--- Exit code สำหรับ Docker: 0 = healthy, 1 = unhealthy
--- os.exit(ok and 0 or 1)
-```
-
----
-
-## 69.9 Docker Networking
-
-```lua
--- ตัวอย่างที่ 9: Container networking concepts
-local ContainerNetwork = {}
-ContainerNetwork.__index = ContainerNetwork
-
-function ContainerNetwork.new(name, config)
-    local self     = setmetatable({}, ContainerNetwork)
-    self.name      = name
-    self.driver    = config.driver or "bridge"
-    self.subnet    = config.subnet
-    self.ipRange   = config.ipRange
-    self.gateway   = config.gateway
-    self.containers = {}
-    return self
-end
-
-function ContainerNetwork:connect(containerName, config)
-    self.containers[containerName] = {
-        name     = containerName,
-        aliases  = config.aliases  or {},
-        ip       = config.ip,
-    }
-    print(string.format("[NET] Container '%s' connected to network '%s'",
-        containerName, self.name))
-end
-
-function ContainerNetwork:resolve(name)
-    -- Container name resolution
-    for cName, c in pairs(self.containers) do
-        if cName == name then return c.ip or cName end
-        for _, alias in ipairs(c.aliases) do
-            if alias == name then return c.ip or cName end
-        end
-    end
-    return nil
-end
-
-function ContainerNetwork:generateDockerCommand()
-    local lines = {}
-    table.insert(lines, "# Create network")
-    local cmd = string.format("docker network create \\\n  --driver %s", self.driver)
-    if self.subnet then
-        cmd = cmd .. string.format(" \\\n  --subnet %s", self.subnet)
-    end
-    if self.gateway then
-        cmd = cmd .. string.format(" \\\n  --gateway %s", self.gateway)
-    end
-    cmd = cmd .. " \\\n  " .. self.name
-    table.insert(lines, cmd)
-    return table.concat(lines, "\n")
-end
-
--- Service Discovery simulation
-local ServiceDiscovery = {}
-ServiceDiscovery.__index = ServiceDiscovery
-
-function ServiceDiscovery.new()
-    local self    = setmetatable({}, ServiceDiscovery)
-    self.services = {}
-    return self
-end
-
-function ServiceDiscovery:register(name, host, port, metadata)
-    if not self.services[name] then
-        self.services[name] = {}
-    end
-    table.insert(self.services[name], {
-        host     = host,
-        port     = port,
-        metadata = metadata or {},
-        healthy  = true,
-    })
-end
-
-function ServiceDiscovery:discover(name)
-    local instances = self.services[name] or {}
-    local healthy   = {}
-    for _, i in ipairs(instances) do
-        if i.healthy then table.insert(healthy, i) end
-    end
-    return healthy
-end
-
--- ทดสอบ
-local appNetwork = ContainerNetwork.new("app-network", {
-    driver  = "bridge",
-    subnet  = "172.20.0.0/16",
-    gateway = "172.20.0.1",
-})
-
-appNetwork:connect("api-service",    {aliases = {"api"}, ip = "172.20.0.10"})
-appNetwork:connect("db-service",     {aliases = {"db", "postgres"}, ip = "172.20.0.20"})
-appNetwork:connect("cache-service",  {aliases = {"cache", "redis"}, ip = "172.20.0.30"})
-appNetwork:connect("nginx-proxy",    {ip = "172.20.0.2"})
-
-print("=== Container Networking ===")
-print(appNetwork:generateDockerCommand())
-print("\nService Resolution:")
-print("  'api'     -> " .. (appNetwork:resolve("api") or "not found"))
-print("  'db'      -> " .. (appNetwork:resolve("db") or "not found"))
-print("  'redis'   -> " .. (appNetwork:resolve("cache") or "not found"))
-print("  'unknown' -> " .. (appNetwork:resolve("unknown") or "not found"))
-
-local sd = ServiceDiscovery.new()
-sd:register("payment-service", "172.20.0.11", 8080, {version = "1.0"})
-sd:register("payment-service", "172.20.0.12", 8080, {version = "1.0"})
-sd:register("user-service",    "172.20.0.21", 8080, {version = "2.0"})
-
-local instances = sd:discover("payment-service")
-print(string.format("\nDiscovered %d instances of payment-service", #instances))
-for _, i in ipairs(instances) do
-    print(string.format("  %s:%d", i.host, i.port))
+-- Convert to W3C traceparent format
+function TraceContext:to_traceparent()
+    return string.format("00-%s-%s-%02x",
+        self.trace_id,
+        self.span_id,
+        self.flags
+    )
 end
 ```
 
 ---
 
-## 69.10 Kubernetes Pod Spec
+## 69.2 W3C Traceparent Header
+
+### 69.2.1 รูปแบบ Traceparent
+
+W3C Trace Context specification กำหนดรูปแบบ Header ดังนี้:
+
+```
+traceparent: 00-{trace-id}-{parent-id}-{trace-flags}
+```
+
+- **version**: `00` (ปัจจุบัน)
+- **trace-id**: 32 hex chars (128-bit)
+- **parent-id**: 16 hex chars (64-bit)
+- **trace-flags**: 2 hex chars (bit flags, `01` = sampled)
 
 ```lua
--- ตัวอย่างที่ 10: Kubernetes manifest generator
-local K8sManifest = {}
-K8sManifest.__index = K8sManifest
-
-function K8sManifest.new()
-    local self = setmetatable({}, K8sManifest)
-    return self
-end
-
-function K8sManifest:deployment(config)
-    local spec = {
-        apiVersion = "apps/v1",
-        kind       = "Deployment",
-        metadata   = {
-            name      = config.name,
-            namespace = config.namespace or "default",
-            labels    = config.labels or {app = config.name},
-        },
-        spec = {
-            replicas = config.replicas or 2,
-            selector = {
-                matchLabels = config.labels or {app = config.name}
-            },
-            template = {
-                metadata = {
-                    labels = config.labels or {app = config.name}
-                },
-                spec = {
-                    containers = {
-                        {
-                            name  = config.name,
-                            image = config.image,
-                            ports = config.ports and
-                                (function()
-                                    local ports = {}
-                                    for _, p in ipairs(config.ports) do
-                                        table.insert(ports, {containerPort = p})
-                                    end
-                                    return ports
-                                end)() or nil,
-                            env    = config.env,
-                            resources = config.resources,
-                            livenessProbe  = config.livenessProbe,
-                            readinessProbe = config.readinessProbe,
-                            volumeMounts   = config.volumeMounts,
-                        }
-                    },
-                    volumes = config.volumes,
-                }
-            },
-            strategy = {
-                type           = "RollingUpdate",
-                rollingUpdate  = {
-                    maxSurge       = config.maxSurge       or 1,
-                    maxUnavailable = config.maxUnavailable or 0,
-                }
-            }
-        }
-    }
-    return spec
-end
-
-function K8sManifest:service(config)
+-- Parse W3C traceparent header
+local function parse_traceparent(header)
+    if not header then return nil end
+    
+    local version, trace_id, parent_id, flags =
+        header:match("^(%x%x)-(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x)-(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x)-(%x%x)$")
+    
+    if not trace_id then
+        return nil, "invalid traceparent format"
+    end
+    
     return {
-        apiVersion = "v1",
-        kind       = "Service",
-        metadata   = {
-            name      = config.name,
-            namespace = config.namespace or "default",
-        },
-        spec = {
-            selector = config.selector or {app = config.name},
-            ports    = config.ports,
-            type     = config.type or "ClusterIP",
-        }
+        version   = version,
+        trace_id  = trace_id,
+        parent_id = parent_id,
+        flags     = tonumber(flags, 16),
+        sampled   = (tonumber(flags, 16) & 1) == 1,
     }
 end
 
-function K8sManifest:configMap(name, namespace, data)
-    return {
-        apiVersion = "v1",
-        kind       = "ConfigMap",
-        metadata   = {name = name, namespace = namespace or "default"},
-        data       = data,
-    }
+-- สร้าง traceparent header ใหม่
+local function create_traceparent(trace_id, span_id, sampled)
+    local flags = sampled and "01" or "00"
+    return string.format("00-%s-%s-%s", trace_id, span_id, flags)
+end
+```
+
+### 69.2.2 Tracestate Header
+
+```lua
+-- Parse tracestate header (vendor-specific key=value pairs)
+local function parse_tracestate(header)
+    if not header then return {} end
+    
+    local state = {}
+    for entry in header:gmatch("[^,]+") do
+        local key, value = entry:match("^%s*([^=]+)=(.+)%s*$")
+        if key and value then
+            state[key:match("^%s*(.-)%s*$")] = value:match("^%s*(.-)%s*$")
+        end
+    end
+    return state
 end
 
-function K8sManifest:toYAML(manifest, indent)
-    indent = indent or 0
-    local lines = {}
-    local prefix = string.rep("  ", indent)
-
-    if type(manifest) == "table" then
-        -- Check if it's an array
-        local isArray = true
-        local maxIdx  = 0
-        for k in pairs(manifest) do
-            if type(k) ~= "number" then isArray = false; break end
-            maxIdx = math.max(maxIdx, k)
-        end
-        isArray = isArray and maxIdx == #manifest
-
-        if isArray then
-            for _, v in ipairs(manifest) do
-                if type(v) == "table" then
-                    local sub = self:toYAML(v, indent + 1)
-                    -- First line gets '-' prefix
-                    sub = sub:gsub("^" .. string.rep("  ", indent + 1), prefix .. "- ", 1)
-                    table.insert(lines, sub)
-                else
-                    table.insert(lines, prefix .. "- " .. tostring(v))
-                end
-            end
-        else
-            for k, v in pairs(manifest) do
-                if type(v) == "table" then
-                    table.insert(lines, prefix .. k .. ":")
-                    table.insert(lines, self:toYAML(v, indent + 1))
-                elseif type(v) == "string" then
-                    if v:match("[:#{}%[%]|>]") or v == "" then
-                        table.insert(lines, string.format('%s%s: "%s"', prefix, k, v))
-                    else
-                        table.insert(lines, prefix .. k .. ": " .. v)
-                    end
-                elseif v ~= nil then
-                    table.insert(lines, prefix .. k .. ": " .. tostring(v))
-                end
-            end
-        end
-    else
-        table.insert(lines, prefix .. tostring(manifest))
+-- สร้าง tracestate header
+local function build_tracestate(vendor, span_id, existing_state)
+    local new_entry = string.format("%s=%s", vendor, span_id)
+    
+    if not existing_state or #existing_state == 0 then
+        return new_entry
     end
-
-    return table.concat(lines, "\n")
-end
-
-local k8s = K8sManifest.new()
-
--- Deployment
-local deployment = k8s:deployment({
-    name      = "lua-api",
-    namespace = "production",
-    image     = "registry.example.com/lua-api:v2.1.0",
-    replicas  = 3,
-    labels    = {app = "lua-api", tier = "backend", version = "v2"},
-    ports     = {8080},
-    env       = {
-        {name = "APP_ENV",     value = "production"},
-        {name = "DB_HOST",     value = "postgres-service"},
-        {name = "REDIS_HOST",  value = "redis-service"},
-        {name  = "SECRET_KEY",
-         valueFrom = {secretKeyRef = {name = "app-secrets", key = "secret-key"}}},
-    },
-    resources = {
-        requests = {cpu = "100m",  memory = "128Mi"},
-        limits   = {cpu = "500m",  memory = "512Mi"},
-    },
-    livenessProbe = {
-        httpGet = {path = "/health", port = 8080},
-        initialDelaySeconds = 30,
-        periodSeconds       = 10,
-    },
-    readinessProbe = {
-        httpGet = {path = "/ready", port = 8080},
-        initialDelaySeconds = 5,
-        periodSeconds       = 5,
-    },
-    maxSurge       = 1,
-    maxUnavailable = 0,
-})
-
-print("=== Kubernetes Deployment ===")
-print("apiVersion: " .. deployment.apiVersion)
-print("kind: " .. deployment.kind)
-print("metadata:")
-print("  name: " .. deployment.metadata.name)
-print("  namespace: " .. deployment.metadata.namespace)
-print("spec:")
-print("  replicas: " .. deployment.spec.replicas)
-print("  strategy:")
-print("    type: " .. deployment.spec.strategy.type)
-print("    rollingUpdate:")
-print("      maxSurge: " .. deployment.spec.strategy.rollingUpdate.maxSurge)
-print("      maxUnavailable: " .. deployment.spec.strategy.rollingUpdate.maxUnavailable)
-print("  template:")
-print("    spec:")
-print("      containers:")
-for _, c in ipairs(deployment.spec.template.spec.containers) do
-    print("        - name: " .. c.name)
-    print("          image: " .. c.image)
-    if c.resources then
-        print("          resources:")
-        print("            requests:")
-        print("              cpu: " .. c.resources.requests.cpu)
-        print("              memory: " .. c.resources.requests.memory)
-        print("            limits:")
-        print("              cpu: " .. c.resources.limits.cpu)
-        print("              memory: " .. c.resources.limits.memory)
-    end
+    
+    -- เพิ่ม vendor ใหม่ที่ต้นรายการ
+    return new_entry .. "," .. existing_state
 end
 ```
 
 ---
 
-## 69.11 ConfigMaps and Secrets
+## 69.3 X-Trace-ID Header (Simple Correlation)
+
+บางระบบใช้ Header ที่เรียบง่ายกว่า W3C เช่น `X-Trace-ID` หรือ `X-Request-ID`
 
 ```lua
--- ตัวอย่างที่ 11: ConfigMap and Secret management
-local function generateConfigMap(name, namespace, configData)
-    local lines = {}
-    table.insert(lines, "apiVersion: v1")
-    table.insert(lines, "kind: ConfigMap")
-    table.insert(lines, "metadata:")
-    table.insert(lines, "  name: " .. name)
-    table.insert(lines, "  namespace: " .. (namespace or "default"))
-    table.insert(lines, "data:")
-    for k, v in pairs(configData) do
-        if type(v) == "string" and v:match("\n") then
-            -- Multi-line value
-            table.insert(lines, "  " .. k .. ": |")
-            for line in v:gmatch("[^\n]+") do
-                table.insert(lines, "    " .. line)
-            end
-        else
-            table.insert(lines, string.format("  %s: %q", k, tostring(v)))
-        end
-    end
-    return table.concat(lines, "\n")
+-- Middleware สำหรับ X-Trace-ID
+local function trace_id_middleware()
+    local headers = ngx.req.get_headers()
+    
+    -- รับ Trace ID จาก Header หรือสร้างใหม่
+    local trace_id = headers["x-trace-id"] 
+                  or headers["x-request-id"]
+                  or headers["x-correlation-id"]
+                  or generate_id_secure(16)
+    
+    -- เก็บใน ngx.ctx เพื่อใช้ใน Request นี้
+    ngx.ctx.trace_id = trace_id
+    
+    -- ส่ง Trace ID ใน Response Header ด้วย
+    ngx.header["X-Trace-ID"] = trace_id
+    
+    -- Log เพื่อ correlation
+    ngx.log(ngx.INFO, "trace_id=", trace_id, " method=", ngx.req.get_method(),
+            " uri=", ngx.var.uri)
 end
-
-local function generateSecret(name, namespace, secretData)
-    -- ใน production ใช้ base64 encode
-    local function base64Mock(s)
-        return s:gsub(".", function(c)
-            return string.format("%02x", c:byte())
-        end)
-    end
-
-    local lines = {}
-    table.insert(lines, "apiVersion: v1")
-    table.insert(lines, "kind: Secret")
-    table.insert(lines, "metadata:")
-    table.insert(lines, "  name: " .. name)
-    table.insert(lines, "  namespace: " .. (namespace or "default"))
-    table.insert(lines, "type: Opaque")
-    table.insert(lines, "data:")
-    for k, v in pairs(secretData) do
-        -- In real use: echo -n 'value' | base64
-        table.insert(lines, string.format("  %s: <base64-encoded-%s>", k, k))
-    end
-    table.insert(lines, "# Generate with:")
-    table.insert(lines, "# kubectl create secret generic " .. name .. " \\")
-    for k, v in pairs(secretData) do
-        table.insert(lines, string.format("#   --from-literal=%s='%s' \\", k, v:sub(1,3) .. "***"))
-    end
-    table.insert(lines, "#   -n " .. (namespace or "default"))
-    return table.concat(lines, "\n")
-end
-
-print("=== ConfigMap ===")
-print(generateConfigMap("app-config", "production", {
-    APP_ENV          = "production",
-    LOG_LEVEL        = "INFO",
-    MAX_CONNECTIONS  = "100",
-    TIMEOUT_MS       = "5000",
-    ["nginx.conf"]   = "server {\n    listen 80;\n    location / {\n        proxy_pass http://app:8080;\n    }\n}",
-}))
-
-print("\n=== Secret ===")
-print(generateSecret("app-secrets", "production", {
-    ["database-url"] = "postgres://user:password@host/db",
-    ["secret-key"]   = "super-secret-key-min-32-characters",
-    ["api-token"]    = "tok-live-xxxxx",
-}))
 ```
 
 ---
 
-## 69.12 Horizontal Scaling
+## 69.4 Implementing Tracing Middleware ใน OpenResty
+
+### 69.4.1 โครงสร้าง Tracing Library
 
 ```lua
--- ตัวอย่างที่ 12: HPA (Horizontal Pod Autoscaler)
-local function generateHPA(name, deploymentName, config)
-    local lines = {}
-    table.insert(lines, "apiVersion: autoscaling/v2")
-    table.insert(lines, "kind: HorizontalPodAutoscaler")
-    table.insert(lines, "metadata:")
-    table.insert(lines, "  name: " .. name)
-    table.insert(lines, "spec:")
-    table.insert(lines, "  scaleTargetRef:")
-    table.insert(lines, "    apiVersion: apps/v1")
-    table.insert(lines, "    kind: Deployment")
-    table.insert(lines, "    name: " .. deploymentName)
-    table.insert(lines, string.format("  minReplicas: %d", config.minReplicas or 2))
-    table.insert(lines, string.format("  maxReplicas: %d", config.maxReplicas or 10))
-    table.insert(lines, "  metrics:")
-
-    if config.cpu then
-        table.insert(lines, "  - type: Resource")
-        table.insert(lines, "    resource:")
-        table.insert(lines, "      name: cpu")
-        table.insert(lines, "      target:")
-        table.insert(lines, "        type: Utilization")
-        table.insert(lines, string.format("        averageUtilization: %d",
-            config.cpu.targetPercent or 70))
-    end
-
-    if config.memory then
-        table.insert(lines, "  - type: Resource")
-        table.insert(lines, "    resource:")
-        table.insert(lines, "      name: memory")
-        table.insert(lines, "      target:")
-        table.insert(lines, "        type: Utilization")
-        table.insert(lines, string.format("        averageUtilization: %d",
-            config.memory.targetPercent or 80))
-    end
-
-    if config.custom then
-        for _, metric in ipairs(config.custom) do
-            table.insert(lines, "  - type: Pods")
-            table.insert(lines, "    pods:")
-            table.insert(lines, "      metric:")
-            table.insert(lines, "        name: " .. metric.name)
-            table.insert(lines, "      target:")
-            table.insert(lines, "        type: AverageValue")
-            table.insert(lines, "        averageValue: " .. metric.targetValue)
-        end
-    end
-
-    if config.behavior then
-        table.insert(lines, "  behavior:")
-        if config.behavior.scaleDown then
-            table.insert(lines, "    scaleDown:")
-            table.insert(lines, "      stabilizationWindowSeconds: " ..
-                (config.behavior.scaleDown.stabilizationWindow or 300))
-        end
-        if config.behavior.scaleUp then
-            table.insert(lines, "    scaleUp:")
-            table.insert(lines, "      stabilizationWindowSeconds: " ..
-                (config.behavior.scaleUp.stabilizationWindow or 60))
-        end
-    end
-
-    return table.concat(lines, "\n")
-end
-
-print("=== HorizontalPodAutoscaler ===")
-print(generateHPA("lua-api-hpa", "lua-api", {
-    minReplicas = 2,
-    maxReplicas = 20,
-    cpu         = {targetPercent = 70},
-    memory      = {targetPercent = 80},
-    custom      = {
-        {name = "http_requests_per_second", targetValue = "100"},
-    },
-    behavior    = {
-        scaleDown = {stabilizationWindow = 300},
-        scaleUp   = {stabilizationWindow = 60},
-    }
-}))
-```
-
----
-
-## 69.13 Rolling Deployments
-
-```lua
--- ตัวอย่างที่ 13: Rolling deployment simulator
-local RollingDeployment = {}
-RollingDeployment.__index = RollingDeployment
-
-function RollingDeployment.new(config)
-    local self         = setmetatable({}, RollingDeployment)
-    self.name          = config.name
-    self.currentImage  = config.currentImage
-    self.targetImage   = config.targetImage
-    self.replicas      = config.replicas or 3
-    self.maxSurge      = config.maxSurge or 1
-    self.maxUnavailable = config.maxUnavailable or 0
-    self.pods          = {}
-
-    -- Initialize current pods
-    for i = 1, self.replicas do
-        self.pods[i] = {
-            id      = "pod-" .. i,
-            image   = self.currentImage,
-            status  = "running",
-            version = "old",
-        }
-    end
-    return self
-end
-
-function RollingDeployment:currentStatus()
-    local old     = 0
-    local new     = 0
-    local running = 0
-    for _, p in ipairs(self.pods) do
-        if p.version == "old"     then old     = old + 1 end
-        if p.version == "new"     then new     = new + 1 end
-        if p.status == "running"  then running = running + 1 end
-    end
-    return {old = old, new = new, running = running, total = #self.pods}
-end
-
-function RollingDeployment:printStatus()
-    local s = self:currentStatus()
-    print(string.format("  [%s] old=%d new=%d running=%d/%d",
-        self.name, s.old, s.new, s.running, s.total))
-end
-
-function RollingDeployment:step()
-    -- Find an old running pod to update
-    for i, pod in ipairs(self.pods) do
-        if pod.version == "old" and pod.status == "running" then
-            -- Check if we can have unavailable pods
-            local s = self:currentStatus()
-            if s.running > self.replicas - self.maxUnavailable then
-                print(string.format("  Updating %s: %s -> %s",
-                    pod.id, self.currentImage, self.targetImage))
-                pod.status  = "terminating"
-                pod.version = "updating"
-                pod.image   = self.targetImage
-                -- Simulate: terminate old, start new
-                pod.status  = "running"
-                pod.version = "new"
-                return true
-            end
-        end
-    end
-    return false  -- No more pods to update
-end
-
-function RollingDeployment:rollout()
-    print(string.format("=== Rolling Update: %s ===", self.name))
-    print(string.format("Old image: %s", self.currentImage))
-    print(string.format("New image: %s", self.targetImage))
-    print(string.format("Replicas: %d, MaxSurge: %d, MaxUnavailable: %d",
-        self.replicas, self.maxSurge, self.maxUnavailable))
-    print("\nInitial state:")
-    self:printStatus()
-
-    local step = 0
-    while true do
-        local s = self:currentStatus()
-        if s.old == 0 then break end
-        step = step + 1
-        print(string.format("\nStep %d:", step))
-        self:step()
-        self:printStatus()
-        if step > 20 then break end  -- Safety
-    end
-
-    print("\nRollout complete!")
-    self:printStatus()
-end
-
-local deploy = RollingDeployment.new({
-    name          = "lua-api",
-    currentImage  = "lua-api:v1.0",
-    targetImage   = "lua-api:v2.0",
-    replicas      = 4,
-    maxSurge      = 1,
-    maxUnavailable = 1,
-})
-
-deploy:rollout()
-```
-
----
-
-## 69.14 Docker Image Layer Optimization
-
-```lua
--- ตัวอย่างที่ 14: Dockerfile best practices checker
-local DockerfileLinter = {}
-DockerfileLinter.__index = DockerfileLinter
-
-function DockerfileLinter.new()
-    local self   = setmetatable({}, DockerfileLinter)
-    self.rules   = {}
-    self.issues  = {}
-    return self
-end
-
-function DockerfileLinter:addRule(rule)
-    table.insert(self.rules, rule)
-end
-
-function DockerfileLinter:check(dockerfile)
-    self.issues = {}
-    local instructions = {}
-    for line in dockerfile:gmatch("[^\n]+") do
-        local trimmed = line:match("^%s*(.-)%s*$")
-        if #trimmed > 0 and not trimmed:match("^#") then
-            table.insert(instructions, trimmed)
-        end
-    end
-
-    for _, rule in ipairs(self.rules) do
-        local issues = rule.check(instructions, dockerfile)
-        for _, issue in ipairs(issues or {}) do
-            table.insert(self.issues, {
-                severity = rule.severity,
-                rule     = rule.name,
-                message  = issue,
-            })
-        end
-    end
-    return self.issues
-end
-
--- Default rules
-local linter = DockerfileLinter.new()
-
-linter:addRule({
-    name     = "NO_LATEST_TAG",
-    severity = "ERROR",
-    check    = function(instructions, raw)
-        local issues = {}
-        if raw:match("FROM%s+[^:]+:%s*latest") or raw:match("FROM%s+[^: \n]+%s*\n") then
-            table.insert(issues, "Use specific image tag instead of 'latest'")
-        end
-        return issues
-    end,
-})
-
-linter:addRule({
-    name     = "NON_ROOT_USER",
-    severity = "WARN",
-    check    = function(instructions)
-        local hasUser = false
-        for _, i in ipairs(instructions) do
-            if i:match("^USER%s+") then hasUser = true end
-        end
-        if not hasUser then
-            return {"No USER instruction found - container will run as root"}
-        end
-    end,
-})
-
-linter:addRule({
-    name     = "HAS_HEALTHCHECK",
-    severity = "WARN",
-    check    = function(instructions)
-        local hasHC = false
-        for _, i in ipairs(instructions) do
-            if i:match("^HEALTHCHECK") then hasHC = true end
-        end
-        if not hasHC then
-            return {"No HEALTHCHECK instruction found"}
-        end
-    end,
-})
-
-linter:addRule({
-    name     = "CACHE_APT",
-    severity = "INFO",
-    check    = function(instructions, raw)
-        local issues = {}
-        if raw:match("apt%-get%s+update") and not raw:match("rm %-rf /var/lib/apt") then
-            table.insert(issues, "Clean apt cache after install to reduce image size")
-        end
-        return issues
-    end,
-})
-
-linter:addRule({
-    name     = "COPY_NOT_ADD",
-    severity = "INFO",
-    check    = function(instructions)
-        local issues = {}
-        for _, i in ipairs(instructions) do
-            if i:match("^ADD%s+") and not i:match("%.tar") then
-                table.insert(issues,
-                    "Use COPY instead of ADD for simple file copying")
-            end
-        end
-        return issues
-    end,
-})
-
--- Test Dockerfile
-local testDockerfile = [[
-FROM ubuntu:latest
-RUN apt-get update && apt-get install -y lua5.4
-ADD config.json /app/config.json
-COPY app.lua /app/
-CMD lua /app/app.lua
-]]
-
-print("=== Dockerfile Linting ===")
-print("Dockerfile:")
-print(testDockerfile)
-print("Issues found:")
-local issues = linter:check(testDockerfile)
-for _, issue in ipairs(issues) do
-    print(string.format("  [%s] %s: %s",
-        issue.severity, issue.rule, issue.message))
-end
-print(string.format("\nTotal: %d issues", #issues))
-```
-
----
-
-## 69.15 Container Orchestration
-
-```lua
--- ตัวอย่างที่ 15: Simple container orchestrator
-local Orchestrator = {}
-Orchestrator.__index = Orchestrator
-
-function Orchestrator.new()
-    local self    = setmetatable({}, Orchestrator)
-    self.services = {}
-    self.nodes    = {}
-    return self
-end
-
-function Orchestrator:addNode(name, resources)
-    self.nodes[name] = {
-        name      = name,
-        cpu       = resources.cpu    or 4,     -- cores
-        memory    = resources.memory or 8192,  -- MB
-        usedCPU   = 0,
-        usedMemory = 0,
-        pods      = {},
-    }
-end
-
-function Orchestrator:bestNode(cpuReq, memReq)
-    local best = nil
-    for _, node in pairs(self.nodes) do
-        local freeCPU = node.cpu    - node.usedCPU
-        local freeMem = node.memory - node.usedMemory
-        if freeCPU >= cpuReq and freeMem >= memReq then
-            if best == nil or (freeCPU > best.freeCPU) then
-                best = {
-                    node    = node,
-                    freeCPU = freeCPU,
-                    freeMem = freeMem,
-                }
-            end
-        end
-    end
-    return best and best.node or nil
-end
-
-function Orchestrator:schedule(service, replicas)
-    local svc = self.services[service]
-    if not svc then
-        return nil, "service not found"
-    end
-
-    local scheduled = {}
-    for i = 1, replicas do
-        local node = self:bestNode(svc.cpuRequest, svc.memRequest)
-        if not node then
-            return scheduled, "insufficient resources for replica " .. i
-        end
-
-        local podId = string.format("%s-%d-%04x",
-            service, i, math.random(0xFFFF))
-        local pod   = {
-            id        = podId,
-            service   = service,
-            node      = node.name,
-            cpuReq    = svc.cpuRequest,
-            memReq    = svc.memRequest,
-            status    = "running",
-        }
-
-        node.usedCPU    = node.usedCPU + svc.cpuRequest
-        node.usedMemory = node.usedMemory + svc.memRequest
-        table.insert(node.pods, pod)
-        table.insert(scheduled, pod)
-    end
-
-    return scheduled, nil
-end
-
-function Orchestrator:defineService(name, config)
-    self.services[name] = {
-        name       = name,
-        image      = config.image,
-        cpuRequest = config.cpu    or 0.1,
-        memRequest = config.memory or 128,
-    }
-end
-
-function Orchestrator:printCluster()
-    print("=== Cluster Status ===")
-    for nodeName, node in pairs(self.nodes) do
-        print(string.format("Node: %s (CPU: %.1f/%.1f, Memory: %d/%dMB)",
-            nodeName,
-            node.usedCPU, node.cpu,
-            node.usedMemory, node.memory))
-        for _, pod in ipairs(node.pods) do
-            print(string.format("  - %s [%s]", pod.id, pod.status))
-        end
-    end
-end
-
-math.randomseed(77)
-local orch = Orchestrator.new()
-orch:addNode("node-1", {cpu = 4, memory = 8192})
-orch:addNode("node-2", {cpu = 4, memory = 8192})
-orch:addNode("node-3", {cpu = 2, memory = 4096})
-
-orch:defineService("api",    {image = "api:v1",    cpu = 0.5, memory = 256})
-orch:defineService("worker", {image = "worker:v1", cpu = 1.0, memory = 512})
-orch:defineService("cache",  {image = "redis:7",   cpu = 0.25, memory = 256})
-
-local pods, err = orch:schedule("api",    4)
-print(string.format("Scheduled %d API pods%s", #pods, err and " (partial: "..err..")" or ""))
-
-pods, err = orch:schedule("worker", 2)
-print(string.format("Scheduled %d worker pods%s", #pods, err and " (partial: "..err..")" or ""))
-
-pods, err = orch:schedule("cache",  1)
-print(string.format("Scheduled %d cache pods%s", #pods, err and " (partial: "..err..")" or ""))
-
-orch:printCluster()
-```
-
----
-
-## 69.16 สรุป Docker Best Practices
-
-```lua
--- ตัวอย่างที่ 16: Dockerfile best practices summary
-local BestPractices = {
-    {
-        category = "Security",
-        practices = {
-            "ใช้ USER instruction เพื่อ run ด้วย non-root user",
-            "Scan image ด้วย trivy หรือ snyk",
-            "ใช้ read-only filesystem: --read-only flag",
-            "จำกัด capabilities: --cap-drop ALL",
-            "ไม่ควร store secrets ใน image",
-        }
-    },
-    {
-        category = "Size Optimization",
-        practices = {
-            "ใช้ Alpine หรือ distroless base images",
-            "Multi-stage builds เพื่อแยก builder และ runtime",
-            "ล้าง package cache หลัง install",
-            "ใช้ .dockerignore เพื่อ exclude unnecessary files",
-            "Combine RUN commands เพื่อลด layers",
-        }
-    },
-    {
-        category = "Performance",
-        practices = {
-            "เรียง COPY จากที่เปลี่ยนน้อยก่อน เพื่อ cache layers",
-            "ใช้ BuildKit (DOCKER_BUILDKIT=1)",
-            "Mount cache สำหรับ package managers",
-            "กำหนด resource limits (--memory, --cpus)",
-        }
-    },
-    {
-        category = "Reliability",
-        practices = {
-            "เพิ่ม HEALTHCHECK instruction",
-            "Handle SIGTERM gracefully",
-            "ใช้ tini หรือ dumb-init เป็น init process",
-            "กำหนด restart policy ที่เหมาะสม",
-            "Log to stdout/stderr เสมอ",
-        }
-    },
+-- lib/tracing.lua
+local _M = {
+    _VERSION = "1.0.0"
 }
 
-print("=== Docker Best Practices for Lua Applications ===")
-for _, category in ipairs(BestPractices) do
-    print(string.format("\n[%s]", category.category))
-    for i, practice in ipairs(category.practices) do
-        print(string.format("  %d. %s", i, practice))
+local mt = { __index = _M }
+
+-- สร้าง Tracer instance ใหม่
+function _M.new(config)
+    local self = setmetatable({}, mt)
+    
+    self.service_name = config.service_name or "unknown-service"
+    self.sample_rate  = config.sample_rate or 1.0   -- 100% by default
+    self.exporter     = config.exporter            -- Zipkin/Jaeger exporter
+    self.propagator   = config.propagator or "w3c"  -- w3c or b3
+    
+    return self
+end
+
+-- เริ่ม Root Span จาก incoming request
+function _M:start_request_span(name)
+    local headers = ngx.req.get_headers()
+    local ctx
+    
+    if self.propagator == "w3c" then
+        ctx = self:extract_w3c(headers)
+    else
+        ctx = self:extract_b3(headers)
+    end
+    
+    local span = self:new_span(name, ctx)
+    ngx.ctx.current_span = span
+    ngx.ctx.tracer = self
+    
+    return span
+end
+
+return _M
+```
+
+### 69.4.2 Span Implementation
+
+```lua
+-- lib/span.lua
+local Span = {}
+Span.__index = Span
+
+function Span.new(tracer, name, parent_ctx)
+    local now_ms = ngx.now() * 1000  -- milliseconds
+    
+    local trace_id, parent_span_id
+    
+    if parent_ctx then
+        trace_id      = parent_ctx.trace_id
+        parent_span_id = parent_ctx.span_id
+    else
+        trace_id = generate_id_secure(16)
+    end
+    
+    return setmetatable({
+        tracer       = tracer,
+        name         = name,
+        trace_id     = trace_id,
+        span_id      = generate_id_secure(8),
+        parent_id    = parent_span_id,
+        start_time   = now_ms,
+        end_time     = nil,
+        status_code  = "UNSET",
+        status_msg   = nil,
+        attributes   = {},
+        events       = {},
+        finished     = false,
+    }, Span)
+end
+
+-- เพิ่ม Attribute
+function Span:set_attribute(key, value)
+    self.attributes[key] = value
+    return self  -- method chaining
+end
+
+-- เพิ่ม Event (timestamp + message)
+function Span:add_event(name, attrs)
+    table.insert(self.events, {
+        name       = name,
+        timestamp  = ngx.now() * 1000,
+        attributes = attrs or {},
+    })
+    return self
+end
+
+-- ตั้ง Error status
+function Span:record_error(err)
+    self.status_code = "ERROR"
+    self.status_msg  = tostring(err)
+    self:set_attribute("error", true)
+    self:set_attribute("error.message", tostring(err))
+    self:add_event("exception", {
+        ["exception.message"] = tostring(err),
+        ["exception.type"]    = type(err),
+    })
+    return self
+end
+
+-- จบ Span
+function Span:finish(status)
+    if self.finished then return end
+    
+    self.end_time = ngx.now() * 1000
+    self.finished = true
+    
+    if status then
+        self.status_code = status
+    elseif self.status_code == "UNSET" then
+        self.status_code = "OK"
+    end
+    
+    -- Export span
+    if self.tracer and self.tracer.exporter then
+        self.tracer.exporter:export(self)
     end
 end
 
--- Example optimized Dockerfile
-print("\n=== Optimized Dockerfile Example ===")
-local optimized = [[
-# ✓ Specific base image version
-FROM openresty/openresty:1.25.3.2-alpine AS base
+-- Duration ใน milliseconds
+function Span:duration_ms()
+    if self.end_time then
+        return self.end_time - self.start_time
+    end
+    return ngx.now() * 1000 - self.start_time
+end
+```
 
-# ✓ Install with cache mount (BuildKit)
-RUN --mount=type=cache,target=/var/cache/apk \
-    apk add --no-cache curl luarocks
+### 69.4.3 Integration กับ OpenResty Phases
 
-# ✓ Dependencies before app code (better caching)
-WORKDIR /app
-COPY *.rockspec ./
-RUN luarocks install --tree /app/rocks --only-deps *.rockspec
+```lua
+-- nginx.conf / access_by_lua_block
+local tracing = require("lib.tracing")
+local tracer = tracing.new({
+    service_name = "api-gateway",
+    sample_rate  = 0.1,  -- 10% sampling
+    exporter     = require("lib.zipkin_exporter").new({
+        endpoint = "http://zipkin:9411/api/v2/spans"
+    }),
+})
 
-# ✓ App code last (changes most frequently)
-COPY lua/ ./lua/
-COPY nginx/ ./nginx/
+-- access phase: เริ่ม span
+local span = tracer:start_request_span(
+    ngx.req.get_method() .. " " .. ngx.var.uri
+)
 
-# ✓ Non-root user
-RUN adduser -D -H -s /sbin/nologin appuser
-USER appuser
+span:set_attribute("http.method",     ngx.req.get_method())
+span:set_attribute("http.url",        ngx.var.scheme .. "://" .. ngx.var.host .. ngx.var.request_uri)
+span:set_attribute("http.target",     ngx.var.uri)
+span:set_attribute("net.peer.ip",     ngx.var.remote_addr)
+span:set_attribute("service.name",    "api-gateway")
+```
 
-EXPOSE 8080
-
-# ✓ Health check
-HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
-    CMD curl -sf http://localhost:8080/health || exit 1
-
-# ✓ Use exec form for CMD
-CMD ["/usr/local/openresty/bin/openresty", "-g", "daemon off;"]
-]]
-
-print(optimized)
+```lua
+-- log phase: จบ span
+-- log_by_lua_block
+local span = ngx.ctx.current_span
+if span then
+    local status = ngx.status
+    span:set_attribute("http.status_code", status)
+    
+    if status >= 500 then
+        span:record_error("HTTP " .. status)
+    elseif status >= 400 then
+        span:set_attribute("http.error", true)
+    end
+    
+    span:finish()
+end
 ```
 
 ---
 
-## สรุปบทที่ 69
+## 69.5 Span Timing และ Attributes
+
+### 69.5.1 Semantic Conventions
+
+OpenTelemetry กำหนด Attribute names มาตรฐานที่ทุกคนควรใช้
+
+```lua
+-- Semantic convention attributes
+local SemanticAttributes = {
+    -- HTTP
+    HTTP_METHOD       = "http.method",
+    HTTP_URL          = "http.url",
+    HTTP_STATUS_CODE  = "http.status_code",
+    HTTP_USER_AGENT   = "http.user_agent",
+    HTTP_REQUEST_BODY_SIZE  = "http.request_content_length",
+    HTTP_RESPONSE_BODY_SIZE = "http.response_content_length",
+    
+    -- Network
+    NET_PEER_IP   = "net.peer.ip",
+    NET_PEER_PORT = "net.peer.port",
+    NET_HOST_NAME = "net.host.name",
+    
+    -- Database
+    DB_SYSTEM    = "db.system",
+    DB_NAME      = "db.name",
+    DB_STATEMENT = "db.statement",
+    DB_OPERATION = "db.operation",
+    
+    -- Messaging
+    MESSAGING_SYSTEM     = "messaging.system",
+    MESSAGING_DESTINATION = "messaging.destination",
+    MESSAGING_OPERATION  = "messaging.operation",
+    
+    -- RPC
+    RPC_SYSTEM  = "rpc.system",
+    RPC_SERVICE = "rpc.service",
+    RPC_METHOD  = "rpc.method",
+}
+
+-- ตัวอย่างการใช้งาน
+local function instrument_db_query(span, query, db_name)
+    span:set_attribute(SemanticAttributes.DB_SYSTEM,    "mysql")
+    span:set_attribute(SemanticAttributes.DB_NAME,      db_name)
+    span:set_attribute(SemanticAttributes.DB_STATEMENT, query)
+    span:set_attribute(SemanticAttributes.DB_OPERATION, "SELECT")
+end
+```
+
+### 69.5.2 Child Span สำหรับ Database Calls
+
+```lua
+-- สร้าง Child Span สำหรับ Database Operation
+local function query_with_tracing(parent_span, sql, params)
+    local span = Span.new(parent_span.tracer, "db.query", {
+        trace_id = parent_span.trace_id,
+        span_id  = parent_span.span_id,
+    })
+    
+    span:set_attribute("db.system",    "mysql")
+    span:set_attribute("db.statement", sql)
+    
+    -- Execute query
+    local ok, result, err = pcall(function()
+        local db = require("resty.mysql")
+        local conn = db:new()
+        -- ... connection setup ...
+        return conn:query(sql, params)
+    end)
+    
+    if not ok then
+        span:record_error(result)
+        span:finish("ERROR")
+        return nil, result
+    end
+    
+    if err then
+        span:record_error(err)
+        span:finish("ERROR")
+        return nil, err
+    end
+    
+    span:set_attribute("db.rows_affected", result.affected_rows or 0)
+    span:finish("OK")
+    
+    return result, nil
+end
+```
+
+---
+
+## 69.6 Zipkin Integration
+
+### 69.6.1 Zipkin Exporter
+
+Zipkin ใช้ JSON format ในการรับ Span data
+
+```lua
+-- lib/zipkin_exporter.lua
+local http = require("resty.http")
+local cjson = require("cjson.safe")
+
+local ZipkinExporter = {}
+ZipkinExporter.__index = ZipkinExporter
+
+function ZipkinExporter.new(config)
+    return setmetatable({
+        endpoint     = config.endpoint or "http://localhost:9411/api/v2/spans",
+        timeout_ms   = config.timeout_ms or 5000,
+        batch_size   = config.batch_size or 100,
+        _buffer      = {},
+    }, ZipkinExporter)
+end
+
+-- แปลง Span เป็น Zipkin format
+function ZipkinExporter:span_to_zipkin(span)
+    local zipkin_span = {
+        traceId       = span.trace_id,
+        id            = span.span_id,
+        name          = span.name,
+        timestamp     = math.floor(span.start_time * 1000),  -- microseconds
+        duration      = math.floor((span.end_time - span.start_time) * 1000),
+        localEndpoint = {
+            serviceName = span.tracer.service_name,
+            ipv4        = ngx.var.server_addr,
+            port        = tonumber(ngx.var.server_port),
+        },
+        tags = {},
+        annotations = {},
+    }
+    
+    -- Parent span
+    if span.parent_id then
+        zipkin_span.parentId = span.parent_id
+    end
+    
+    -- Attributes -> Tags
+    for k, v in pairs(span.attributes) do
+        zipkin_span.tags[k] = tostring(v)
+    end
+    
+    -- Status
+    if span.status_code == "ERROR" then
+        zipkin_span.tags["error"] = span.status_msg or "true"
+    end
+    
+    -- Events -> Annotations
+    for _, event in ipairs(span.events) do
+        table.insert(zipkin_span.annotations, {
+            timestamp = math.floor(event.timestamp * 1000),
+            value     = event.name,
+        })
+    end
+    
+    return zipkin_span
+end
+
+-- ส่ง Spans ไปยัง Zipkin
+function ZipkinExporter:send_batch(spans)
+    local zipkin_spans = {}
+    for _, span in ipairs(spans) do
+        table.insert(zipkin_spans, self:span_to_zipkin(span))
+    end
+    
+    local body, err = cjson.encode(zipkin_spans)
+    if not body then
+        ngx.log(ngx.ERR, "failed to encode spans: ", err)
+        return false
+    end
+    
+    local httpc = http.new()
+    httpc:set_timeout(self.timeout_ms)
+    
+    local res, err = httpc:request_uri(self.endpoint, {
+        method  = "POST",
+        body    = body,
+        headers = {
+            ["Content-Type"] = "application/json",
+        },
+    })
+    
+    if not res then
+        ngx.log(ngx.ERR, "failed to send spans to Zipkin: ", err)
+        return false
+    end
+    
+    if res.status ~= 202 then
+        ngx.log(ngx.WARN, "Zipkin returned status: ", res.status)
+        return false
+    end
+    
+    return true
+end
+
+function ZipkinExporter:export(span)
+    table.insert(self._buffer, span)
+    
+    if #self._buffer >= self.batch_size then
+        self:flush()
+    end
+end
+
+function ZipkinExporter:flush()
+    if #self._buffer == 0 then return end
+    
+    local batch = self._buffer
+    self._buffer = {}
+    
+    -- ส่งใน background (ไม่ block request)
+    local ok = ngx.timer.at(0, function()
+        self:send_batch(batch)
+    end)
+    
+    if not ok then
+        ngx.log(ngx.ERR, "failed to create timer for Zipkin export")
+    end
+end
+```
+
+---
+
+## 69.7 Jaeger Integration
+
+### 69.7.1 Jaeger UDP Exporter (Thrift format)
+
+```lua
+-- lib/jaeger_exporter.lua
+-- Jaeger รับข้อมูลผ่าน UDP ด้วย Thrift binary protocol
+-- หรือผ่าน HTTP Collector
+
+local JaegerExporter = {}
+JaegerExporter.__index = JaegerExporter
+
+function JaegerExporter.new(config)
+    return setmetatable({
+        -- HTTP Collector endpoint (ง่ายกว่า UDP)
+        endpoint     = config.endpoint or "http://localhost:14268/api/traces",
+        service_name = config.service_name or "unknown",
+        timeout_ms   = config.timeout_ms or 5000,
+    }, JaegerExporter)
+end
+
+-- Jaeger รองรับ OpenTelemetry Protocol (OTLP) ด้วย
+-- แนะนำให้ใช้ OTLP HTTP แทน
+function JaegerExporter:span_to_otlp(span)
+    -- OTLP format (JSON)
+    return {
+        traceId    = span.trace_id,
+        spanId     = span.span_id,
+        parentSpanId = span.parent_id,
+        name       = span.name,
+        kind       = 2,  -- SPAN_KIND_SERVER
+        startTimeUnixNano = tostring(math.floor(span.start_time * 1e6)),
+        endTimeUnixNano   = tostring(math.floor(span.end_time * 1e6)),
+        attributes = self:convert_attributes(span.attributes),
+        status = {
+            code    = span.status_code == "ERROR" and 2 or 1,
+            message = span.status_msg or "",
+        },
+        events = span.events,
+    }
+end
+
+function JaegerExporter:convert_attributes(attrs)
+    local result = {}
+    for k, v in pairs(attrs) do
+        local attr = { key = k }
+        if type(v) == "boolean" then
+            attr.value = { boolValue = v }
+        elseif type(v) == "number" then
+            if math.floor(v) == v then
+                attr.value = { intValue = tostring(v) }
+            else
+                attr.value = { doubleValue = v }
+            end
+        else
+            attr.value = { stringValue = tostring(v) }
+        end
+        table.insert(result, attr)
+    end
+    return result
+end
+```
+
+---
+
+## 69.8 Sampling Strategies
+
+### 69.8.1 ประเภทของ Sampling
+
+Sampling ช่วยลดปริมาณข้อมูล Trace ที่ต้องเก็บและส่ง
+
+```lua
+-- lib/sampler.lua
+local Sampler = {}
+Sampler.__index = Sampler
+
+-- 1. Always Sample
+function Sampler.always_on()
+    return { should_sample = function() return true end }
+end
+
+-- 2. Never Sample (ใช้ใน dev)
+function Sampler.always_off()
+    return { should_sample = function() return false end }
+end
+
+-- 3. Trace ID Ratio Sampling
+function Sampler.ratio(rate)
+    assert(rate >= 0 and rate <= 1, "sample rate must be between 0 and 1")
+    
+    return {
+        should_sample = function(trace_id)
+            -- ใช้ trace_id เพื่อให้ consistent sampling
+            -- (ถ้า sampled ที่ Service A ต้องได้ sampled ที่ Service B ด้วย)
+            local id_int = tonumber(trace_id:sub(1, 15), 16)
+            local threshold = math.floor(rate * 0xFFFFFFFFFFFFFF)
+            return id_int < threshold
+        end
+    }
+end
+
+-- 4. Rate Limiting Sampler
+function Sampler.rate_limit(max_per_second)
+    local count = 0
+    local last_reset = ngx.now()
+    
+    return {
+        should_sample = function()
+            local now = ngx.now()
+            if now - last_reset >= 1.0 then
+                count = 0
+                last_reset = now
+            end
+            
+            if count < max_per_second then
+                count = count + 1
+                return true
+            end
+            return false
+        end
+    }
+end
+
+-- 5. Parent-based Sampling (ปฏิบัติตามการตัดสินใจของ Parent)
+function Sampler.parent_based(root_sampler)
+    return {
+        should_sample = function(trace_id, parent_sampled)
+            if parent_sampled ~= nil then
+                return parent_sampled  -- เชื่อฟัง parent
+            end
+            return root_sampler.should_sample(trace_id)
+        end
+    }
+end
+```
+
+### 69.8.2 Adaptive Sampling
+
+```lua
+-- Adaptive Sampler: ปรับ Rate ตาม Error Rate
+local AdaptiveSampler = {}
+AdaptiveSampler.__index = AdaptiveSampler
+
+function AdaptiveSampler.new(config)
+    return setmetatable({
+        base_rate     = config.base_rate or 0.1,
+        error_rate    = config.error_rate or 1.0,  -- sample all errors
+        window_size   = config.window_size or 60,  -- seconds
+        _error_count  = 0,
+        _total_count  = 0,
+        _window_start = ngx.now(),
+    }, AdaptiveSampler)
+end
+
+function AdaptiveSampler:should_sample(is_error)
+    local now = ngx.now()
+    
+    -- Reset window
+    if now - self._window_start > self.window_size then
+        self._error_count = 0
+        self._total_count = 0
+        self._window_start = now
+    end
+    
+    self._total_count = self._total_count + 1
+    
+    -- Always sample errors
+    if is_error then
+        self._error_count = self._error_count + 1
+        return true
+    end
+    
+    -- ถ้า error rate สูง เพิ่ม sampling rate
+    local current_error_rate = self._total_count > 0
+        and (self._error_count / self._total_count)
+        or 0
+    
+    local effective_rate = self.base_rate
+    if current_error_rate > 0.05 then  -- > 5% error rate
+        effective_rate = math.min(1.0, self.base_rate * 5)
+    end
+    
+    return math.random() < effective_rate
+end
+```
+
+---
+
+## 69.9 Correlation ID Patterns
+
+### 69.9.1 Correlation ID ใน Log
+
+```lua
+-- Correlation ID middleware
+local function setup_correlation()
+    local headers = ngx.req.get_headers()
+    
+    -- สนับสนุนหลาย Header formats
+    local correlation_id = 
+        headers["x-correlation-id"] or
+        headers["x-request-id"] or
+        headers["x-trace-id"] or
+        generate_id_secure(16)
+    
+    -- เก็บใน ngx.ctx
+    ngx.ctx.correlation_id = correlation_id
+    ngx.ctx.request_id = generate_id_secure(8)  -- unique ต่อ request นี้
+    
+    -- ส่งกลับผ่าน response
+    ngx.header["X-Correlation-ID"] = correlation_id
+    ngx.header["X-Request-ID"] = ngx.ctx.request_id
+    
+    return correlation_id
+end
+
+-- Structured logging พร้อม correlation
+local function log_with_context(level, msg, data)
+    local ctx = ngx.ctx
+    local log_entry = {
+        timestamp      = ngx.now(),
+        level          = level,
+        message        = msg,
+        correlation_id = ctx.correlation_id,
+        request_id     = ctx.request_id,
+        trace_id       = ctx.trace_id,
+        span_id        = ctx.span_id,
+        service        = "api-gateway",
+        host           = ngx.var.hostname,
+    }
+    
+    if data then
+        for k, v in pairs(data) do
+            log_entry[k] = v
+        end
+    end
+    
+    local cjson = require("cjson.safe")
+    ngx.log(ngx[level], cjson.encode(log_entry))
+end
+```
+
+---
+
+## 69.10 Parent/Child Span Relationships
+
+### 69.10.1 Span Tree
+
+```lua
+-- SpanContext สำหรับ thread-safe context passing
+local SpanContext = {}
+SpanContext.__index = SpanContext
+
+function SpanContext.from_span(span)
+    return setmetatable({
+        trace_id  = span.trace_id,
+        span_id   = span.span_id,
+        sampled   = span.sampled,
+        baggage   = span.baggage or {},
+    }, SpanContext)
+end
+
+-- สร้าง child span จาก parent
+local function new_child_span(parent_span, operation_name)
+    local child = Span.new(parent_span.tracer, operation_name, {
+        trace_id = parent_span.trace_id,
+        span_id  = parent_span.span_id,
+    })
+    
+    -- inherit baggage
+    child.baggage = {}
+    if parent_span.baggage then
+        for k, v in pairs(parent_span.baggage) do
+            child.baggage[k] = v
+        end
+    end
+    
+    return child
+end
+
+-- ตัวอย่าง: ติดตาม HTTP call ไปยัง upstream service
+local function trace_upstream_call(parent_span, url, options)
+    local child = new_child_span(parent_span, "http.client " .. url)
+    
+    child:set_attribute("http.method", options.method or "GET")
+    child:set_attribute("http.url", url)
+    child:set_attribute("span.kind", "CLIENT")
+    
+    -- Inject trace context ใน outgoing headers
+    local headers = options.headers or {}
+    headers["traceparent"] = create_traceparent(
+        child.trace_id,
+        child.span_id,
+        true
+    )
+    headers["X-Trace-ID"] = child.trace_id
+    
+    options.headers = headers
+    
+    -- ทำ HTTP call
+    local httpc = require("resty.http").new()
+    local res, err = httpc:request_uri(url, options)
+    
+    if not res then
+        child:record_error(err or "connection failed")
+        child:finish("ERROR")
+        return nil, err
+    end
+    
+    child:set_attribute("http.status_code", res.status)
+    
+    if res.status >= 500 then
+        child:record_error("upstream error: " .. res.status)
+        child:finish("ERROR")
+    else
+        child:finish("OK")
+    end
+    
+    return res, nil
+end
+```
+
+---
+
+## 69.11 Error Tracking ใน Spans
+
+### 69.11.1 Error Recording Patterns
+
+```lua
+-- Error tracking helper
+local function with_span(tracer, name, attrs, fn)
+    local span = tracer:new_span(name)
+    
+    if attrs then
+        for k, v in pairs(attrs) do
+            span:set_attribute(k, v)
+        end
+    end
+    
+    local ok, result, err = pcall(fn, span)
+    
+    if not ok then
+        -- Lua error (exception)
+        span:record_error(result)
+        span:add_event("exception", {
+            ["exception.message"]    = tostring(result),
+            ["exception.stacktrace"] = debug.traceback(),
+        })
+        span:finish("ERROR")
+        return nil, result
+    end
+    
+    if err then
+        -- Application error
+        span:record_error(err)
+        span:finish("ERROR")
+        return result, err
+    end
+    
+    span:finish("OK")
+    return result, nil
+end
+
+-- ตัวอย่างการใช้งาน
+local result, err = with_span(tracer, "process_payment", {
+    ["payment.method"] = "credit_card",
+    ["payment.amount"] = 1000,
+}, function(span)
+    -- validate
+    span:add_event("validation_started")
+    local ok = validate_payment(data)
+    if not ok then
+        return nil, "invalid payment data"
+    end
+    span:add_event("validation_passed")
+    
+    -- charge
+    span:add_event("charge_started")
+    local charge_result = charge_card(data)
+    span:set_attribute("payment.transaction_id", charge_result.id)
+    span:add_event("charge_completed")
+    
+    return charge_result
+end)
+```
+
+---
+
+## 69.12 Complete Tracing Library Implementation
+
+นี่คือ Implementation ที่สมบูรณ์และพร้อมใช้งาน Production:
+
+```lua
+-- lib/otel.lua - OpenTelemetry-compatible tracing library for OpenResty
+local cjson    = require("cjson.safe")
+local http     = require("resty.http")
+local resty_random = require("resty.random")
+local resty_str    = require("resty.string")
+
+local _M = { _VERSION = "2.0.0" }
+
+-- ==================== Utilities ====================
+
+local function random_hex(bytes)
+    return resty_str.to_hex(resty_random.bytes(bytes))
+end
+
+local function now_ms()
+    return math.floor(ngx.now() * 1000)
+end
+
+-- ==================== Span ====================
+
+local Span = {}
+Span.__index = Span
+
+function Span.new(opts)
+    return setmetatable({
+        trace_id   = opts.trace_id or random_hex(16),
+        span_id    = opts.span_id or random_hex(8),
+        parent_id  = opts.parent_id,
+        name       = opts.name or "unnamed",
+        kind       = opts.kind or "SERVER",
+        start_ms   = now_ms(),
+        end_ms     = nil,
+        status     = "UNSET",
+        status_msg = nil,
+        attrs      = {},
+        events     = {},
+        links      = {},
+        _tracer    = opts.tracer,
+    }, Span)
+end
+
+function Span:attr(key, value)
+    self.attrs[key] = value
+    return self
+end
+
+function Span:event(name, timestamp, attrs)
+    table.insert(self.events, {
+        name  = name,
+        ts    = timestamp or now_ms(),
+        attrs = attrs or {},
+    })
+    return self
+end
+
+function Span:error(msg, stack)
+    self.status    = "ERROR"
+    self.status_msg = msg
+    self:attr("error", true)
+    self:attr("error.message", tostring(msg))
+    if stack then
+        self:attr("error.stack", stack)
+    end
+    self:event("exception", nil, {
+        ["exception.message"] = tostring(msg),
+        ["exception.stacktrace"] = stack or debug.traceback(2),
+    })
+    return self
+end
+
+function Span:ok()
+    if self.status == "UNSET" then
+        self.status = "OK"
+    end
+    return self
+end
+
+function Span:finish()
+    if self.end_ms then return self end
+    self.end_ms = now_ms()
+    if self.status == "UNSET" then self.status = "OK" end
+    if self._tracer then
+        self._tracer:_export(self)
+    end
+    return self
+end
+
+function Span:duration()
+    return (self.end_ms or now_ms()) - self.start_ms
+end
+
+function Span:traceparent()
+    local flags = "01"
+    return string.format("00-%s-%s-%s", self.trace_id, self.span_id, flags)
+end
+
+-- ==================== Tracer ====================
+
+local Tracer = {}
+Tracer.__index = Tracer
+
+function Tracer.new(opts)
+    return setmetatable({
+        service      = opts.service or "unknown",
+        version      = opts.version,
+        exporter     = opts.exporter,
+        sampler      = opts.sampler or { should_sample = function() return true end },
+        propagator   = opts.propagator or "w3c",
+        _spans_sent  = 0,
+    }, Tracer)
+end
+
+function Tracer:extract(headers)
+    if self.propagator == "b3" then
+        return self:_extract_b3(headers)
+    end
+    return self:_extract_w3c(headers)
+end
+
+function Tracer:_extract_w3c(headers)
+    local tp = headers["traceparent"]
+    if not tp then return nil end
+    
+    local ver, tid, pid, flags = tp:match(
+        "^(%x%x)-(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x)-(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x)-(%x%x)$"
+    )
+    if not tid then return nil end
+    
+    return {
+        trace_id = tid,
+        span_id  = pid,
+        sampled  = (tonumber(flags, 16) & 1) == 1,
+    }
+end
+
+function Tracer:_extract_b3(headers)
+    local single = headers["b3"]
+    if single then
+        if single == "0" then return { sampled = false } end
+        local tid, sid, sampled = single:match("^(%x+)-(%x+)-?([01]?)$")
+        if tid then
+            return {
+                trace_id = tid,
+                span_id  = sid,
+                sampled  = sampled ~= "0",
+            }
+        end
+    end
+    
+    return {
+        trace_id = headers["x-b3-traceid"],
+        span_id  = headers["x-b3-spanid"],
+        sampled  = headers["x-b3-sampled"] ~= "0",
+    }
+end
+
+function Tracer:inject(span, headers)
+    headers["traceparent"] = span:traceparent()
+    headers["X-Trace-ID"]  = span.trace_id
+    if self.propagator == "b3" then
+        headers["X-B3-TraceId"] = span.trace_id
+        headers["X-B3-SpanId"]  = span.span_id
+        headers["X-B3-Sampled"] = "1"
+    end
+    return headers
+end
+
+function Tracer:start(name, opts)
+    opts = opts or {}
+    local parent = opts.parent or ngx.ctx._current_span
+    
+    local span = Span.new({
+        name      = name,
+        trace_id  = parent and parent.trace_id or (opts.trace_id or random_hex(16)),
+        parent_id = parent and parent.span_id or opts.parent_id,
+        kind      = opts.kind or "INTERNAL",
+        tracer    = self,
+    })
+    
+    -- Set standard resource attributes
+    span:attr("service.name",    self.service)
+    if self.version then
+        span:attr("service.version", self.version)
+    end
+    
+    ngx.ctx._current_span = span
+    return span
+end
+
+function Tracer:start_server_span(name)
+    local incoming = self:extract(ngx.req.get_headers())
+    
+    local span = Span.new({
+        name      = name,
+        trace_id  = incoming and incoming.trace_id or random_hex(16),
+        parent_id = incoming and incoming.span_id,
+        kind      = "SERVER",
+        tracer    = self,
+    })
+    
+    span:attr("service.name", self.service)
+    ngx.ctx._trace_id      = span.trace_id
+    ngx.ctx._current_span  = span
+    
+    -- Propagate in response
+    ngx.header["X-Trace-ID"] = span.trace_id
+    
+    return span
+end
+
+function Tracer:_export(span)
+    if not self.exporter then return end
+    self._spans_sent = self._spans_sent + 1
+    
+    -- Non-blocking export
+    local ok, err = ngx.timer.at(0, function()
+        local success, export_err = pcall(function()
+            self.exporter:export({ span })
+        end)
+        if not success then
+            ngx.log(ngx.ERR, "trace export error: ", export_err)
+        end
+    end)
+    
+    if not ok then
+        ngx.log(ngx.ERR, "failed to schedule trace export: ", err)
+    end
+end
+
+-- ==================== Zipkin Exporter ====================
+
+local ZipkinExporter = {}
+ZipkinExporter.__index = ZipkinExporter
+
+function ZipkinExporter.new(opts)
+    return setmetatable({
+        url     = opts.url or "http://localhost:9411/api/v2/spans",
+        timeout = opts.timeout or 3000,
+    }, ZipkinExporter)
+end
+
+function ZipkinExporter:export(spans)
+    local payload = {}
+    for _, s in ipairs(spans) do
+        table.insert(payload, {
+            traceId       = s.trace_id,
+            id            = s.span_id,
+            parentId      = s.parent_id,
+            name          = s.name,
+            timestamp     = s.start_ms * 1000,
+            duration      = s:duration() * 1000,
+            localEndpoint = { serviceName = s.attrs["service.name"] or "unknown" },
+            tags          = (function()
+                local t = {}
+                for k, v in pairs(s.attrs) do t[k] = tostring(v) end
+                if s.status == "ERROR" then t["error"] = s.status_msg or "true" end
+                return t
+            end)(),
+        })
+    end
+    
+    local body = cjson.encode(payload)
+    local c = http.new()
+    c:set_timeout(self.timeout)
+    local res, err = c:request_uri(self.url, {
+        method  = "POST",
+        body    = body,
+        headers = { ["Content-Type"] = "application/json" },
+    })
+    
+    return res and res.status == 202, err
+end
+
+-- ==================== Module exports ====================
+
+_M.Tracer         = Tracer
+_M.Span           = Span
+_M.ZipkinExporter = ZipkinExporter
+
+return _M
+```
+
+---
+
+## 69.13 ตัวอย่างการใช้งาน Complete
+
+```lua
+-- init_by_lua_block
+local otel = require("lib.otel")
+
+_G.tracer = otel.Tracer.new({
+    service  = "order-service",
+    version  = "1.2.0",
+    exporter = otel.ZipkinExporter.new({
+        url = os.getenv("ZIPKIN_URL") or "http://zipkin:9411/api/v2/spans"
+    }),
+    sampler  = {
+        should_sample = function(trace_id)
+            -- 5% sampling ปกติ, 100% สำหรับ error path
+            return math.random() < 0.05
+        end
+    },
+})
+
+-- access_by_lua_block
+local span = tracer:start_server_span(
+    ngx.req.get_method() .. " " .. ngx.var.uri
+)
+span:attr("http.method",  ngx.req.get_method())
+span:attr("http.target",  ngx.var.uri)
+span:attr("http.scheme",  ngx.var.scheme)
+span:attr("net.peer.ip",  ngx.var.remote_addr)
+span:attr("server.port",  tonumber(ngx.var.server_port))
+
+-- log_by_lua_block
+local span = ngx.ctx._current_span
+if span then
+    span:attr("http.status_code", ngx.status)
+    span:attr("http.response_size", tonumber(ngx.var.bytes_sent) or 0)
+    if ngx.status >= 500 then
+        span:error("HTTP " .. ngx.status)
+    end
+    span:finish()
+end
+```
+
+---
+
+## 69.14 แบบฝึกหัด
+
+### แบบฝึกหัดที่ 1: พื้นฐาน
+สร้าง Tracing Middleware อย่างง่ายที่:
+- รับ `X-Trace-ID` จาก Header หรือสร้าง UUID ใหม่
+- บันทึก Request method, URI, IP
+- วัดเวลาใน Response Header ว่าใช้เวลากี่ milliseconds
+- Log ข้อมูลเป็น JSON
+
+### แบบฝึกหัดที่ 2: W3C Traceparent
+เขียนฟังก์ชัน `parse_traceparent(header)` ที่:
+- Validate format ตาม W3C spec
+- Return table พร้อม trace_id, parent_id, flags, sampled
+- Return nil, error message ถ้า format ผิด
+- เขียน Unit Test ครอบคลุม edge cases
+
+### แบบฝึกหัดที่ 3: Child Spans
+สร้าง wrapper สำหรับ `resty.mysql` ที่:
+- สร้าง Child Span อัตโนมัติสำหรับทุก Query
+- บันทึก SQL statement, rows affected/returned
+- Track query time
+- Report error ถ้า query ล้มเหลว
+
+### แบบฝึกหัดที่ 4: Sampling
+Implement `RateLimitSampler` ที่:
+- รับ parameter `max_traces_per_minute`
+- ใช้ sliding window algorithm
+- Thread-safe (ใน OpenResty context)
+- Test ว่า rate limiting ทำงานถูกต้อง
+
+### แบบฝึกหัดที่ 5: Integration
+สร้าง Complete tracing setup สำหรับ API Gateway ที่มี:
+- W3C traceparent extraction/injection
+- Zipkin/Jaeger export
+- Structured JSON logging พร้อม trace_id
+- Parent-based sampling ที่เคารพ upstream sampling decision
+- Dashboard ใน Zipkin แสดง Service Map
+
+---
+
+## สรุป
 
 ในบทนี้เราได้เรียนรู้:
 
-1. **Docker Basics** - Images, Containers, Networks, Volumes
-2. **Dockerfile for Lua** - สร้าง image สำหรับ Lua app
-3. **Dockerfile for OpenResty** - Nginx + LuaJIT container
-4. **Multi-stage Builds** - Builder + Production stages
-5. **Docker Compose** - Development environment
-6. **Environment Variables** - Config management
-7. **Volume Mounting** - Bind mounts, named volumes
-8. **Health Checks** - Container health verification
-9. **Docker Networking** - Bridge networks, DNS resolution
-10. **Kubernetes Pod Spec** - Deployment, Service manifests
-11. **ConfigMaps & Secrets** - Configuration management
-12. **Horizontal Scaling** - HPA configuration
-13. **Rolling Deployments** - Zero-downtime updates
-14. **Dockerfile Linting** - Best practices checker
-15. **Container Orchestration** - Scheduling concepts
+1. **OpenTelemetry concepts** - Trace, Span, Context และความสัมพันธ์
+2. **W3C Traceparent** - มาตรฐาน Header สำหรับ context propagation
+3. **Span lifecycle** - การสร้าง, บันทึก attributes, events และ finish span
+4. **Zipkin/Jaeger** - การส่ง trace data ไปยัง backend systems
+5. **Sampling strategies** - วิธีต่างๆ ในการเลือกว่าจะ trace Request ไหน
+6. **Error tracking** - การบันทึก errors และ exceptions ใน spans
+7. **Production-ready library** - Complete implementation พร้อมใช้งาน
 
----
-
-*จบบทที่ 69 - Docker + Lua Applications*
+Distributed Tracing เป็นเครื่องมือสำคัญในการ Debug และ Optimize ระบบ Microservices ขนาดใหญ่ ความเข้าใจอย่างลึกซึ้งจะช่วยให้คุณสร้างระบบที่ Observable และ Maintainable ได้ดียิ่งขึ้น
