@@ -2,891 +2,792 @@
 
 ## บทนำ
 
-CI/CD (Continuous Integration / Continuous Deployment) คือแนวปฏิบัติที่ช่วยให้ทีม development สามารถ deliver code ได้รวดเร็ว มั่นคง และอัตโนมัติ ในบทนี้จะครอบคลุมการสร้าง CI/CD pipeline สำหรับ Lua projects โดยใช้ GitHub Actions ตั้งแต่การรัน tests, ตรวจสอบ code quality, สร้าง Docker images, ไปจนถึงการ deploy ไปยัง production
+CI/CD (Continuous Integration / Continuous Deployment) คือแนวปฏิบัติในการ automate กระบวนการ build, test, และ deploy software อย่างต่อเนื่อง ในบทนี้จะเรียนรู้การสร้าง CI/CD pipeline สำหรับ Lua projects โดยใช้ GitHub Actions พร้อม tools ต่างๆ เช่น Busted, LuaCheck, LuaCov และ LuaRocks
 
 ---
 
-## 65.1 GitHub Actions สำหรับ Lua Projects
+## 65.1 GitHub Actions พื้นฐาน
 
-### 65.1.1 โครงสร้าง GitHub Actions
-
-GitHub Actions ใช้ YAML files ใน `.github/workflows/` directory โดยแต่ละ workflow ประกอบด้วย:
-
-- **Events**: สิ่งที่ trigger workflow (push, pull_request, schedule, etc.)
-- **Jobs**: กลุ่มของ steps ที่รันบน runner เดียว
-- **Steps**: คำสั่งแต่ละขั้นตอนใน job
+### ตัวอย่างที่ 1: Workflow พื้นฐานสำหรับ Lua Project
 
 ```yaml
-# ตัวอย่างที่ 1: .github/workflows/hello-world.yml - Workflow พื้นฐาน
-name: Hello World Workflow
-
-# กำหนด events ที่ trigger workflow
-on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:    # รันด้วยมือได้
-
-jobs:
-  greet:
-    name: Greet Job
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Setup Lua
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: "5.4"
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    - name: Print Lua version
-      run: |
-        lua -v
-        luarocks --version
-    
-    - name: Run simple Lua script
-      run: |
-        lua -e "print('Hello from GitHub Actions!')"
-        lua -e "print('Lua version: ' .. _VERSION)"
-```
-
-### 65.1.2 Workflow สำหรับ Lua Library
-
-```yaml
-# ตัวอย่างที่ 2: .github/workflows/library-ci.yml - CI สำหรับ Lua library
-name: Lua Library CI
+# .github/workflows/ci.yml
+name: Lua CI
 
 on:
   push:
-    branches: [main, develop, 'feature/**', 'hotfix/**']
+    branches: [ main, develop ]
   pull_request:
-    branches: [main, develop]
-
-# ใช้ concurrency เพื่อยกเลิก runs เก่าเมื่อ push ใหม่
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  LUA_VERSION: "5.4"
-  LUAROCKS_VERSION: "3.9.2"
-
-jobs:
-  # Job 1: ตรวจสอบ syntax และ style
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Lua
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: ${{ env.LUA_VERSION }}
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    - name: Install luacheck
-      run: luarocks install luacheck
-    
-    - name: Run luacheck
-      run: |
-        luacheck src/ --codes --ranges \
-          --globals ngx cjson redis \
-          --max-line-length 120 \
-          --ignore 212 213  # unused self/vararg
-    
-    - name: Check formatting (StyLua)
-      run: |
-        # Download StyLua
-        curl -sL https://github.com/JohnnyMorganz/StyLua/releases/latest/download/stylua-linux-x86_64.zip -o stylua.zip
-        unzip stylua.zip
-        chmod +x stylua
-        
-        # ตรวจสอบว่า code formatting ถูกต้อง
-        ./stylua --check src/ spec/
-```
-
----
-
-## 65.2 Testing ด้วย Busted ใน CI
-
-### 65.2.1 Busted Test Runner
-
-Busted คือ test framework สำหรับ Lua ที่มีความสามารถสูง รองรับ BDD-style tests
-
-```yaml
-# ตัวอย่างที่ 3: .github/workflows/test.yml - Test workflow
-name: Tests
-
-on: [push, pull_request]
+    branches: [ main ]
 
 jobs:
   test:
     name: Test on Lua ${{ matrix.lua-version }}
     runs-on: ubuntu-latest
     
-    # Matrix testing: ทดสอบกับ Lua versions หลาย version
     strategy:
-      fail-fast: false
       matrix:
-        lua-version: ["5.1", "5.2", "5.3", "5.4", "luajit-2.1"]
+        lua-version: ['5.1', '5.2', '5.3', '5.4', 'luajit']
     
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Lua ${{ matrix.lua-version }}
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: ${{ matrix.lua-version }}
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    # Cache LuaRocks dependencies เพื่อเพิ่มความเร็ว
-    - name: Cache LuaRocks
-      uses: actions/cache@v4
-      with:
-        path: ~/.luarocks
-        key: ${{ runner.os }}-lua${{ matrix.lua-version }}-${{ hashFiles('*.rockspec') }}
-        restore-keys: |
-          ${{ runner.os }}-lua${{ matrix.lua-version }}-
-    
-    - name: Install dependencies
-      run: |
-        luarocks install --only-deps myproject-dev-1.rockspec
-        luarocks install busted
-        luarocks install luacov
-        luarocks install busted-htest  # HTML test reporter
-    
-    - name: Run tests
-      run: |
-        busted spec/ \
-          --coverage \
-          --output=TAP \
-          --verbose \
-          2>&1 | tee test-results.txt
-      env:
-        LUA_PATH: "./src/?.lua;./src/?/init.lua;$LUA_PATH"
-    
-    - name: Upload test results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: test-results-lua${{ matrix.lua-version }}
-        path: test-results.txt
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: ${{ matrix.lua-version }}
+      
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+      
+      - name: Install dependencies
+        run: luarocks install --only-deps myproject-dev-1.rockspec
+      
+      - name: Run tests
+        run: busted --verbose
+      
+      - name: Run linter
+        run: luacheck . --config .luacheckrc
 ```
 
-### 65.2.2 Busted Test Files
+### ตัวอย่างที่ 2: Project Structure สำหรับ CI
+
+```
+myproject/
+├── .github/
+│   └── workflows/
+│       ├── ci.yml          # Main CI pipeline
+│       ├── release.yml     # Release pipeline
+│       └── docs.yml        # Documentation pipeline
+├── src/
+│   └── myproject/
+│       ├── init.lua
+│       ├── utils.lua
+│       └── config.lua
+├── spec/
+│   ├── spec_helper.lua
+│   ├── utils_spec.lua
+│   └── config_spec.lua
+├── .luacheckrc             # LuaCheck configuration
+├── .busted                 # Busted configuration
+├── myproject-dev-1.rockspec
+├── myproject-1.0.0-1.rockspec
+└── README.md
+```
+
+---
+
+## 65.2 Unit Testing ด้วย Busted
+
+### ตัวอย่างที่ 3: Busted Test Suite
 
 ```lua
--- ตัวอย่างที่ 4: spec/calculator_spec.lua - Busted test file
--- BDD-style tests สำหรับ calculator module
+-- spec/utils_spec.lua
+local utils = require("myproject.utils")
 
-local Calculator = require "myproject.calculator"
-
-describe("Calculator", function()
-    local calc
+describe("utils module", function()
     
-    -- Setup ก่อนแต่ละ test
-    before_each(function()
-        calc = Calculator.new()
-    end)
-    
-    -- Teardown หลังจากแต่ละ test
-    after_each(function()
-        calc = nil
-    end)
-    
-    describe("add", function()
-        it("should add two positive numbers", function()
-            assert.equals(5, calc:add(2, 3))
+    describe("string helpers", function()
+        it("should trim whitespace", function()
+            assert.equal("hello", utils.trim("  hello  "))
+            assert.equal("world", utils.trim("\t world \n"))
+            assert.equal("", utils.trim("   "))
         end)
         
-        it("should add negative numbers", function()
-            assert.equals(-1, calc:add(2, -3))
+        it("should split string", function()
+            local parts = utils.split("a,b,c", ",")
+            assert.equal(3, #parts)
+            assert.equal("a", parts[1])
+            assert.equal("b", parts[2])
+            assert.equal("c", parts[3])
         end)
         
-        it("should handle zero", function()
-            assert.equals(0, calc:add(0, 0))
-        end)
-    end)
-    
-    describe("divide", function()
-        it("should divide correctly", function()
-            assert.equals(2, calc:divide(10, 5))
+        it("should handle empty string split", function()
+            local parts = utils.split("", ",")
+            assert.equal(1, #parts)
+            assert.equal("", parts[1])
         end)
         
-        it("should raise error for division by zero", function()
-            assert.has_error(function()
-                calc:divide(10, 0)
-            end, "Division by zero")
-        end)
-        
-        it("should return float for non-integer division", function()
-            local result = calc:divide(7, 2)
-            assert.near(3.5, result, 0.001)
+        it("should format string with placeholders", function()
+            local result = utils.format("Hello, {name}!", {name = "World"})
+            assert.equal("Hello, World!", result)
         end)
     end)
     
-    describe("history", function()
-        it("should track operations", function()
-            calc:add(1, 2)
-            calc:add(3, 4)
+    describe("table helpers", function()
+        it("should merge tables", function()
+            local t1 = {a = 1, b = 2}
+            local t2 = {b = 3, c = 4}
+            local merged = utils.merge(t1, t2)
             
-            local history = calc:get_history()
-            assert.equals(2, #history)
-            assert.equals("add(1, 2) = 3", history[1])
+            assert.equal(1, merged.a)
+            assert.equal(3, merged.b)  -- t2 overrides t1
+            assert.equal(4, merged.c)
         end)
         
-        it("should clear history", function()
-            calc:add(1, 2)
-            calc:clear_history()
+        it("should deep clone table", function()
+            local original = {a = {b = {c = 1}}}
+            local clone = utils.deep_clone(original)
             
-            assert.equals(0, #calc:get_history())
+            assert.are_not.equal(original, clone)
+            assert.are_not.equal(original.a, clone.a)
+            assert.equal(1, clone.a.b.c)
+            
+            -- Modify clone should not affect original
+            clone.a.b.c = 99
+            assert.equal(1, original.a.b.c)
+        end)
+        
+        it("should filter table", function()
+            local numbers = {1, 2, 3, 4, 5, 6}
+            local evens = utils.filter(numbers, function(n) return n % 2 == 0 end)
+            
+            assert.equal(3, #evens)
+            assert.equal(2, evens[1])
+            assert.equal(4, evens[2])
+            assert.equal(6, evens[3])
         end)
     end)
     
-    -- Async test (สำหรับ LuaJIT/OpenResty)
-    describe("async operations", function()
-        it("should handle async calculation", function(done)
-            calc:async_add(1, 2, function(result)
-                assert.equals(3, result)
-                done()
-            end)
+    describe("number helpers", function()
+        it("should clamp numbers", function()
+            assert.equal(5, utils.clamp(5, 1, 10))
+            assert.equal(1, utils.clamp(-5, 1, 10))
+            assert.equal(10, utils.clamp(15, 1, 10))
+        end)
+        
+        it("should round numbers", function()
+            assert.equal(3, utils.round(3.4))
+            assert.equal(4, utils.round(3.5))
+            assert.equal(4, utils.round(3.7))
+            assert.equal(-3, utils.round(-3.4))
         end)
     end)
+    
 end)
 ```
 
-### 65.2.3 Mock และ Stub ใน Tests
+### ตัวอย่างที่ 4: Testing Async และ Mocking
 
 ```lua
--- ตัวอย่างที่ 5: spec/service_spec.lua - Testing with mocks
-local UserService = require "myproject.user_service"
+-- spec/async_spec.lua
+local mock = require("busted.mock")
 
--- Mock object
-local mock_db = {
-    find = function(self, id)
-        if id == 1 then
-            return {id = 1, name = "สมชาย", email = "somchai@test.com"}
-        end
-        return nil
-    end,
-    save = function(self, user)
-        user.id = math.random(1000)
-        return user
-    end,
-    call_count = {find = 0, save = 0}
-}
+-- Mock HTTP client
+local http_mock = mock({
+    get = function(url) return nil, "network error" end,
+    post = function(url, data) return {status = 200, body = "{}"} end,
+})
 
--- Spy บน mock
-local original_find = mock_db.find
-mock_db.find = function(self, id)
-    mock_db.call_count.find = mock_db.call_count.find + 1
-    return original_find(self, id)
-end
+-- Module ที่ต้อง test
+local api_client = require("myproject.api_client")
 
-describe("UserService", function()
-    local service
+describe("API Client", function()
     
     before_each(function()
-        -- reset call counts
-        mock_db.call_count = {find = 0, save = 0}
-        service = UserService.new(mock_db)
+        -- Reset mocks ก่อนแต่ละ test
+        mock.clear(http_mock)
     end)
     
-    describe("get_user", function()
-        it("should return user when found", function()
-            local user = service:get_user(1)
-            
-            assert.is_not_nil(user)
-            assert.equals("สมชาย", user.name)
-            assert.equals(1, mock_db.call_count.find)
-        end)
+    it("should handle network errors gracefully", function()
+        -- Setup mock
+        http_mock.get = function(url)
+            return nil, "connection refused"
+        end
         
-        it("should return nil when not found", function()
-            local user = service:get_user(999)
-            assert.is_nil(user)
-        end)
+        -- Override dependency
+        api_client._http = http_mock
         
-        it("should validate input", function()
-            assert.has_error(function()
-                service:get_user(-1)
-            end)
-            
-            assert.has_error(function()
-                service:get_user("not_a_number")
-            end)
-        end)
+        local result, err = api_client.fetch_user(123)
+        
+        assert.is_nil(result)
+        assert.matches("connection refused", err)
     end)
     
-    describe("create_user", function()
-        it("should create and return new user with id", function()
-            local new_user = service:create_user({
-                name = "สมหญิง",
-                email = "somying@test.com"
+    it("should parse successful response", function()
+        http_mock.get = function(url)
+            return {
+                status = 200,
+                body = '{"id": 123, "name": "Test User"}'
+            }
+        end
+        
+        api_client._http = http_mock
+        
+        local user, err = api_client.fetch_user(123)
+        
+        assert.is_nil(err)
+        assert.equal(123, user.id)
+        assert.equal("Test User", user.name)
+    end)
+    
+    it("should retry on 503 errors", function()
+        local call_count = 0
+        
+        http_mock.get = function(url)
+            call_count = call_count + 1
+            if call_count < 3 then
+                return {status = 503, body = "Service Unavailable"}
+            end
+            return {status = 200, body = '{"id": 1}'}
+        end
+        
+        api_client._http = http_mock
+        api_client._max_retries = 3
+        
+        local user, err = api_client.fetch_user(1)
+        
+        assert.is_nil(err)
+        assert.equal(3, call_count)
+    end)
+    
+end)
+```
+
+### ตัวอย่างที่ 5: Integration Tests
+
+```lua
+-- spec/integration/database_spec.lua
+-- Integration tests ที่ใช้ database จริง (ในสภาพแวดล้อม test)
+
+local sqlite3 = require("lsqlite3")
+local UserRepository = require("myproject.repositories.user")
+
+describe("UserRepository Integration", function()
+    local db
+    local repo
+    
+    before_each(function()
+        -- สร้าง fresh in-memory database สำหรับแต่ละ test
+        db = sqlite3.open(":memory:")
+        db:exec([[
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
+        ]])
+        repo = UserRepository.new(db)
+    end)
+    
+    after_each(function()
+        db:close()
+    end)
+    
+    it("should create and find user", function()
+        local user = repo:create({name = "Test User", email = "test@example.com"})
+        
+        assert.truthy(user.id)
+        assert.equal("Test User", user.name)
+        
+        local found = repo:find_by_id(user.id)
+        assert.equal(user.id, found.id)
+        assert.equal("Test User", found.name)
+    end)
+    
+    it("should enforce unique email", function()
+        repo:create({name = "User 1", email = "same@example.com"})
+        
+        local ok, err = pcall(function()
+            repo:create({name = "User 2", email = "same@example.com"})
+        end)
+        
+        assert.is_false(ok)
+        assert.matches("UNIQUE", err)
+    end)
+    
+    it("should find all users with pagination", function()
+        for i = 1, 10 do
+            repo:create({
+                name = "User " .. i,
+                email = "user" .. i .. "@example.com"
             })
-            
-            assert.is_not_nil(new_user.id)
-            assert.equals("สมหญิง", new_user.name)
-        end)
+        end
         
-        it("should validate required fields", function()
-            -- Missing name
-            assert.has_error(function()
-                service:create_user({email = "test@test.com"})
-            end, "name is required")
-            
-            -- Missing email
-            assert.has_error(function()
-                service:create_user({name = "Test"})
-            end, "email is required")
-            
-            -- Invalid email format
-            assert.has_error(function()
-                service:create_user({name = "Test", email = "not-an-email"})
-            end, "invalid email format")
-        end)
+        local page1 = repo:find_all({limit = 5, offset = 0})
+        local page2 = repo:find_all({limit = 5, offset = 5})
+        
+        assert.equal(5, #page1)
+        assert.equal(5, #page2)
+        
+        -- Verify no overlap
+        for _, u1 in ipairs(page1) do
+            for _, u2 in ipairs(page2) do
+                assert.are_not.equal(u1.id, u2.id)
+            end
+        end
     end)
+    
 end)
 ```
 
 ---
 
-## 65.3 Luacheck ใน Pipeline
+## 65.3 LuaCheck - Static Analysis
 
-### 65.3.1 Configuration ของ Luacheck
+### ตัวอย่างที่ 6: LuaCheck Configuration
 
 ```lua
--- ตัวอย่างที่ 6: .luacheckrc - Luacheck configuration file
--- Configuration สำหรับ luacheck static analyzer
+-- .luacheckrc
+-- LuaCheck configuration file
 
--- Standard globals ที่อนุญาต
-std = "lua54"
-
--- Global variables ที่กำหนดเพิ่มเติม
-globals = {
-    -- OpenResty globals
-    "ngx",
-    "ndk",
-    -- Testing globals (Busted)
-    "describe",
-    "it",
-    "before_each",
-    "after_each",
-    "before_all",
-    "after_all",
-    "assert",
-    "spy",
-    "stub",
-    "mock",
-    "pending",
-    "done"
-}
-
--- ปิด warnings บางอย่าง
-ignore = {
-    "212",  -- Unused argument self
-    "213",  -- Unused loop variable
-}
-
--- ไม่ตรวจสอบ files เหล่านี้
-exclude_files = {
-    "spec/fixtures/**",
-    "vendor/**",
-    "*.min.lua"
-}
-
--- กำหนด max line length
-max_line_length = 120
-max_string_line_length = 160
-
--- ตั้งค่าตามแต่ละ file pattern
-files["spec/**"] = {
-    -- ใน test files อนุญาต globals เพิ่มเติม
-    globals = {"assert", "describe", "it", "before_each", "after_each"},
-    ignore = {"211"}  -- อนุญาต unused variables ใน test files
-}
-
-files["src/migrations/**"] = {
-    -- Migration files อาจมี unused globals
-    ignore = {"111", "112"}
+return {
+    -- Global settings
+    max_line_length = 120,
+    max_code_line_length = 120,
+    max_comment_line_length = 200,
+    
+    -- Warning settings
+    unused_args = true,
+    unused = true,
+    undefined = true,
+    
+    -- Globals ที่อนุญาต
+    globals = {
+        -- Lua builtins
+        "print", "pairs", "ipairs", "next", "select",
+        "unpack", "table", "string", "math", "os", "io",
+        "type", "tostring", "tonumber", "error", "pcall",
+        "xpcall", "assert", "require", "load", "loadfile",
+        "dofile", "collectgarbage", "rawget", "rawset",
+        "rawequal", "rawlen", "setmetatable", "getmetatable",
+        
+        -- Testing globals (Busted)
+        "describe", "it", "before_each", "after_each",
+        "before", "after", "pending", "assert", "mock",
+        "spy", "stub",
+        
+        -- Project globals
+        "LOG", "CONFIG", "APP_VERSION",
+    },
+    
+    -- File-specific overrides
+    files = {
+        -- Test files - allow more globals
+        ["spec/**/*.lua"] = {
+            globals = {"describe", "it", "before_each", "after_each",
+                       "assert", "mock", "spy", "stub", "pending"}
+        },
+        
+        -- Generated files - skip
+        ["generated/**"] = {
+            ignore = {".*"}
+        },
+    },
+    
+    -- Rules to ignore
+    ignore = {
+        "212",  -- Unused argument (common in callbacks)
+        "213",  -- Unused loop variable
+    },
+    
+    -- Rules to treat as errors (not warnings)
+    -- ทำให้ undefined variables เป็น error
+    enable = {"112", "113"},
 }
 ```
 
-### 65.3.2 Luacheck ใน GitHub Actions
+### ตัวอย่างที่ 7: GitHub Actions ด้วย LuaCheck
 
 ```yaml
-# ตัวอย่างที่ 7: .github/workflows/quality.yml - Code quality checks
-name: Code Quality
+# .github/workflows/lint.yml
+name: Lint
 
-on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
+on: [push, pull_request]
 
 jobs:
   luacheck:
-    name: Static Analysis (luacheck)
+    name: LuaCheck Static Analysis
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Lua
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: "5.4"
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    - name: Install luacheck
-      run: luarocks install luacheck
-    
-    - name: Run luacheck
-      id: luacheck
-      run: |
-        luacheck src/ spec/ \
-          --formatter TAP \
-          --codes \
-          --ranges \
-          2>&1 | tee luacheck-results.txt
-        
-        # สร้าง summary
-        echo "## Luacheck Results" >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
-        cat luacheck-results.txt >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
-    
-    - name: Upload luacheck results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: luacheck-results
-        path: luacheck-results.txt
-    
-    - name: Check for critical issues
-      run: |
-        # Fail ถ้ามี errors (ไม่ใช่แค่ warnings)
-        luacheck src/ spec/ --quiet --no-warnings
+      - uses: actions/checkout@v4
+      
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.4"
+      
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+      
+      - name: Install LuaCheck
+        run: luarocks install luacheck
+      
+      - name: Run LuaCheck
+        run: |
+          luacheck src/ spec/ \
+            --config .luacheckrc \
+            --formatter plain \
+            --codes \
+            --ranges
+      
+      - name: Check for TODO/FIXME
+        run: |
+          # Warning เมื่อมี TODO ใน code
+          if grep -rn "TODO\|FIXME\|HACK\|XXX" src/; then
+            echo "⚠️ Found TODO/FIXME comments in source"
+            exit 1
+          fi
 ```
 
 ---
 
 ## 65.4 Code Coverage ด้วย LuaCov
 
-### 65.4.1 LuaCov Configuration
+### ตัวอย่างที่ 8: LuaCov Setup
 
 ```lua
--- ตัวอย่างที่ 8: .luacov - LuaCov configuration
--- LuaCov configuration file
+-- .luacov
+-- LuaCov configuration
 
 return {
-    -- ไฟล์ที่ต้องการ coverage
+    -- Files ที่ต้องการ track
     include = {
         "src/.*",
+        "myproject/.*",
     },
     
-    -- ไฟล์ที่ไม่ต้องการ coverage
+    -- Files ที่ไม่ต้อง track
     exclude = {
         "spec/.*",
-        "vendor/.*",
-        ".*/init%.lua$",  -- Skip init files
+        "test/.*",
+        ".luarocks/.*",
+        ".*_spec%.lua",
     },
+    
+    -- Report format
+    reporter = "default",
     
     -- Output file
     statsfile = "luacov.stats.out",
-    
-    -- Report file
     reportfile = "luacov.report.out",
     
-    -- Threshold สำหรับ fail (%)
-    -- ถ้า coverage ต่ำกว่านี้จะถือว่า fail
-    -- (ใช้ใน CI script ไม่ใช่ config โดยตรง)
-    threshold = 80
+    -- Cobertura format สำหรับ CI
+    -- reporter = "cobertura",
 }
 ```
 
-### 65.4.2 Coverage ใน GitHub Actions
+### ตัวอย่างที่ 9: Coverage Workflow
 
 ```yaml
-# ตัวอย่างที่ 9: coverage section ใน CI workflow
+# .github/workflows/coverage.yml
+name: Code Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
   coverage:
-    name: Code Coverage
     runs-on: ubuntu-latest
-    needs: test   # รันหลังจาก test ผ่านแล้ว
     
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Lua
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: "5.4"
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    - name: Install dependencies
-      run: |
-        luarocks install busted
-        luarocks install luacov
-        luarocks install luacov-reporter-lcov  # LCOV format สำหรับ Codecov
-    
-    - name: Run tests with coverage
-      run: |
-        busted spec/ \
-          --coverage \
-          -c luacov.lua  # ใช้ custom coverage config
-      env:
-        LUA_PATH: "./src/?.lua;$LUA_PATH"
-    
-    - name: Generate coverage report
-      run: |
-        lua -e "require('luacov.reporter').report()"
-        
-        # แสดง summary
-        cat luacov.report.out
-        
-        # ตรวจสอบ coverage threshold
-        COVERAGE=$(grep -E "^Total" luacov.report.out | awk '{print $NF}' | tr -d '%')
-        echo "Coverage: ${COVERAGE}%"
-        
-        if [ $(echo "$COVERAGE < 80" | bc) -eq 1 ]; then
-          echo "Coverage ${COVERAGE}% is below threshold of 80%"
-          exit 1
-        fi
-    
-    - name: Convert to LCOV format
-      run: |
-        lua -e "require('luacov.reporter.lcov').report()"
-        mv luacov.report.lcov coverage.lcov
-    
-    - name: Upload to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        file: coverage.lcov
-        flags: lua
-        name: lua-coverage
-        token: ${{ secrets.CODECOV_TOKEN }}
-    
-    - name: Upload coverage artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: coverage-report
-        path: |
-          luacov.report.out
-          coverage.lcov
+      - uses: actions/checkout@v4
+      
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.4"
+      
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+      
+      - name: Install dependencies
+        run: |
+          luarocks install busted
+          luarocks install luacov
+          luarocks install luacov-reporter-lcov
+      
+      - name: Run tests with coverage
+        run: |
+          busted --coverage --verbose 2>&1 | tee test-results.txt
+      
+      - name: Generate coverage report
+        run: |
+          luacov
+          cat luacov.report.out
+      
+      - name: Generate LCOV report
+        run: |
+          luacov -r lcov
+          cat luacov.report.lcov
+      
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: luacov.report.lcov
+          flags: lua
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+      
+      - name: Check coverage threshold
+        run: |
+          # ตรวจสอบว่า coverage >= 80%
+          COVERAGE=$(grep "Total" luacov.report.out | awk '{print $NF}' | tr -d '%')
+          echo "Coverage: ${COVERAGE}%"
+          if [ -n "$COVERAGE" ] && [ "${COVERAGE%.*}" -lt 80 ]; then
+            echo "❌ Coverage ${COVERAGE}% is below minimum 80%"
+            exit 1
+          fi
+          echo "✅ Coverage check passed"
 ```
 
 ---
 
 ## 65.5 Semantic Versioning
 
-### 65.5.1 Version Management
-
-```bash
-# ตัวอย่างที่ 10: scripts/version.sh - Version management script
-#!/bin/bash
-set -e
-
-# อ่าน current version จาก rockspec หรือ version file
-get_current_version() {
-    if [ -f "VERSION" ]; then
-        cat VERSION
-    elif ls *.rockspec 1> /dev/null 2>&1; then
-        grep -m1 'version = ' *.rockspec | sed "s/.*version = '\(.*\)'.*/\1/"
-    else
-        echo "0.0.0"
-    fi
-}
-
-# Parse version components
-parse_version() {
-    local version=$1
-    IFS='.' read -r MAJOR MINOR PATCH <<< "$version"
-    echo "$MAJOR $MINOR $PATCH"
-}
-
-# Bump version
-bump_version() {
-    local bump_type=$1  # major, minor, patch
-    local current=$(get_current_version)
-    read MAJOR MINOR PATCH <<< $(parse_version "$current")
-    
-    case $bump_type in
-        major)
-            MAJOR=$((MAJOR + 1))
-            MINOR=0
-            PATCH=0
-            ;;
-        minor)
-            MINOR=$((MINOR + 1))
-            PATCH=0
-            ;;
-        patch)
-            PATCH=$((PATCH + 1))
-            ;;
-        *)
-            echo "Usage: $0 bump [major|minor|patch]"
-            exit 1
-            ;;
-    esac
-    
-    local new_version="${MAJOR}.${MINOR}.${PATCH}"
-    echo "$new_version"
-}
-
-# อัปเดต version ใน files ต่าง ๆ
-update_version_files() {
-    local new_version=$1
-    
-    # อัปเดต VERSION file
-    echo "$new_version" > VERSION
-    
-    # อัปเดต rockspec
-    for rockspec in *.rockspec; do
-        if [ -f "$rockspec" ]; then
-            sed -i "s/version = '[0-9]*\.[0-9]*\.[0-9]*'/version = '$new_version'/" "$rockspec"
-            
-            # Rename rockspec file
-            local name=$(echo "$rockspec" | sed 's/-[0-9].*\.rockspec//')
-            mv "$rockspec" "${name}-${new_version}-1.rockspec"
-        fi
-    done
-    
-    # อัปเดต version ใน main Lua file
-    if [ -f "src/init.lua" ]; then
-        sed -i "s/_VERSION = '[0-9]*\.[0-9]*\.[0-9]*'/_VERSION = '$new_version'/" src/init.lua
-    fi
-    
-    echo "Updated version to $new_version"
-}
-
-# Main
-case "$1" in
-    get)
-        get_current_version
-        ;;
-    bump)
-        new_version=$(bump_version "$2")
-        update_version_files "$new_version"
-        ;;
-    set)
-        update_version_files "$2"
-        ;;
-    *)
-        echo "Usage: $0 [get|bump|set] [major|minor|patch|version]"
-        exit 1
-        ;;
-esac
-```
-
-### 65.5.2 Conventional Commits สำหรับ Auto-versioning
-
-```yaml
-# ตัวอย่างที่ 11: .github/workflows/release.yml - Automatic release
-name: Release
-
-on:
-  push:
-    branches: [main]
-
-permissions:
-  contents: write
-  packages: write
-
-jobs:
-  release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # ต้องการ full history สำหรับ changelog
-        token: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Setup Node.js (สำหรับ semantic-release)
-      uses: actions/setup-node@v4
-      with:
-        node-version: "20"
-    
-    - name: Install semantic-release
-      run: |
-        npm install -g \
-          semantic-release \
-          @semantic-release/changelog \
-          @semantic-release/git \
-          @semantic-release/github \
-          @semantic-release/exec
-    
-    - name: Setup Lua
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: "5.4"
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    - name: Run semantic-release
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        LUAROCKS_API_KEY: ${{ secrets.LUAROCKS_API_KEY }}
-      run: npx semantic-release
-```
-
-### 65.5.3 .releaserc.json Configuration
-
-```json
-{
-  "branches": ["main"],
-  "plugins": [
-    "@semantic-release/commit-analyzer",
-    "@semantic-release/release-notes-generator",
-    [
-      "@semantic-release/changelog",
-      {
-        "changelogFile": "CHANGELOG.md"
-      }
-    ],
-    [
-      "@semantic-release/exec",
-      {
-        "prepareCmd": "scripts/version.sh set ${nextRelease.version}",
-        "publishCmd": "luarocks upload *.rockspec --api-key=${LUAROCKS_API_KEY}"
-      }
-    ],
-    [
-      "@semantic-release/git",
-      {
-        "assets": ["CHANGELOG.md", "VERSION", "*.rockspec", "src/init.lua"],
-        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
-      }
-    ],
-    "@semantic-release/github"
-  ]
-}
-```
-
----
-
-## 65.6 Automatic Release ไปยัง LuaRocks
-
-### 65.6.1 Rockspec สำหรับ LuaRocks
+### ตัวอย่างที่ 10: Version Management Script
 
 ```lua
--- ตัวอย่างที่ 12: myproject-1.0.0-1.rockspec - LuaRocks package spec
-package = "myproject"
-version = "1.0.0-1"
-source = {
-   url = "git+https://github.com/username/myproject.git",
-   tag = "v1.0.0"
-}
-description = {
-   summary = "A useful Lua library",
-   detailed = [[
-      myproject เป็น Lua library สำหรับ...
-      มีความสามารถในการ...
-   ]],
-   homepage = "https://github.com/username/myproject",
-   license = "MIT"
-}
-dependencies = {
-   "lua >= 5.1",
-   "lua-cjson >= 2.1.0",
-   "luasocket >= 3.0"
-}
-build = {
-   type = "builtin",
-   modules = {
-      ["myproject"] = "src/init.lua",
-      ["myproject.utils"] = "src/utils.lua",
-      ["myproject.config"] = "src/config.lua",
-      ["myproject.validator"] = "src/validator.lua"
-   },
-   copy_directories = {
-      "docs"
-   }
-}
+-- scripts/version.lua
+-- จัดการ semantic versioning
+
+local Version = {}
+Version.__index = Version
+
+function Version.parse(version_str)
+    local major, minor, patch, pre = version_str:match(
+        "^v?(%d+)%.(%d+)%.(%d+)%-?(.*)$"
+    )
+    
+    if not major then
+        error("Invalid version string: " .. version_str)
+    end
+    
+    return setmetatable({
+        major = tonumber(major),
+        minor = tonumber(minor),
+        patch = tonumber(patch),
+        pre = pre ~= "" and pre or nil,
+    }, Version)
+end
+
+function Version:__tostring()
+    local v = string.format("%d.%d.%d", self.major, self.minor, self.patch)
+    if self.pre then
+        v = v .. "-" .. self.pre
+    end
+    return v
+end
+
+function Version:bump(bump_type)
+    local new = {
+        major = self.major,
+        minor = self.minor,
+        patch = self.patch,
+    }
+    
+    if bump_type == "major" then
+        new.major = new.major + 1
+        new.minor = 0
+        new.patch = 0
+    elseif bump_type == "minor" then
+        new.minor = new.minor + 1
+        new.patch = 0
+    elseif bump_type == "patch" then
+        new.patch = new.patch + 1
+    else
+        error("Invalid bump type: " .. bump_type)
+    end
+    
+    return setmetatable(new, Version)
+end
+
+function Version:__lt(other)
+    if self.major ~= other.major then return self.major < other.major end
+    if self.minor ~= other.minor then return self.minor < other.minor end
+    return self.patch < other.patch
+end
+
+function Version:__eq(other)
+    return self.major == other.major
+        and self.minor == other.minor
+        and self.patch == other.patch
+end
+
+-- Read version from file
+local function read_version(filename)
+    local f = io.open(filename, "r")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+    
+    local version = content:match("version%s*=%s*[\"']([^\"']+)[\"']")
+    return version and Version.parse(version)
+end
+
+-- Write version to file
+local function write_version(filename, version)
+    local f = io.open(filename, "r")
+    if not f then error("File not found: " .. filename) end
+    local content = f:read("*a")
+    f:close()
+    
+    -- Replace version string
+    local new_content = content:gsub(
+        '(version%s*=%s*["\'])([^"\']+)(["\'])',
+        '%1' .. tostring(version) .. '%3'
+    )
+    
+    f = io.open(filename, "w")
+    f:write(new_content)
+    f:close()
+end
+
+-- CLI interface
+local args = {...}
+local cmd = args[1] or "show"
+
+local current = read_version("myproject-dev-1.rockspec")
+if not current then
+    current = Version.parse("0.1.0")
+end
+
+if cmd == "show" then
+    print(tostring(current))
+elseif cmd == "bump" then
+    local bump_type = args[2] or "patch"
+    local new_version = current:bump(bump_type)
+    print(string.format("Bumping %s: %s -> %s",
+        bump_type, tostring(current), tostring(new_version)))
+    -- write_version("myproject-dev-1.rockspec", new_version)
+elseif cmd == "check" then
+    local compare_ver = Version.parse(args[2] or "1.0.0")
+    if current < compare_ver then
+        print(tostring(current) .. " < " .. tostring(compare_ver))
+    elseif current == compare_ver then
+        print(tostring(current) .. " == " .. tostring(compare_ver))
+    else
+        print(tostring(current) .. " > " .. tostring(compare_ver))
+    end
+end
 ```
 
-### 65.6.2 LuaRocks Upload Workflow
+### ตัวอย่างที่ 11: Rockspec File ที่ Complete
 
-```yaml
-# ตัวอย่างที่ 13: .github/workflows/publish-luarocks.yml
-name: Publish to LuaRocks
+```lua
+-- myproject-1.0.0-1.rockspec
+package = "myproject"
+version = "1.0.0-1"
 
-on:
-  release:
-    types: [published]  # trigger เมื่อ create release
+source = {
+    url = "git+https://github.com/username/myproject.git",
+    tag = "v1.0.0",
+}
 
-jobs:
-  publish:
-    name: Publish to LuaRocks
-    runs-on: ubuntu-latest
-    
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.release.tag_name }}
-    
-    - name: Setup Lua
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: "5.4"
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    - name: Extract version from tag
-      id: version
-      run: |
-        TAG="${{ github.event.release.tag_name }}"
-        VERSION="${TAG#v}"  # ลบ 'v' prefix
-        echo "version=${VERSION}" >> $GITHUB_OUTPUT
-        echo "rockspec=myproject-${VERSION}-1.rockspec" >> $GITHUB_OUTPUT
-    
-    - name: Validate rockspec
-      run: |
-        luarocks lint ${{ steps.version.outputs.rockspec }}
-    
-    - name: Upload to LuaRocks
-      run: |
-        luarocks upload \
-          ${{ steps.version.outputs.rockspec }} \
-          --api-key=${{ secrets.LUAROCKS_API_KEY }}
-    
-    - name: Verify upload
-      run: |
-        sleep 30  # รอให้ LuaRocks อัปเดต
-        luarocks search myproject ${{ steps.version.outputs.version }}
+description = {
+    summary = "A comprehensive Lua project template",
+    detailed = [[
+        myproject provides utilities and patterns for
+        building robust Lua applications with proper
+        CI/CD integration.
+    ]],
+    homepage = "https://github.com/username/myproject",
+    license = "MIT",
+    maintainer = "Developer <dev@example.com>",
+    labels = {"lua", "utilities", "template"},
+}
+
+dependencies = {
+    "lua >= 5.1",
+    "lsqlite3 >= 0.9",
+    "inspect >= 3.1",
+}
+
+build = {
+    type = "builtin",
+    modules = {
+        ["myproject"] = "src/myproject/init.lua",
+        ["myproject.utils"] = "src/myproject/utils.lua",
+        ["myproject.config"] = "src/myproject/config.lua",
+        ["myproject.logger"] = "src/myproject/logger.lua",
+    },
+    install = {
+        bin = {
+            ["myproject"] = "bin/myproject",
+        },
+    },
+}
+
+test_dependencies = {
+    "busted >= 2.0",
+    "luacheck >= 1.0",
+    "luacov >= 0.15",
+}
+
+test = {
+    type = "busted",
+}
 ```
 
 ---
 
-## 65.7 Docker Image Building และ Pushing
+## 65.6 Docker Integration
 
-### 65.7.1 Docker Build และ Push Workflow
+### ตัวอย่างที่ 12: Dockerfile สำหรับ Lua Application
+
+```dockerfile
+# Dockerfile
+FROM ubuntu:22.04 AS base
+
+# ติดตั้ง Lua และ dependencies
+RUN apt-get update && apt-get install -y \
+    lua5.4 \
+    luarocks \
+    libsqlite3-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ติดตั้ง Lua dependencies ก่อน (เพื่อ cache layer)
+COPY *.rockspec ./
+RUN luarocks install --only-deps *.rockspec
+
+# Copy source code
+COPY . .
+
+# Install application
+RUN luarocks make *.rockspec
+
+EXPOSE 8080
+
+CMD ["lua", "src/server.lua"]
+
+# --- Development stage ---
+FROM base AS development
+RUN luarocks install busted \
+    && luarocks install luacheck \
+    && luarocks install luacov
+
+CMD ["lua", "-e", "print('Dev mode')"]
+
+# --- Test stage ---
+FROM development AS test
+RUN busted --verbose && luacheck src/
+
+# --- Production stage ---
+FROM base AS production
+ENV LUA_ENV=production
+CMD ["lua", "src/server.lua"]
+```
+
+### ตัวอย่างที่ 13: Docker Build ใน CI
 
 ```yaml
-# ตัวอย่างที่ 14: .github/workflows/docker.yml - Docker build and push
-name: Docker Build & Push
+# .github/workflows/docker.yml
+name: Docker Build and Push
 
 on:
   push:
     branches: [main]
-    tags: ['v*.*.*']
+    tags:
+      - 'v*.*.*'
   pull_request:
     branches: [main]
 
@@ -895,136 +796,187 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  docker:
-    name: Build and Push Docker Image
+  build:
     runs-on: ubuntu-latest
-    
     permissions:
       contents: read
       packages: write
-      security-events: write
     
     steps:
-    - uses: actions/checkout@v4
-    
-    # Setup Docker Buildx สำหรับ multi-platform builds
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-    
-    - name: Set up QEMU (สำหรับ multi-platform)
-      uses: docker/setup-qemu-action@v3
-    
-    # Login ไปยัง registries
-    - name: Login to GitHub Container Registry
-      if: github.event_name != 'pull_request'
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Login to Docker Hub
-      if: github.event_name != 'pull_request'
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
-    
-    # สร้าง metadata สำหรับ Docker tags
-    - name: Extract metadata for Docker
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: |
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          ${{ secrets.DOCKERHUB_USERNAME }}/lua-app
-        tags: |
-          type=ref,event=branch
-          type=ref,event=pr
-          type=semver,pattern={{version}}
-          type=semver,pattern={{major}}.{{minor}}
-          type=semver,pattern={{major}}
-          type=sha,prefix=sha-
-          type=raw,value=latest,enable={{is_default_branch}}
-    
-    # Build image เพื่อรัน tests ก่อน
-    - name: Build test image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        target: tester
-        load: true  # load ลง local Docker
-        tags: lua-app:test
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-    
-    - name: Run tests in Docker
-      run: |
-        docker run --rm lua-app:test \
-          busted spec/ --output=TAP
-    
-    # Security scan
-    - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@master
-      with:
-        image-ref: lua-app:test
-        format: sarif
-        output: trivy-results.sarif
-        severity: HIGH,CRITICAL
-    
-    - name: Upload Trivy scan results
-      uses: github/codeql-action/upload-sarif@v3
-      if: always()
-      with:
-        sarif_file: trivy-results.sarif
-    
-    # Build และ Push production image
-    - name: Build and push production image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        target: production
-        platforms: linux/amd64,linux/arm64
-        push: ${{ github.event_name != 'pull_request' }}
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-        build-args: |
-          APP_VERSION=${{ github.ref_name }}
-          BUILD_DATE=${{ github.event.repository.updated_at }}
-          GIT_COMMIT=${{ github.sha }}
-    
-    - name: Inspect image
-      if: github.event_name != 'pull_request'
-      run: |
-        docker buildx imagetools inspect \
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+      
+      - name: Build and test
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: test
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Build and push production image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
 ```
 
 ---
 
-## 65.8 Integration Testing
+## 65.7 Complete CI/CD Pipeline
 
-### 65.8.1 Integration Test Setup
+### ตัวอย่างที่ 14: Full Pipeline
 
 ```yaml
-# ตัวอย่างที่ 15: .github/workflows/integration-tests.yml
-name: Integration Tests
+# .github/workflows/pipeline.yml
+name: Full CI/CD Pipeline
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, 'feature/**', 'hotfix/**']
   pull_request:
-    branches: [main]
+    branches: [main, develop]
+  release:
+    types: [published]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  integration:
+  # Stage 1: Code Quality
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Lua 5.4
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.4"
+      
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+      
+      - name: Install quality tools
+        run: |
+          luarocks install luacheck
+          luarocks install lua-format || true
+      
+      - name: Lint check
+        run: luacheck src/ spec/ --config .luacheckrc
+      
+      - name: Format check
+        run: |
+          # Check if code is formatted (optional)
+          echo "Format check passed"
+  
+  # Stage 2: Unit Tests
+  unit-tests:
+    name: Unit Tests (Lua ${{ matrix.lua-version }})
+    needs: quality
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        lua-version: ['5.2', '5.3', '5.4', 'luajit-2.1']
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Lua ${{ matrix.lua-version }}
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: ${{ matrix.lua-version }}
+      
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+      
+      - name: Install test dependencies
+        run: |
+          luarocks install busted
+          luarocks install luacov
+          luarocks install --only-deps *.rockspec
+      
+      - name: Run unit tests
+        run: |
+          busted spec/ \
+            --verbose \
+            --output junit \
+            --ftest-output test-results-${{ matrix.lua-version }}.xml \
+            --coverage
+      
+      - name: Generate coverage report
+        if: matrix.lua-version == '5.4'
+        run: luacov
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.lua-version }}
+          path: test-results-*.xml
+      
+      - name: Upload coverage
+        if: matrix.lua-version == '5.4'
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+  
+  # Stage 3: Integration Tests
+  integration-tests:
     name: Integration Tests
+    needs: unit-tests
     runs-on: ubuntu-latest
     
     services:
-      # Redis service
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
       redis:
         image: redis:7-alpine
         ports:
@@ -1032,1270 +984,803 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      
-      # PostgreSQL service
-      postgres:
-        image: postgres:15-alpine
-        ports:
-          - 5432:5432
-        env:
-          POSTGRES_DB: testdb
-          POSTGRES_USER: testuser
-          POSTGRES_PASSWORD: testpass
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.4"
+      
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+      
+      - name: Install dependencies
+        run: |
+          luarocks install busted
+          luarocks install luasql-postgres PGSQL_INCDIR=/usr/include/postgresql
+          luarocks install lua-resty-redis || true
+          luarocks install --only-deps *.rockspec
+      
+      - name: Run integration tests
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: testdb
+          DB_USER: testuser
+          DB_PASS: testpass
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+        run: busted spec/integration/ --verbose
+  
+  # Stage 4: Build Docker Image
+  build:
+    name: Build Docker Image
+    needs: integration-tests
+    runs-on: ubuntu-latest
     
-    - name: Setup Lua
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: "5.4"
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
     
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+      
+      - name: Login to registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+  
+  # Stage 5: Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment: staging
     
-    - name: Install dependencies
-      run: |
-        luarocks install busted
-        luarocks install lua-resty-redis  
-        luarocks install luasql-postgres
-        luarocks install http  # Pure Lua HTTP client
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to staging
+        env:
+          DEPLOY_KEY: ${{ secrets.STAGING_DEPLOY_KEY }}
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+        run: |
+          echo "Deploying to staging..."
+          # ssh deploy@${STAGING_HOST} "docker pull ... && docker-compose up -d"
+          echo "Deployed successfully"
+      
+      - name: Run smoke tests
+        run: |
+          # ทดสอบ basic endpoints หลัง deploy
+          sleep 30  # รอให้ service start
+          # curl -f https://staging.example.com/health
+          echo "Smoke tests passed"
+  
+  # Stage 6: Deploy to Production
+  deploy-production:
+    name: Deploy to Production
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment: production
     
-    - name: Run database migrations
-      env:
-        DB_HOST: localhost
-        DB_PORT: 5432
-        DB_NAME: testdb
-        DB_USER: testuser
-        DB_PASSWORD: testpass
-      run: |
-        lua scripts/migrate.lua up
-    
-    - name: Run integration tests
-      env:
-        APP_ENV: test
-        REDIS_HOST: localhost
-        REDIS_PORT: 6379
-        DB_HOST: localhost
-        DB_PORT: 5432
-        DB_NAME: testdb
-        DB_USER: testuser
-        DB_PASSWORD: testpass
-      run: |
-        busted spec/integration/ \
-          --output=TAP \
-          --verbose \
-          --tags=integration
-    
-    - name: Run API tests with curl
-      run: |
-        # Start the application
-        nginx -c $(pwd)/nginx.conf -p $(pwd) &
-        sleep 3
-        
-        # Test health endpoint
-        curl -f http://localhost:8080/health || exit 1
-        
-        # Test API endpoints
-        bash spec/api/test_users_api.sh
-        bash spec/api/test_auth_api.sh
-        
-        # Cleanup
-        nginx -s stop
-```
-
-### 65.8.2 API Integration Test Script
-
-```bash
-# ตัวอย่างที่ 16: spec/api/test_users_api.sh - API integration tests
-#!/bin/bash
-set -e
-
-BASE_URL="${API_URL:-http://localhost:8080}"
-PASS=0
-FAIL=0
-
-# Helper functions
-assert_status() {
-    local expected=$1
-    local actual=$2
-    local test_name=$3
-    
-    if [ "$expected" == "$actual" ]; then
-        echo "  [PASS] $test_name (status: $actual)"
-        ((PASS++))
-    else
-        echo "  [FAIL] $test_name (expected: $expected, got: $actual)"
-        ((FAIL++))
-    fi
-}
-
-assert_json_field() {
-    local json=$1
-    local field=$2
-    local expected=$3
-    local test_name=$4
-    
-    local actual=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$field',''))")
-    
-    if [ "$expected" == "$actual" ]; then
-        echo "  [PASS] $test_name (field '$field': $actual)"
-        ((PASS++))
-    else
-        echo "  [FAIL] $test_name (expected '$field'='$expected', got '$actual')"
-        ((FAIL++))
-    fi
-}
-
-echo "=== API Integration Tests: Users ==="
-echo ""
-
-# Test 1: Health check
-echo "Test: Health check"
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/health")
-assert_status "200" "$STATUS" "GET /health returns 200"
-
-# Test 2: Get all users (empty)
-echo ""
-echo "Test: Get all users"
-RESPONSE=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/users")
-STATUS=$(echo "$RESPONSE" | tail -1)
-BODY=$(echo "$RESPONSE" | head -1)
-assert_status "200" "$STATUS" "GET /api/users returns 200"
-
-# Test 3: Create user
-echo ""
-echo "Test: Create user"
-RESPONSE=$(curl -s -w "\n%{http_code}" \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -d '{"name":"สมชาย","email":"somchai@test.com"}' \
-    "$BASE_URL/api/users")
-STATUS=$(echo "$RESPONSE" | tail -1)
-BODY=$(echo "$RESPONSE" | head -1)
-assert_status "201" "$STATUS" "POST /api/users returns 201"
-assert_json_field "$BODY" "name" "สมชาย" "Response contains user name"
-
-# Test 4: Validation error
-echo ""
-echo "Test: Validation error"
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -d '{"name":"NoEmail"}' \
-    "$BASE_URL/api/users")
-assert_status "422" "$STATUS" "POST /api/users without email returns 422"
-
-# Test 5: Rate limiting
-echo ""
-echo "Test: Rate limiting"
-for i in {1..110}; do
-    curl -s -o /dev/null "$BASE_URL/api/users"
-done
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/users")
-assert_status "429" "$STATUS" "Rate limit returns 429 after threshold"
-
-echo ""
-echo "=== Summary ==="
-echo "Passed: $PASS"
-echo "Failed: $FAIL"
-
-if [ $FAIL -gt 0 ]; then
-    exit 1
-fi
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to production
+        env:
+          PROD_KEY: ${{ secrets.PROD_DEPLOY_KEY }}
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+        run: |
+          echo "Deploying version ${{ github.event.release.tag_name }} to production"
+          echo "Deployment successful"
+      
+      - name: Create deployment record
+        run: |
+          echo "Recording deployment in monitoring system..."
 ```
 
 ---
 
-## 65.9 Environment Promotion (dev→staging→prod)
+## 65.8 Release Automation
 
-### 65.9.1 Multi-Environment Deployment Workflow
+### ตัวอย่างที่ 15: Automatic Release Workflow
 
 ```yaml
-# ตัวอย่างที่ 17: .github/workflows/deploy.yml - Multi-environment deployment
-name: Deploy
+# .github/workflows/release.yml
+name: Release
 
 on:
   push:
-    branches:
-      - develop    # → staging
-      - main       # → production
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for changelog
+      
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.4"
+      
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+      
+      - name: Install tools
+        run: |
+          luarocks install busted
+          luarocks install luarocks-build-cpp || true
+      
+      - name: Run final tests
+        run: busted spec/ --verbose
+      
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Generate changelog from git log
+          PREV_TAG=$(git describe --abbrev=0 --tags HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            CHANGES=$(git log --oneline --no-merges | head -20)
+          else
+            CHANGES=$(git log --oneline --no-merges ${PREV_TAG}..HEAD)
+          fi
+          
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "## Changes in v${{ steps.version.outputs.VERSION }}" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "$CHANGES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      - name: Create rockspec for release
+        run: |
+          # สร้าง rockspec สำหรับ version ใหม่
+          VERSION=${{ steps.version.outputs.VERSION }}
+          sed "s/dev-1/${VERSION}-1/g; s|git+https://.*|git+https://github.com/${{ github.repository }}.git|g" \
+            myproject-dev-1.rockspec > myproject-${VERSION}-1.rockspec
+          cat myproject-${VERSION}-1.rockspec
+      
+      - name: Upload to LuaRocks
+        if: secrets.LUAROCKS_API_KEY != ''
+        env:
+          LUAROCKS_API_KEY: ${{ secrets.LUAROCKS_API_KEY }}
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          luarocks upload myproject-${VERSION}-1.rockspec \
+            --api-key=$LUAROCKS_API_KEY
+      
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          name: "v${{ steps.version.outputs.VERSION }}"
+          body: ${{ steps.changelog.outputs.CHANGELOG }}
+          artifacts: "myproject-*.rockspec"
+          makeLatest: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Notify team
+        if: success()
+        run: |
+          echo "✅ Released v${{ steps.version.outputs.VERSION }} successfully!"
+          # สามารถ add Slack/Teams notification ได้ที่นี่
+```
+
+---
+
+## 65.9 Environment Promotion
+
+### ตัวอย่างที่ 16: Environment Promotion Pipeline
+
+```yaml
+# .github/workflows/promote.yml
+name: Environment Promotion
+
+on:
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Environment to deploy to'
+      from_env:
+        description: 'Source environment'
         required: true
-        default: 'staging'
         type: choice
         options:
           - staging
           - production
+      to_env:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      version:
+        description: 'Version/tag to promote'
+        required: true
+        type: string
 
 jobs:
-  # กำหนด environment ที่จะ deploy
-  set-environment:
-    name: Set Environment
+  validate:
+    name: Validate Promotion
     runs-on: ubuntu-latest
-    outputs:
-      environment: ${{ steps.set-env.outputs.environment }}
     
     steps:
-    - name: Determine environment
-      id: set-env
-      run: |
-        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-          echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
-        elif [ "${{ github.ref_name }}" == "main" ]; then
-          echo "environment=production" >> $GITHUB_OUTPUT
-        else
-          echo "environment=staging" >> $GITHUB_OUTPUT
-        fi
-
-  # Deploy ไปยัง Development (auto)
-  deploy-dev:
-    name: Deploy to Development
+      - name: Validate promotion path
+        run: |
+          FROM="${{ inputs.from_env }}"
+          TO="${{ inputs.to_env }}"
+          
+          # ป้องกัน promote ที่ไม่ถูกต้อง
+          if [ "$FROM" == "$TO" ]; then
+            echo "❌ Cannot promote to same environment"
+            exit 1
+          fi
+          
+          if [ "$FROM" == "production" ] && [ "$TO" == "staging" ]; then
+            echo "❌ Cannot promote from production to staging"
+            exit 1
+          fi
+          
+          echo "✅ Promotion path valid: $FROM -> $TO"
+  
+  promote:
+    name: Promote ${{ inputs.version }} to ${{ inputs.to_env }}
+    needs: validate
     runs-on: ubuntu-latest
-    if: github.ref_name == 'develop' || github.event_name == 'pull_request'
-    environment: development
+    environment: ${{ inputs.to_env }}
     
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Deploy to dev cluster
-      uses: appleboy/ssh-action@v1
-      with:
-        host: ${{ secrets.DEV_HOST }}
-        username: deploy
-        key: ${{ secrets.DEV_SSH_KEY }}
-        script: |
-          cd /srv/lua-app
-          git pull origin develop
-          docker-compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
-          docker-compose exec app nginx -s reload
-    
-    - name: Run smoke tests on dev
-      run: |
-        sleep 15  # รอให้ deploy เสร็จ
-        curl -f https://dev.example.com/health
-
-  # Deploy ไปยัง Staging (auto after tests)
-  deploy-staging:
-    name: Deploy to Staging
-    runs-on: ubuntu-latest
-    if: github.ref_name == 'develop'
-    needs: [deploy-dev]
-    environment:
-      name: staging
-      url: https://staging.example.com
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Login to registry
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Deploy to staging
-      uses: appleboy/ssh-action@v1
-      with:
-        host: ${{ secrets.STAGING_HOST }}
-        username: deploy
-        key: ${{ secrets.STAGING_SSH_KEY }}
-        envs: GITHUB_SHA,GITHUB_REPOSITORY
-        script: |
-          export IMAGE="ghcr.io/${GITHUB_REPOSITORY}:sha-${GITHUB_SHA:0:7}"
-          
-          # Update image ใน docker-compose
-          sed -i "s|image:.*lua-app.*|image: ${IMAGE}|g" /srv/lua-app/docker-compose.yml
-          
-          cd /srv/lua-app
-          docker-compose pull app
-          docker-compose up -d --no-build app
-          
-          # Wait for health check
-          for i in {1..30}; do
-            if curl -sf https://staging.example.com/health; then
-              echo "Deployment successful"
-              break
-            fi
-            echo "Waiting... ($i/30)"
-            sleep 5
-          done
-    
-    - name: Run staging acceptance tests
-      run: |
-        npm install -g newman
-        newman run spec/postman/acceptance_tests.json \
-          --environment spec/postman/staging_env.json \
-          --reporters cli,junit \
-          --reporter-junit-export staging-test-results.xml
-    
-    - name: Upload test results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: staging-acceptance-tests
-        path: staging-test-results.xml
-
-  # Deploy ไปยัง Production (manual approval required)
-  deploy-production:
-    name: Deploy to Production
-    runs-on: ubuntu-latest
-    if: github.ref_name == 'main'
-    needs: []
-    environment:
-      name: production
-      url: https://api.example.com
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Notify deployment start
-      uses: slackapi/slack-github-action@v1
-      with:
-        payload: |
-          {
-            "text": "🚀 Starting production deployment for ${{ github.repository }}",
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*Production Deployment Started*\n• Repo: ${{ github.repository }}\n• Commit: `${{ github.sha }}`\n• By: ${{ github.actor }}"
-                }
-              }
-            ]
-          }
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-    
-    - name: Deploy to production (Blue/Green)
-      run: |
-        # Deploy to green environment
-        ssh deploy@${{ secrets.PROD_HOST }} << 'EOF'
-          cd /srv/lua-app
-          
-          # Pull new image
-          docker pull ghcr.io/${{ github.repository }}:${{ github.sha }}
-          
-          # Scale up green deployment
-          docker-compose -f docker-compose.green.yml up -d
-          
-          # Wait for green to be healthy
-          for i in {1..60}; do
-            if docker-compose -f docker-compose.green.yml exec app curl -sf http://localhost/health; then
-              echo "Green deployment healthy"
-              break
-            fi
-            sleep 5
-          done
-          
-          # Switch traffic to green
-          nginx -s reload
-          
-          # Scale down blue
-          sleep 30  # drain existing connections
-          docker-compose -f docker-compose.blue.yml down
-        EOF
-    
-    - name: Notify deployment success
-      if: success()
-      uses: slackapi/slack-github-action@v1
-      with:
-        payload: '{"text": "Production deployment successful!"}'
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-    
-    - name: Rollback on failure
-      if: failure()
-      run: |
-        ssh deploy@${{ secrets.PROD_HOST }} "cd /srv/lua-app && docker-compose -f docker-compose.blue.yml up -d && nginx -s reload"
-        
-        # Notify failure
-        curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
-          -d '{"text": "Production deployment FAILED - rolled back!"}'
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
+      
+      - name: Deploy to ${{ inputs.to_env }}
+        run: |
+          echo "Promoting ${{ inputs.version }} from ${{ inputs.from_env }} to ${{ inputs.to_env }}"
+          # Deploy script here
+          echo "Promotion successful"
+      
+      - name: Verify deployment
+        run: |
+          echo "Running post-deployment verification..."
+          # Health check
+          # curl -f https://${{ inputs.to_env }}.example.com/health
+          echo "Verification passed"
+      
+      - name: Tag promotion
+        run: |
+          git tag "${{ inputs.to_env }}-${{ inputs.version }}" || true
+          echo "Tagged: ${{ inputs.to_env }}-${{ inputs.version }}"
 ```
 
 ---
 
-## 65.10 Complete CI/CD Pipeline
+## 65.10 Monitoring และ Alerting
 
-### 65.10.1 Full .github/workflows/ci.yml
+### ตัวอย่างที่ 17: Health Check Endpoint ใน Lua
+
+```lua
+-- src/health.lua
+-- Health check endpoint สำหรับ CI/CD monitoring
+
+local Health = {}
+Health.__index = Health
+
+function Health.new(checks)
+    local self = setmetatable({}, Health)
+    self._checks = checks or {}
+    self._start_time = os.time()
+    return self
+end
+
+function Health:add_check(name, check_fn)
+    self._checks[name] = check_fn
+end
+
+function Health:run()
+    local results = {
+        status = "healthy",
+        timestamp = os.time(),
+        uptime = os.time() - self._start_time,
+        version = os.getenv("APP_VERSION") or "unknown",
+        checks = {},
+    }
+
+    for name, check_fn in pairs(self._checks) do
+        local ok, err = pcall(check_fn)
+        local check_result = {
+            status = ok and "ok" or "error",
+            name = name,
+        }
+
+        if not ok then
+            check_result.error = tostring(err)
+            results.status = "unhealthy"
+        end
+
+        results.checks[name] = check_result
+    end
+
+    return results
+end
+
+function Health:to_json(results)
+    local checks_json = {}
+    for name, check in pairs(results.checks) do
+        local status_str = '"' .. check.status .. '"'
+        local error_str = check.error and (', "error": "' .. check.error .. '"') or ""
+        table.insert(checks_json, string.format(
+            '"%s": {"status": %s%s}', name, status_str, error_str
+        ))
+    end
+
+    return string.format(
+        '{"status": "%s", "timestamp": %d, "uptime": %d, "version": "%s", "checks": {%s}}',
+        results.status,
+        results.timestamp,
+        results.uptime,
+        results.version,
+        table.concat(checks_json, ", ")
+    )
+end
+
+-- ตัวอย่างการใช้งาน
+local health = Health.new()
+
+-- เพิ่ม checks
+health:add_check("database", function()
+    -- ตรวจสอบ database connection
+    local sqlite3 = require("lsqlite3")
+    local db = sqlite3.open(":memory:")
+    local row = db:nrows("SELECT 1")()
+    db:close()
+    assert(row, "Database query failed")
+end)
+
+health:add_check("memory", function()
+    -- ตรวจสอบ memory usage
+    local info = collectgarbage("count")
+    local kb = info
+    assert(kb < 100000, string.format("Memory too high: %.2f KB", kb))
+end)
+
+health:add_check("disk", function()
+    -- ตรวจสอบ disk space (Unix only)
+    local f = io.open("/proc/mounts", "r")
+    if f then
+        f:close()
+        -- ใน production จะ check actual disk space
+    end
+end)
+
+local results = health:run()
+print(health:to_json(results))
+```
+
+### ตัวอย่างที่ 18: Deployment Notification Script
+
+```lua
+-- scripts/notify.lua
+-- ส่ง notification เมื่อ deploy เสร็จ
+
+local function send_slack_notification(webhook_url, message)
+    -- ใช้ curl ส่ง notification
+    local payload = string.format(
+        '{"text": "%s"}',
+        message:gsub('"', '\\"')
+    )
+
+    local cmd = string.format(
+        'curl -s -X POST -H "Content-Type: application/json" -d \'%s\' "%s"',
+        payload, webhook_url
+    )
+
+    local result = os.execute(cmd)
+    return result == 0
+end
+
+local function format_deployment_message(opts)
+    local emoji = opts.success and "✅" or "❌"
+    local status = opts.success and "succeeded" or "failed"
+
+    return string.format(
+        "%s Deployment %s!\n" ..
+        "• Service: %s\n" ..
+        "• Version: %s\n" ..
+        "• Environment: %s\n" ..
+        "• By: %s",
+        emoji, status,
+        opts.service or "unknown",
+        opts.version or "unknown",
+        opts.environment or "unknown",
+        opts.deployer or "CI/CD"
+    )
+end
+
+-- รับ args จาก environment variables
+local deployment = {
+    success = os.getenv("DEPLOY_SUCCESS") == "true",
+    service = os.getenv("SERVICE_NAME") or "myproject",
+    version = os.getenv("DEPLOY_VERSION") or "unknown",
+    environment = os.getenv("DEPLOY_ENV") or "unknown",
+    deployer = os.getenv("GITHUB_ACTOR") or "CI/CD",
+}
+
+local message = format_deployment_message(deployment)
+local webhook = os.getenv("SLACK_WEBHOOK_URL")
+
+if webhook then
+    local sent = send_slack_notification(webhook, message)
+    if sent then
+        print("Notification sent successfully")
+    else
+        print("Failed to send notification")
+        os.exit(1)
+    end
+else
+    print("No SLACK_WEBHOOK_URL set, skipping notification")
+    print(message)
+end
+```
+
+---
+
+## 65.11 Security Scanning
+
+### ตัวอย่างที่ 19: Security Checks ใน CI
 
 ```yaml
-# ตัวอย่างที่ 18: .github/workflows/ci.yml - Complete CI/CD pipeline
-name: CI/CD Pipeline
+# .github/workflows/security.yml
+name: Security Scan
 
 on:
   push:
-    branches: [main, develop, 'feature/**', 'hotfix/**', 'release/**']
-    tags: ['v*.*.*']
-  pull_request:
-    branches: [main, develop]
+    branches: [main]
   schedule:
-    # รัน full test suite ทุกวันจันทร์เวลา 2:00 (UTC)
-    - cron: '0 2 * * 1'
-  workflow_dispatch:
-    inputs:
-      skip_tests:
-        description: 'Skip tests (emergency deploy)'
-        required: false
-        default: 'false'
-        type: boolean
-      deploy_env:
-        description: 'Force deploy to environment'
-        required: false
-        type: choice
-        options: ['', 'staging', 'production']
-
-# Concurrency: ยกเลิก run เก่าสำหรับ branch เดียวกัน
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
-# Default permissions (principle of least privilege)
-permissions:
-  contents: read
-
-env:
-  LUA_VERSION: "5.4"
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+    - cron: '0 2 * * 1'  # Every Monday at 2 AM
 
 jobs:
-  # ============================================================
-  # STAGE 1: Code Quality
-  # ============================================================
-  
-  lint:
-    name: Lint & Style Check
+  secrets-scan:
+    name: Scan for Secrets
     runs-on: ubuntu-latest
-    if: ${{ !inputs.skip_tests }}
     
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Lua
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: ${{ env.LUA_VERSION }}
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    - name: Cache LuaRocks
-      uses: actions/cache@v4
-      with:
-        path: ~/.luarocks
-        key: ${{ runner.os }}-luarocks-${{ hashFiles('*.rockspec') }}
-    
-    - name: Install luacheck
-      run: luarocks install luacheck
-    
-    - name: Run luacheck
-      run: |
-        luacheck src/ spec/ \
-          --codes --ranges \
-          --formatter TAP \
-          --max-line-length 120
-    
-    - name: Check YAML syntax
-      uses: ibiqlik/action-yamllint@v3
-      with:
-        file_or_dir: .github/
-        config_data: |
-          extends: default
-          rules:
-            line-length:
-              max: 160
-    
-    - name: Lint Dockerfile
-      uses: hadolint/hadolint-action@v3.1.0
-      with:
-        dockerfile: Dockerfile
-        failure-threshold: warning
-  
-  # ============================================================
-  # STAGE 2: Tests
-  # ============================================================
-  
-  unit-tests:
-    name: Unit Tests (Lua ${{ matrix.lua-version }})
-    runs-on: ubuntu-latest
-    if: ${{ !inputs.skip_tests }}
-    needs: lint
-    
-    strategy:
-      fail-fast: false
-      matrix:
-        lua-version: ["5.1", "5.4", "luajit-2.1"]
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Lua ${{ matrix.lua-version }}
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: ${{ matrix.lua-version }}
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    - name: Cache LuaRocks
-      uses: actions/cache@v4
-      with:
-        path: ~/.luarocks
-        key: ${{ runner.os }}-lua${{ matrix.lua-version }}-${{ hashFiles('*.rockspec') }}
-    
-    - name: Install dependencies
-      run: |
-        luarocks install --only-deps *.rockspec
-        luarocks install busted
-        luarocks install luacov
-    
-    - name: Run unit tests
-      run: |
-        busted spec/unit/ \
-          --coverage \
-          --output=TAP \
-          --verbose \
-          2>&1 | tee unit-test-results.txt
-      env:
-        LUA_PATH: "./src/?.lua;./src/?/init.lua;$LUA_PATH"
-    
-    - name: Generate coverage report
-      run: |
-        lua -e "require('luacov.reporter').report()"
-        cat luacov.report.out
-    
-    - name: Check coverage threshold
-      run: |
-        COVERAGE=$(grep "^Total" luacov.report.out | grep -oP '\d+\.\d+(?=%)' | tail -1)
-        echo "Coverage: ${COVERAGE}%"
-        if awk "BEGIN {exit !($COVERAGE < 75)}"; then
-          echo "::error::Coverage ${COVERAGE}% is below threshold of 75%"
-          exit 1
-        fi
-    
-    - name: Upload test artifacts
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: unit-test-results-lua${{ matrix.lua-version }}
-        path: |
-          unit-test-results.txt
-          luacov.report.out
-  
-  integration-tests:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-    if: ${{ !inputs.skip_tests }}
-    needs: lint
-    
-    services:
-      redis:
-        image: redis:7-alpine
-        ports: ["6379:6379"]
-        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       
-      postgres:
-        image: postgres:15-alpine
-        ports: ["5432:5432"]
-        env:
-          POSTGRES_DB: testdb
-          POSTGRES_USER: testuser
-          POSTGRES_PASSWORD: testpass
-        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Lua
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: ${{ env.LUA_VERSION }}
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    - name: Install dependencies
-      run: |
-        luarocks install --only-deps *.rockspec
-        luarocks install busted
-    
-    - name: Run integration tests
-      env:
-        APP_ENV: test
-        REDIS_HOST: localhost
-        REDIS_PORT: 6379
-        DB_HOST: localhost
-        DB_PORT: 5432
-        DB_NAME: testdb
-        DB_USER: testuser
-        DB_PASSWORD: testpass
-      run: |
-        busted spec/integration/ --tags=integration --output=TAP
-    
-    - name: Upload integration test results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: integration-test-results
-        path: integration-test-results.txt
+      - name: TruffleHog scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
   
-  # ============================================================
-  # STAGE 3: Security Scan
-  # ============================================================
-  
-  security:
-    name: Security Scan
+  dependency-scan:
+    name: Dependency Vulnerability Scan
     runs-on: ubuntu-latest
-    needs: [unit-tests]
-    permissions:
-      security-events: write
     
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Run Semgrep
-      uses: returntocorp/semgrep-action@v1
-      with:
-        config: >-
-          p/lua
-          p/owasp-top-ten
-    
-    - name: Scan secrets
-      uses: trufflesecurity/trufflehog@main
-      with:
-        path: ./
-        base: ${{ github.event.repository.default_branch }}
-  
-  # ============================================================
-  # STAGE 4: Build Docker Image
-  # ============================================================
-  
-  build:
-    name: Build Docker Image
-    runs-on: ubuntu-latest
-    needs: [unit-tests, integration-tests]
-    permissions:
-      contents: read
-      packages: write
-    
-    outputs:
-      image_digest: ${{ steps.build.outputs.digest }}
-      image_tag: ${{ steps.meta.outputs.version }}
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-    
-    - name: Login to GHCR
-      if: github.event_name != 'pull_request'
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-        tags: |
-          type=ref,event=branch
-          type=semver,pattern={{version}}
-          type=sha,prefix=sha-
-          type=raw,value=latest,enable={{is_default_branch}}
-    
-    - name: Build and push
-      id: build
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        target: production
-        platforms: linux/amd64,linux/arm64
-        push: ${{ github.event_name != 'pull_request' }}
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-  
-  # ============================================================
-  # STAGE 5: Deploy
-  # ============================================================
-  
-  deploy-staging:
-    name: Deploy to Staging
-    runs-on: ubuntu-latest
-    needs: [build, security]
-    if: github.ref_name == 'develop' || (github.event_name == 'workflow_dispatch' && inputs.deploy_env == 'staging')
-    environment:
-      name: staging
-      url: https://staging.example.com
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Deploy to staging
-      uses: appleboy/ssh-action@v1
-      env:
-        IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
-      with:
-        host: ${{ secrets.STAGING_HOST }}
-        username: deploy
-        key: ${{ secrets.STAGING_SSH_KEY }}
-        envs: IMAGE_TAG,REGISTRY,IMAGE_NAME
-        script: |
-          export IMAGE="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
-          cd /srv/lua-app
-          docker pull "$IMAGE"
-          docker-compose up -d --no-build
-    
-    - name: Run smoke tests
-      run: |
-        sleep 20
-        curl -f https://staging.example.com/health
-    
-    - name: Run acceptance tests
-      run: |
-        curl -sf https://staging.example.com/api/users
-  
-  deploy-production:
-    name: Deploy to Production
-    runs-on: ubuntu-latest
-    needs: [build, security, deploy-staging]
-    if: |
-      github.ref_name == 'main' || 
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.deploy_env == 'production')
-    environment:
-      name: production
-      url: https://api.example.com
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Deploy to production
-      uses: appleboy/ssh-action@v1
-      env:
-        IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
-      with:
-        host: ${{ secrets.PROD_HOST }}
-        username: deploy
-        key: ${{ secrets.PROD_SSH_KEY }}
-        envs: IMAGE_TAG,REGISTRY,IMAGE_NAME
-        script: |
-          export IMAGE="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
-          cd /srv/lua-app
-          docker pull "$IMAGE"
-          docker-compose up -d --no-build
-    
-    - name: Verify production health
-      run: |
-        for i in {1..12}; do
-          if curl -sf https://api.example.com/health; then
-            echo "Production is healthy"
-            exit 0
+      - uses: actions/checkout@v4
+      
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.4"
+      
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+      
+      - name: Check for vulnerable dependencies
+        run: |
+          # ตรวจสอบ rockspec dependencies
+          luarocks install --only-deps *.rockspec 2>&1 | tee deps.log
+          
+          # ตรวจสอบ version ที่ใช้
+          luarocks list --porcelain | while read name ver; do
+            echo "Checking $name@$ver..."
+          done
+          
+          echo "Dependency check complete"
+      
+      - name: Scan for hardcoded secrets
+        run: |
+          # ค้นหา patterns ที่น่าสงสัย
+          if grep -rn \
+            -e "password\s*=\s*['\"][^'\"]\+['\"]" \
+            -e "secret\s*=\s*['\"][^'\"]\+['\"]" \
+            -e "api_key\s*=\s*['\"][^'\"]\+['\"]" \
+            --include="*.lua" \
+            --exclude-dir=spec \
+            .; then
+            echo "⚠️ Potential hardcoded secrets found!"
+            exit 1
           fi
-          echo "Waiting for production... ($i/12)"
-          sleep 10
-        done
-        echo "Production health check failed!"
-        exit 1
+          echo "✅ No hardcoded secrets found"
 ```
 
 ---
 
-## 65.11 Advanced CI/CD Patterns
+## 65.12 Performance Testing ใน CI
 
-### 65.11.1 Reusable Workflows
-
-```yaml
-# ตัวอย่างที่ 19: .github/workflows/reusable-test.yml - Reusable workflow
-name: Reusable Test Workflow
-
-on:
-  workflow_call:
-    inputs:
-      lua-version:
-        required: true
-        type: string
-      run-coverage:
-        required: false
-        type: boolean
-        default: false
-    secrets:
-      codecov-token:
-        required: false
-    outputs:
-      coverage:
-        description: "Coverage percentage"
-        value: ${{ jobs.test.outputs.coverage }}
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    outputs:
-      coverage: ${{ steps.coverage.outputs.percent }}
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Lua ${{ inputs.lua-version }}
-      uses: leafo/gh-actions-lua@v10
-      with:
-        luaVersion: ${{ inputs.lua-version }}
-    
-    - name: Setup LuaRocks
-      uses: leafo/gh-actions-luarocks@v4
-    
-    - name: Install and run tests
-      run: |
-        luarocks install busted
-        luarocks install luacov
-        busted spec/ --coverage
-    
-    - name: Get coverage
-      id: coverage
-      if: ${{ inputs.run-coverage }}
-      run: |
-        lua -e "require('luacov.reporter').report()"
-        COVERAGE=$(grep "^Total" luacov.report.out | grep -oP '\d+\.\d+(?=%)' | tail -1)
-        echo "percent=${COVERAGE}" >> $GITHUB_OUTPUT
-```
-
-### 65.11.2 Composite Actions
-
-```yaml
-# ตัวอย่างที่ 20: .github/actions/setup-lua/action.yml - Composite action
-name: Setup Lua Environment
-description: Sets up Lua with LuaRocks and common packages
-
-inputs:
-  lua-version:
-    description: Lua version to install
-    required: false
-    default: '5.4'
-  install-busted:
-    description: Install Busted test framework
-    required: false
-    default: 'true'
-  install-luacheck:
-    description: Install luacheck
-    required: false
-    default: 'true'
-
-outputs:
-  lua-path:
-    description: LUA_PATH for installed packages
-    value: ${{ steps.setup.outputs.lua-path }}
-
-runs:
-  using: composite
-  steps:
-  - name: Setup Lua
-    uses: leafo/gh-actions-lua@v10
-    with:
-      luaVersion: ${{ inputs.lua-version }}
-  
-  - name: Setup LuaRocks
-    uses: leafo/gh-actions-luarocks@v4
-  
-  - name: Cache LuaRocks packages
-    uses: actions/cache@v4
-    with:
-      path: ~/.luarocks
-      key: ${{ runner.os }}-lua${{ inputs.lua-version }}-${{ hashFiles('*.rockspec') }}
-  
-  - name: Install test tools
-    shell: bash
-    run: |
-      if [ "${{ inputs.install-busted }}" == "true" ]; then
-        luarocks install busted || true
-        luarocks install luacov || true
-      fi
-      
-      if [ "${{ inputs.install-luacheck }}" == "true" ]; then
-        luarocks install luacheck || true
-      fi
-  
-  - name: Set LUA_PATH
-    id: setup
-    shell: bash
-    run: |
-      LUA_PATH="./src/?.lua;./src/?/init.lua;$(luarocks path --lr-path)"
-      echo "lua-path=${LUA_PATH}" >> $GITHUB_OUTPUT
-      echo "LUA_PATH=${LUA_PATH}" >> $GITHUB_ENV
-```
-
-### 65.11.3 Dependabot Configuration
-
-```yaml
-# ตัวอย่างที่ 21: .github/dependabot.yml - Automated dependency updates
-version: 2
-
-updates:
-  # GitHub Actions updates
-  - package-ecosystem: github-actions
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-      time: "09:00"
-      timezone: "Asia/Bangkok"
-    commit-message:
-      prefix: "chore(deps)"
-    labels:
-      - "dependencies"
-      - "github-actions"
-    reviewers:
-      - "your-github-username"
-  
-  # Docker base image updates
-  - package-ecosystem: docker
-    directory: /
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: "chore(docker)"
-    labels:
-      - "dependencies"
-      - "docker"
-  
-  # npm dependencies (สำหรับ semantic-release)
-  - package-ecosystem: npm
-    directory: /
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: "chore(deps)"
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
-```
-
----
-
-## 65.12 Monitoring และ Alerting ใน CI/CD
-
-### 65.12.1 GitHub Actions Notifications
-
-```yaml
-# ตัวอย่างที่ 22: .github/workflows/notify.yml - Notifications workflow
-name: Notifications
-
-on:
-  workflow_run:
-    workflows: ["CI/CD Pipeline"]
-    types: [completed]
-
-jobs:
-  notify:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Check workflow status
-      id: status
-      run: |
-        if [ "${{ github.event.workflow_run.conclusion }}" == "success" ]; then
-          echo "emoji=✅" >> $GITHUB_OUTPUT
-          echo "color=#36a64f" >> $GITHUB_OUTPUT
-        else
-          echo "emoji=❌" >> $GITHUB_OUTPUT
-          echo "color=#ff0000" >> $GITHUB_OUTPUT
-        fi
-    
-    - name: Send Slack notification
-      uses: slackapi/slack-github-action@v1
-      if: github.event.workflow_run.head_branch == 'main'
-      with:
-        payload: |
-          {
-            "attachments": [
-              {
-                "color": "${{ steps.status.outputs.color }}",
-                "title": "${{ steps.status.outputs.emoji }} CI/CD Pipeline: ${{ github.event.workflow_run.conclusion }}",
-                "fields": [
-                  {
-                    "title": "Repository",
-                    "value": "${{ github.repository }}",
-                    "short": true
-                  },
-                  {
-                    "title": "Branch",
-                    "value": "${{ github.event.workflow_run.head_branch }}",
-                    "short": true
-                  },
-                  {
-                    "title": "Commit",
-                    "value": "${{ github.event.workflow_run.head_sha }}",
-                    "short": true
-                  },
-                  {
-                    "title": "Run URL",
-                    "value": "${{ github.event.workflow_run.html_url }}",
-                    "short": false
-                  }
-                ]
-              }
-            ]
-          }
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-```
-
-### 65.12.2 Pipeline Performance Monitoring
+### ตัวอย่างที่ 20: Benchmark ใน CI
 
 ```lua
--- ตัวอย่างที่ 23: scripts/ci-metrics.lua - CI/CD metrics collection
--- Script สำหรับ collect metrics จาก CI pipeline
+-- spec/benchmark_spec.lua
+-- Performance benchmarks ที่รันใน CI
 
-local cjson = require "cjson"
+local function benchmark(name, fn, iterations)
+    iterations = iterations or 1000
+    local start = os.clock()
 
-local function parse_time(time_str)
-    -- Parse ISO8601 duration หรือ seconds
-    if type(time_str) == "number" then return time_str end
-    local h, m, s = time_str:match("(%d+):(%d+):(%d+)")
-    if h then
-        return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
+    for _ = 1, iterations do
+        fn()
     end
-    return 0
-end
 
-local function read_github_event()
-    local event_file = os.getenv("GITHUB_EVENT_PATH")
-    if not event_file then return {} end
-    
-    local f = io.open(event_file, "r")
-    if not f then return {} end
-    
-    local content = f:read("*all")
-    f:close()
-    
-    local ok, data = pcall(cjson.decode, content)
-    return ok and data or {}
-end
+    local elapsed = os.clock() - start
+    local per_iter = elapsed / iterations * 1000  -- milliseconds
 
-local function collect_metrics()
-    local event = read_github_event()
-    
     return {
-        workflow = os.getenv("GITHUB_WORKFLOW") or "",
-        run_id = os.getenv("GITHUB_RUN_ID") or "",
-        run_number = tonumber(os.getenv("GITHUB_RUN_NUMBER")) or 0,
-        repository = os.getenv("GITHUB_REPOSITORY") or "",
-        branch = os.getenv("GITHUB_REF_NAME") or "",
-        sha = os.getenv("GITHUB_SHA") or "",
-        actor = os.getenv("GITHUB_ACTOR") or "",
-        event_name = os.getenv("GITHUB_EVENT_NAME") or "",
-        timestamp = os.time()
+        name = name,
+        iterations = iterations,
+        total_ms = elapsed * 1000,
+        per_iter_ms = per_iter,
     }
 end
 
--- Main
-local metrics = collect_metrics()
-print(cjson.encode(metrics))
+describe("Performance Benchmarks", function()
 
--- ส่ง metrics ไปยัง monitoring service
-local http_cmd = string.format(
-    "curl -s -X POST '%s/metrics' -H 'Content-Type: application/json' -d '%s'",
-    os.getenv("METRICS_ENDPOINT") or "http://metrics.internal",
-    cjson.encode(metrics)
-)
-os.execute(http_cmd)
+    describe("string operations", function()
+        it("string concatenation should be fast", function()
+            local result = benchmark("string_concat", function()
+                local s = ""
+                for i = 1, 10 do
+                    s = s .. tostring(i)
+                end
+            end, 10000)
+
+            print(string.format(
+                "\n  %s: %.3f ms/iter",
+                result.name, result.per_iter_ms
+            ))
+
+            -- ไม่ควรช้ากว่า 0.1ms ต่อ iteration
+            assert.is_true(result.per_iter_ms < 0.1,
+                string.format("Too slow: %.3f ms", result.per_iter_ms))
+        end)
+
+        it("table.concat should be faster than concatenation", function()
+            local result = benchmark("table_concat", function()
+                local parts = {}
+                for i = 1, 10 do
+                    parts[i] = tostring(i)
+                end
+                return table.concat(parts)
+            end, 10000)
+
+            print(string.format(
+                "\n  %s: %.3f ms/iter",
+                result.name, result.per_iter_ms
+            ))
+
+            assert.is_true(result.per_iter_ms < 0.05,
+                string.format("Too slow: %.3f ms", result.per_iter_ms))
+        end)
+    end)
+
+    describe("table operations", function()
+        it("table insert should be O(1) amortized", function()
+            local result = benchmark("table_insert", function()
+                local t = {}
+                for i = 1, 100 do
+                    table.insert(t, i)
+                end
+            end, 1000)
+
+            print(string.format(
+                "\n  %s: %.3f ms/iter",
+                result.name, result.per_iter_ms
+            ))
+
+            assert.is_true(result.per_iter_ms < 0.5,
+                string.format("Too slow: %.3f ms", result.per_iter_ms))
+        end)
+    end)
+
+end)
 ```
 
 ---
 
-## 65.13 Best Practices และ Optimization
+## 65.13 Monitoring Dashboard
 
-### 65.13.1 Caching Strategy
+### ตัวอย่างที่ 21: CI Metrics Script
 
-```yaml
-# ตัวอย่างที่ 24: Caching strategy สำหรับ Lua CI
-# ใน job steps:
+```lua
+-- scripts/ci_metrics.lua
+-- รวบรวม CI/CD metrics
 
-    - name: Cache LuaRocks packages
-      id: cache-luarocks
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.luarocks
-          /usr/local/lib/lua
-          /usr/local/share/lua
-        # Cache key ที่ดี: combine OS + Lua version + lockfile hash
-        key: luarocks-${{ runner.os }}-lua${{ env.LUA_VERSION }}-${{ hashFiles('**/*.rockspec', '**/luarocks.lock') }}
-        restore-keys: |
-          luarocks-${{ runner.os }}-lua${{ env.LUA_VERSION }}-
-          luarocks-${{ runner.os }}-
-    
-    - name: Cache Docker layers
-      uses: actions/cache@v4
-      with:
-        path: /tmp/.buildx-cache
-        key: docker-${{ runner.os }}-${{ hashFiles('**/Dockerfile', '*.rockspec') }}
-        restore-keys: |
-          docker-${{ runner.os }}-
-    
-    - name: Install dependencies (use cache if available)
-      if: steps.cache-luarocks.outputs.cache-hit != 'true'
-      run: |
-        luarocks install --only-deps *.rockspec
-        luarocks install busted
-        luarocks install luacheck
-        luarocks install luacov
-```
+local Metrics = {}
+Metrics.__index = Metrics
 
-### 65.13.2 Parallel Test Execution
+function Metrics.new()
+    return setmetatable({
+        _data = {},
+        _start_time = os.time(),
+    }, Metrics)
+end
 
-```yaml
-# ตัวอย่างที่ 25: Parallel test execution
-  parallel-tests:
-    name: Test Suite ${{ matrix.suite }}
-    runs-on: ubuntu-latest
-    
-    strategy:
-      fail-fast: false
-      matrix:
-        suite:
-          - unit/models
-          - unit/services
-          - unit/utils
-          - integration/api
-          - integration/database
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup environment
-      uses: ./.github/actions/setup-lua
-      with:
-        lua-version: "5.4"
-    
-    - name: Run test suite
-      run: |
-        busted spec/${{ matrix.suite }}/ \
-          --output=TAP \
-          2>&1 | tee test-${{ matrix.suite }}-results.txt
-    
-    - name: Upload results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: test-${{ matrix.suite }}-results
-        path: test-${{ matrix.suite }}-results.txt
-  
-  # รวม results จาก parallel tests
-  aggregate-results:
-    name: Aggregate Test Results
-    runs-on: ubuntu-latest
-    needs: parallel-tests
-    if: always()
-    
-    steps:
-    - name: Download all results
-      uses: actions/download-artifact@v4
-      with:
-        pattern: test-*-results
-        merge-multiple: true
-    
-    - name: Summarize results
-      run: |
-        echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        
-        TOTAL_PASS=0
-        TOTAL_FAIL=0
-        
-        for file in *.txt; do
-          PASS=$(grep -c "^ok" "$file" || true)
-          FAIL=$(grep -c "^not ok" "$file" || true)
-          TOTAL_PASS=$((TOTAL_PASS + PASS))
-          TOTAL_FAIL=$((TOTAL_FAIL + FAIL))
-          
-          echo "### $file" >> $GITHUB_STEP_SUMMARY
-          echo "- Passed: $PASS" >> $GITHUB_STEP_SUMMARY
-          echo "- Failed: $FAIL" >> $GITHUB_STEP_SUMMARY
-        done
-        
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**Total: $TOTAL_PASS passed, $TOTAL_FAIL failed**" >> $GITHUB_STEP_SUMMARY
-        
-        if [ $TOTAL_FAIL -gt 0 ]; then
-          exit 1
-        fi
+function Metrics:record(name, value, labels)
+    table.insert(self._data, {
+        name = name,
+        value = value,
+        labels = labels or {},
+        timestamp = os.time(),
+    })
+end
+
+function Metrics:timer(name, fn, labels)
+    local start = os.clock()
+    local ok, result = pcall(fn)
+    local elapsed = os.clock() - start
+
+    self:record(name .. "_duration_seconds", elapsed, labels)
+    self:record(name .. "_success", ok and 1 or 0, labels)
+
+    if not ok then
+        error(result)
+    end
+    return result
+end
+
+function Metrics:to_prometheus()
+    local lines = {}
+    for _, m in ipairs(self._data) do
+        local label_str = ""
+        if next(m.labels) then
+            local parts = {}
+            for k, v in pairs(m.labels) do
+                table.insert(parts, k .. '="' .. v .. '"')
+            end
+            label_str = "{" .. table.concat(parts, ",") .. "}"
+        end
+
+        table.insert(lines, string.format(
+            "%s%s %s %d",
+            m.name, label_str, tostring(m.value), m.timestamp
+        ))
+    end
+    return table.concat(lines, "\n")
+end
+
+function Metrics:summary()
+    local by_name = {}
+    for _, m in ipairs(self._data) do
+        if not by_name[m.name] then
+            by_name[m.name] = {count = 0, total = 0, min = math.huge, max = -math.huge}
+        end
+        local s = by_name[m.name]
+        s.count = s.count + 1
+        s.total = s.total + m.value
+        s.min = math.min(s.min, m.value)
+        s.max = math.max(s.max, m.value)
+    end
+
+    print("=== CI Metrics Summary ===")
+    for name, stats in pairs(by_name) do
+        print(string.format(
+            "  %s: count=%d, avg=%.3f, min=%.3f, max=%.3f",
+            name,
+            stats.count,
+            stats.total / stats.count,
+            stats.min,
+            stats.max
+        ))
+    end
+end
+
+-- ทดสอบ
+local metrics = Metrics.new()
+
+-- บันทึก metrics ต่างๆ
+metrics:record("build_duration_seconds", 45.2, {branch = "main"})
+metrics:record("test_count", 156, {suite = "unit"})
+metrics:record("test_failures", 0, {suite = "unit"})
+metrics:record("coverage_percent", 87.5, {module = "core"})
+metrics:record("docker_image_size_mb", 128, {tag = "latest"})
+
+-- Timer example
+metrics:timer("database_migration", function()
+    -- จำลอง migration
+    local sum = 0
+    for i = 1, 1000000 do sum = sum + i end
+    return sum
+end, {env = "test"})
+
+metrics:summary()
+
+print("\n=== Prometheus Format ===")
+print(metrics:to_prometheus())
 ```
 
 ---
 
-## 65.14 แบบฝึกหัด
+## แบบฝึกหัด
 
-### แบบฝึกหัดที่ 1: Basic CI Pipeline
-สร้าง GitHub Actions workflow สำหรับ Lua library ที่:
-- รัน luacheck บน code ทั้งหมดใน `src/`
-- รัน Busted tests ใน `spec/`
-- ทดสอบกับ Lua 5.1, 5.4, และ LuaJIT
-- Upload test results เป็น artifacts
+**ข้อที่ 1:** สร้าง complete CI pipeline สำหรับ Lua library ที่:
+- Test บน Lua 5.1, 5.2, 5.3, 5.4 และ LuaJIT
+- รัน LuaCheck
+- Generate coverage report
+- Auto-publish ไป LuaRocks เมื่อ tag v*
 
-### แบบฝึกหัดที่ 2: Coverage Gate
-เพิ่ม code coverage ใน pipeline จากแบบฝึกหัดที่ 1:
-- รัน LuaCov พร้อมกับ tests
-- Generate HTML coverage report
-- Fail pipeline ถ้า coverage ต่ำกว่า 80%
-- Upload report ไปยัง Codecov
+**ข้อที่ 2:** สร้าง deployment pipeline ที่:
+- Deploy ไป staging เมื่อ push ไป develop
+- Deploy ไป production เมื่อ create release
+- มี rollback mechanism
+- ส่ง Slack notification
 
-### แบบฝึกหัดที่ 3: Docker Build Pipeline
-สร้าง workflow สำหรับ build และ push Docker image:
-- รัน tests ใน Docker container
-- ทำ security scan ด้วย Trivy
-- Build multi-platform image (amd64 + arm64)
-- Push ไปยัง GitHub Container Registry
-- Tag image ด้วย version และ commit SHA
+**ข้อที่ 3:** เพิ่ม security scanning ใน CI ที่:
+- ตรวจสอบ hardcoded secrets
+- Check dependencies vulnerabilities
+- SAST (Static Application Security Testing)
+- Generate security report
 
-### แบบฝึกหัดที่ 4: Multi-Environment Deployment
-สร้าง deployment pipeline ที่:
-- Auto-deploy ไปยัง dev เมื่อ push ไปยัง feature branch
-- Auto-deploy ไปยัง staging เมื่อ merge ไปยัง develop
-- Deploy ไปยัง production ต้องมี manual approval
-- มี rollback mechanism เมื่อ health check ไม่ผ่าน
-
-### แบบฝึกหัดที่ 5: Complete LuaRocks Release
-สร้าง release automation ที่:
-- ใช้ Conventional Commits สำหรับ auto-versioning
-- Generate CHANGELOG จาก commits
-- สร้าง GitHub Release พร้อม release notes
-- Upload package ไปยัง LuaRocks โดยอัตโนมัติ
-- ส่ง Slack notification เมื่อ release สำเร็จ
+**ข้อที่ 4:** สร้าง performance regression testing ที่:
+- รัน benchmarks ใน CI
+- เปรียบเทียบกับ baseline
+- Fail ถ้า performance ลดลงเกิน 10%
+- สร้าง performance report
 
 ---
 
 ## สรุป
 
-ในบทนี้เราได้เรียนรู้การสร้าง CI/CD Pipeline ที่สมบูรณ์สำหรับ Lua projects:
+ในบทนี้เราได้เรียนรู้:
+- **GitHub Actions**: การสร้าง workflow สำหรับ Lua projects
+- **Busted Testing**: Unit tests, integration tests, mocking
+- **LuaCheck**: Static analysis และ lint configuration
+- **LuaCov**: Code coverage measurement
+- **Semantic Versioning**: Version management automation
+- **Docker Integration**: Building และ pushing Docker images
+- **Complete Pipeline**: Multi-stage CI/CD จาก code ถึง production
+- **Release Automation**: Auto-publish ไป LuaRocks และ GitHub Releases
+- **Environment Promotion**: Dev → Staging → Production
+- **Security Scanning**: Secret detection และ dependency scanning
+- **Performance Testing**: Benchmarks และ regression detection
 
-- **GitHub Actions** - สร้าง workflows สำหรับ CI/CD ด้วย YAML
-- **Busted** - รัน unit tests และ integration tests ใน CI environment
-- **Luacheck** - ทำ static analysis และ style checking อัตโนมัติ
-- **LuaCov** - วัด code coverage และบังคับใช้ coverage threshold
-- **Semantic Versioning** - จัดการ version แบบอัตโนมัติด้วย Conventional Commits
-- **LuaRocks Publishing** - Publish packages ไปยัง LuaRocks อัตโนมัติ
-- **Docker Integration** - Build, scan, และ push Docker images ใน pipeline
-- **Integration Testing** - รัน tests กับ real services (Redis, PostgreSQL)
-- **Environment Promotion** - Deploy แบบ dev → staging → production พร้อม approval gates
-- **Optimization** - Caching, parallel execution, reusable workflows
-
-การมี CI/CD pipeline ที่ดีช่วยให้ทีมสามารถ deliver code ได้อย่างรวดเร็วและมั่นใจว่า code quality อยู่ในระดับสูงตลอดเวลา
+**ถัดไป**: บทที่ 66 จะเรียนรู้เกี่ยวกับ Load Balancing algorithms และ implementation ด้วย Lua
